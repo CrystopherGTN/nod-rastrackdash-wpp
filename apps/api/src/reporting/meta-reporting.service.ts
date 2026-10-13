@@ -175,12 +175,29 @@ type MetaReportingAccountRecord = {
  * creative id so it is only ever applied to the same creative.
  */
 type SavedAdMedia = {
-  /** Previews whose CDN expiry hint is safely in the future. */
+  /**
+   * Any saved preview of the creative, reused without asking Graph again.
+   * The fbcdn `oe` expiry hint is only used to prefer the freshest of several
+   * saved URLs, never to force a refetch (Graph calls count against the
+   * shared app-level rate limit).
+   */
   reusablePreviewUrls: Map<string, string>;
   /** Any saved preview, used only when enrichment of that creative failed. */
   previewByCreative: Map<string, string>;
   thumbnailByCreative: Map<string, string>;
+  /**
+   * Creatives that recently came back from Graph without a usable preview
+   * (absent or failed). They are not requested again until the TTL expires.
+   */
+  skipPreviewCreativeIds: Set<string>;
 };
+
+/**
+ * How long a creative that came back absent/failed is not requested again.
+ * Kept in memory only (no schema change): a restart forgets it, which costs
+ * at most one extra request per such creative.
+ */
+export const META_PREVIEW_MISS_TTL_MS = 24 * 60 * 60 * 1000;
 
 type AdMediaResolutionCounters = {
   preservedAfterFailure: number;
@@ -381,6 +398,8 @@ type WhatsappOverrideUpdateData = {
 @Injectable()
 export class MetaReportingService {
   private readonly logger = new Logger(MetaReportingService.name);
+  /** `${workspaceId}|${businessId}|${adAccountId}|${creativeId}` -> expiry ms */
+  private readonly previewMissUntil = new Map<string, number>();
 
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
@@ -945,9 +964,49 @@ export class MetaReportingService {
         accessToken: input.accessToken,
         adAccountId: input.account.adAccountId,
         reusablePreviewUrls: savedMedia.reusablePreviewUrls,
+        skipPreviewCreativeIds: savedMedia.skipPreviewCreativeIds,
       });
+    this.rememberPreviewMisses(input, ads, savedMedia);
 
     return { ads, previewStats, savedMedia };
+  }
+
+  private previewMissKey(
+    input: { workspaceId: string; account: MetaReportingAccountRecord },
+    creativeId: string,
+  ): string {
+    return [
+      input.workspaceId,
+      input.account.businessId ?? "",
+      input.account.adAccountId,
+      creativeId,
+    ].join("|");
+  }
+
+  /**
+   * Remembers creatives Graph just returned without a usable preview so the
+   * next syncs do not request them again within META_PREVIEW_MISS_TTL_MS.
+   */
+  private rememberPreviewMisses(
+    input: { workspaceId: string; account: MetaReportingAccountRecord },
+    ads: MetaAdAsset[],
+    savedMedia: SavedAdMedia,
+  ): void {
+    const until = Date.now() + META_PREVIEW_MISS_TTL_MS;
+
+    for (const ad of ads) {
+      if (
+        ad.creativeId &&
+        (ad.previewSource === "absent" || ad.previewSource === "failed") &&
+        !ad.previewUrl &&
+        !savedMedia.previewByCreative.has(ad.creativeId)
+      ) {
+        this.previewMissUntil.set(
+          this.previewMissKey(input, ad.creativeId),
+          until,
+        );
+      }
+    }
   }
 
   private async loadSavedAdMedia(input: {
@@ -974,8 +1033,16 @@ export class MetaReportingService {
       reusablePreviewUrls: new Map(),
       previewByCreative: new Map(),
       thumbnailByCreative: new Map(),
+      skipPreviewCreativeIds: new Set(),
     };
     const reusableExpiryByCreative = new Map<string, number>();
+    const nowMs = now.getTime();
+
+    for (const [key, until] of this.previewMissUntil) {
+      if (until <= nowMs) {
+        this.previewMissUntil.delete(key);
+      }
+    }
 
     for (const row of rows) {
       const creativeId = row.creativeId;
@@ -989,13 +1056,20 @@ export class MetaReportingService {
       }
 
       if (!row.previewUrl) {
+        if (this.previewMissUntil.has(this.previewMissKey(input, creativeId))) {
+          savedMedia.skipPreviewCreativeIds.add(creativeId);
+        }
+
         continue;
       }
 
       if (!savedMedia.previewByCreative.has(creativeId)) {
         savedMedia.previewByCreative.set(creativeId, row.previewUrl);
+        savedMedia.reusablePreviewUrls.set(creativeId, row.previewUrl);
       }
 
+      // Expired/unknown hints still reuse the saved URL; the hint only picks
+      // the freshest one when the same creative has several saved URLs.
       const freshness = evaluateMetaPreviewUrlFreshness(row.previewUrl, now);
 
       if (
@@ -1007,6 +1081,10 @@ export class MetaReportingService {
         savedMedia.reusablePreviewUrls.set(creativeId, row.previewUrl);
         savedMedia.previewByCreative.set(creativeId, row.previewUrl);
       }
+    }
+
+    for (const creativeId of savedMedia.reusablePreviewUrls.keys()) {
+      savedMedia.skipPreviewCreativeIds.delete(creativeId);
     }
 
     return savedMedia;
@@ -1074,6 +1152,7 @@ export class MetaReportingService {
         `ads=${input.adCount}`,
         `distinctCreatives=${stats.distinctCreatives}`,
         `reused=${stats.creativesReused}`,
+        `skipped=${stats.creativesSkipped}`,
         `requested=${stats.creativesRequested}`,
         `succeeded=${stats.creativesSucceeded}`,
         `failed=${stats.creativesFailed}`,

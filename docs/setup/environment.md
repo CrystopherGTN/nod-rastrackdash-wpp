@@ -251,6 +251,7 @@ EMAIL_FROM_ADDRESS=no-reply@exemplo.com
 | `KOMMO_CRM_ENCRYPTION_KEY` | Sim, antes de criar uma conexão Kommo | Base64 canônico de 32 bytes, gerado pelo aluno | env efetiva do container da API | **Sim** |
 | `META_WEBHOOK_VERIFY_TOKEN` | Só para o webhook de **Meta Ads** (`/webhooks/meta`) | Você define | `.env` local / env do serviço | **Sim** |
 | `WPPTRACK_META_AUTO_SYNC_*` | Não (têm padrão) | Tuning do sync automático | `.env` da API | Não |
+| `META_VIDEO_THUMBNAILS_ENABLED` | Não (padrão desligado) | Só `true` liga a busca extra de miniaturas de vídeo (`/{video}/thumbnails`). Deixe desligado ao usar o login social PalmUP: o limite de chamadas do app Meta é compartilhado | `.env` da API | Não |
 | `WPPTRACK_REPORT_TIMEZONE` | Não (tem padrão `America/Sao_Paulo`) | Seu fuso horário de relatório | `.env` da API | Não |
 | `PALMUP_META_BROKER_URL` | Só para o botão **Conectar Meta (PalmUP)** — sem ela, fica só o token permanente | Fornecido pela PalmUP (já vem preenchido no `.env.example`: `https://wpptrack-api.rastrack.app`) | `.env` da API / env do serviço da API. O web **não** precisa dela | **Não** — é uma URL pública, não é App Secret |
 

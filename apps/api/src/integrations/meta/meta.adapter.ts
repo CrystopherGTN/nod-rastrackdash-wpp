@@ -125,10 +125,17 @@ export type MetaAdSetAsset = {
  * - absent: Graph returned the creative successfully but it has no media
  * - failed: the creative (or its video thumbnails) could not be read; any
  *   previewUrl is only a lower-quality fallback from the creative itself
+ * - skipped: the caller asked not to request this creative now (it recently
+ *   came back without a usable preview); previewUrl is null, no Graph request
  * - no_creative: the ad has no creative id
  */
 export type MetaAdPreviewSource =
-  "reused" | "fetched" | "absent" | "failed" | "no_creative";
+  | "reused"
+  | "fetched"
+  | "absent"
+  | "failed"
+  | "skipped"
+  | "no_creative";
 
 export type MetaAdAsset = {
   id: string;
@@ -163,6 +170,7 @@ export type MetaGraphBatchFailureReason =
 export type MetaPreviewEnrichmentStats = {
   distinctCreatives: number;
   creativesReused: number;
+  creativesSkipped: number;
   creativesRequested: number;
   creativesSucceeded: number;
   creativesFailed: number;
@@ -184,6 +192,11 @@ export type MetaListAdsInput = {
    * the same workspace and ad account.
    */
   reusablePreviewUrls?: ReadonlyMap<string, string>;
+  /**
+   * Creatives not to request from Graph in this call (e.g. they recently came
+   * back absent/failed). They are reported with previewSource "skipped".
+   */
+  skipPreviewCreativeIds?: ReadonlySet<string>;
 };
 
 export type MetaCampaignInsight = {
@@ -906,6 +919,7 @@ export class MetaAdapter implements IntegrationAdapter {
       ),
     ];
     const reusedPreviewUrls = new Map<string, string>();
+    const skippedCreativeIds = new Set<string>();
     const creativeIdsToRequest: string[] = [];
 
     for (const creativeId of creativeIds) {
@@ -915,6 +929,8 @@ export class MetaAdapter implements IntegrationAdapter {
 
       if (reusableUrl) {
         reusedPreviewUrls.set(creativeId, reusableUrl);
+      } else if (input.skipPreviewCreativeIds?.has(creativeId)) {
+        skippedCreativeIds.add(creativeId);
       } else {
         creativeIdsToRequest.push(creativeId);
       }
@@ -923,6 +939,7 @@ export class MetaAdapter implements IntegrationAdapter {
     const previewStats = this.emptyPreviewStats();
     previewStats.distinctCreatives = creativeIds.length;
     previewStats.creativesReused = reusedPreviewUrls.size;
+    previewStats.creativesSkipped = skippedCreativeIds.size;
     previewStats.creativesRequested = creativeIdsToRequest.length;
     let previews: Map<string, MetaCreativePreview>;
 
@@ -959,7 +976,9 @@ export class MetaAdapter implements IntegrationAdapter {
           ? "no_creative"
           : reusedUrl
             ? "reused"
-            : (preview?.status ?? "failed");
+            : skippedCreativeIds.has(creativeId)
+              ? "skipped"
+              : (preview?.status ?? "failed");
 
         return {
           id: this.asString(item.id),
@@ -1476,10 +1495,16 @@ export class MetaAdapter implements IntegrationAdapter {
     return payload as T;
   }
 
+  /** Opt-in only: exact string "true" in META_VIDEO_THUMBNAILS_ENABLED. */
+  private videoThumbnailsEnabled(): boolean {
+    return this.env.META_VIDEO_THUMBNAILS_ENABLED?.trim() === "true";
+  }
+
   private emptyPreviewStats(): MetaPreviewEnrichmentStats {
     return {
       distinctCreatives: 0,
       creativesReused: 0,
+      creativesSkipped: 0,
       creativesRequested: 0,
       creativesSucceeded: 0,
       creativesFailed: 0,
@@ -1539,13 +1564,19 @@ export class MetaAdapter implements IntegrationAdapter {
     stats.creativesFailed = creatives.failures.size;
     this.countBatchFailures(stats, creatives.failures);
 
-    const videoIds = [
-      ...new Set(
-        [...creatives.results.values()]
-          .map((creative) => this.creativeVideoId(creative))
-          .filter((videoId): videoId is string => Boolean(videoId)),
-      ),
-    ];
+    // GET /{video}/thumbnails costs one extra Graph call per video creative
+    // and is disabled by default: installations share the app-level rate
+    // limit of the PalmUP Meta app. The creative's own image_url /
+    // thumbnail_url (already in this batch) is used as the preview instead.
+    const videoIds = this.videoThumbnailsEnabled()
+      ? [
+          ...new Set(
+            [...creatives.results.values()]
+              .map((creative) => this.creativeVideoId(creative))
+              .filter((videoId): videoId is string => Boolean(videoId)),
+          ),
+        ]
+      : [];
     // After a batch-level failure (e.g. throttling) stop issuing preview
     // requests for this sync instead of immediately hitting Graph again.
     const videoThumbnails: MetaGraphBatchResult<

@@ -7,6 +7,18 @@ This is the **initial public release** of the `nod-rastrackdash-wpp` student tem
 
 ## [Unreleased]
 
+### Fixed
+
+- **URGENT — fewer Meta Graph API calls** (stops exhausting the shared
+  PalmUP Meta app rate limit that blocked Meta social login): saved creative
+  previews are always reused regardless of the fbcdn `oe` expiry hint (only
+  never-seen creatives are fetched); creatives that came back absent/failed
+  are not requested again for 24h (in-memory); `GET /{video}/thumbnails` is
+  off unless `META_VIDEO_THUMBNAILS_ENABLED=true`; the first automatic Meta
+  sync after boot now runs after a random 10-30 min (values below 600 s in
+  `WPPTRACK_META_AUTO_SYNC_INITIAL_DELAY_SECONDS`, like the old `60`, are
+  ignored). The 180-min interval is unchanged. API only, no migration.
+
 ### Added
 
 - **Data Crazy inbound webhook** support for CTWA messages, including

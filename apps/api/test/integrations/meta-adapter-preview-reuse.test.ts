@@ -50,9 +50,17 @@ function videoCreative(
   return url;
 }
 
-function adapterFor(graph: FakeMetaGraph): MetaAdapter {
-  return new MetaAdapter({ META_GRAPH_SLOW_LOG_MS: "999999" }, graph.fetch);
+function adapterFor(
+  graph: FakeMetaGraph,
+  env: Record<string, string | undefined> = {},
+): MetaAdapter {
+  return new MetaAdapter(
+    { META_GRAPH_SLOW_LOG_MS: "999999", ...env },
+    graph.fetch,
+  );
 }
+
+const VIDEO_THUMBNAILS_ON = { META_VIDEO_THUMBNAILS_ENABLED: "true" };
 
 describe("MetaAdapter preview enrichment reuse", () => {
   let warn: ReturnType<typeof vi.spyOn>;
@@ -89,7 +97,8 @@ describe("MetaAdapter preview enrichment reuse", () => {
     seed(graph, [ad("a1", "cr1"), ad("a2", "cr2"), ad("a3", "cr3")]);
     imageCreative(graph, "cr1");
     const url2 = imageCreative(graph, "cr2");
-    const url3 = videoCreative(graph, "cr3", "v3");
+    videoCreative(graph, "cr3", "v3");
+    const creativeThumb3 = graph.creatives.get("cr3")?.thumbnailUrl;
     const saved1 = fbcdnUrl("saved-cr1", hoursFromNow(48));
 
     const result = await adapterFor(graph).listAdsWithPreviewStats({
@@ -99,13 +108,14 @@ describe("MetaAdapter preview enrichment reuse", () => {
     });
 
     expect(graph.creativeSubrequestIds.sort()).toEqual(["cr2", "cr3"]);
-    expect(graph.videoSubrequestIds).toEqual(["v3"]);
+    // Video thumbnails are opt-in: the creative's own thumbnail is used.
+    expect(graph.videoSubrequestIds).toEqual([]);
     expect(
       result.ads.map((item) => [item.id, item.previewUrl, item.previewSource]),
     ).toEqual([
       ["a1", saved1, "reused"],
       ["a2", url2, "fetched"],
-      ["a3", url3, "fetched"],
+      ["a3", creativeThumb3, "fetched"],
     ]);
     expect(result.previewStats).toMatchObject({
       distinctCreatives: 3,
@@ -115,10 +125,72 @@ describe("MetaAdapter preview enrichment reuse", () => {
       creativesFailed: 0,
       creativesWithoutPreview: 0,
       creativeBatchRequests: 1,
-      videosRequested: 1,
-      videosSucceeded: 1,
+      videosRequested: 0,
+      videosSucceeded: 0,
       videosFailed: 0,
-      videoBatchRequests: 1,
+      videoBatchRequests: 0,
+    });
+  });
+
+  it("never calls /{video}/thumbnails unless META_VIDEO_THUMBNAILS_ENABLED is exactly \"true\"", async () => {
+    for (const value of [undefined, "", "false", "1", "yes", "TRUE"]) {
+      const graph = new FakeMetaGraph();
+      seed(graph, [ad("a1", "cr1")]);
+      videoCreative(graph, "cr1", "v1");
+      const creativeThumb = graph.creatives.get("cr1")?.thumbnailUrl;
+
+      const result = await adapterFor(graph, {
+        META_VIDEO_THUMBNAILS_ENABLED: value,
+      }).listAdsWithPreviewStats({ accessToken: TOKEN, adAccountId: ACCOUNT });
+
+      expect(graph.videoBatches).toBe(0);
+      expect(graph.videoSubrequestIds).toEqual([]);
+      expect(result.ads[0]).toMatchObject({
+        previewUrl: creativeThumb,
+        previewSource: "fetched",
+      });
+    }
+
+    const graph = new FakeMetaGraph();
+    seed(graph, [ad("a1", "cr1")]);
+    const bigUrl = videoCreative(graph, "cr1", "v1");
+    const result = await adapterFor(
+      graph,
+      VIDEO_THUMBNAILS_ON,
+    ).listAdsWithPreviewStats({ accessToken: TOKEN, adAccountId: ACCOUNT });
+
+    expect(graph.videoSubrequestIds).toEqual(["v1"]);
+    expect(result.ads[0]?.previewUrl).toBe(bigUrl);
+  });
+
+  it("does not request creatives the caller asked to skip and reports them as skipped", async () => {
+    const graph = new FakeMetaGraph();
+    seed(graph, [ad("a1", "cr1"), ad("a2", "cr2"), ad("a3", "cr3")]);
+    imageCreative(graph, "cr1");
+    const url2 = imageCreative(graph, "cr2");
+    imageCreative(graph, "cr3");
+    const saved3 = fbcdnUrl("saved-cr3", hoursFromNow(-48));
+
+    const result = await adapterFor(graph).listAdsWithPreviewStats({
+      accessToken: TOKEN,
+      adAccountId: ACCOUNT,
+      reusablePreviewUrls: new Map([["cr3", saved3]]),
+      skipPreviewCreativeIds: new Set(["cr1", "cr3"]),
+    });
+
+    expect(graph.creativeSubrequestIds).toEqual(["cr2"]);
+    expect(
+      result.ads.map((item) => [item.id, item.previewUrl, item.previewSource]),
+    ).toEqual([
+      ["a1", null, "skipped"],
+      ["a2", url2, "fetched"],
+      ["a3", saved3, "reused"],
+    ]);
+    expect(result.previewStats).toMatchObject({
+      distinctCreatives: 3,
+      creativesReused: 1,
+      creativesSkipped: 1,
+      creativesRequested: 1,
     });
   });
 
@@ -160,7 +232,10 @@ describe("MetaAdapter preview enrichment reuse", () => {
     videoCreative(graph, "cr2", "vShared");
     videoCreative(graph, "cr3", "vOther");
 
-    const result = await adapterFor(graph).listAdsWithPreviewStats({
+    const result = await adapterFor(
+      graph,
+      VIDEO_THUMBNAILS_ON,
+    ).listAdsWithPreviewStats({
       accessToken: TOKEN,
       adAccountId: ACCOUNT,
     });
@@ -326,7 +401,10 @@ describe("MetaAdapter preview enrichment reuse", () => {
     graph.itemFault = (kind) =>
       kind === "video" ? { kind: "code", code: 503 } : null;
 
-    const result = await adapterFor(graph).listAdsWithPreviewStats({
+    const result = await adapterFor(
+      graph,
+      VIDEO_THUMBNAILS_ON,
+    ).listAdsWithPreviewStats({
       accessToken: TOKEN,
       adAccountId: ACCOUNT,
     });

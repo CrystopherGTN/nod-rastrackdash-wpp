@@ -1,7 +1,10 @@
 import { Logger } from "@nestjs/common";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MetaAdapter } from "../../src/integrations/meta/meta.adapter";
-import { MetaReportingService } from "../../src/reporting/meta-reporting.service";
+import {
+  META_PREVIEW_MISS_TTL_MS,
+  MetaReportingService,
+} from "../../src/reporting/meta-reporting.service";
 import { WhatsappCampaignClassifierService } from "../../src/reporting/whatsapp-campaign-classifier.service";
 import {
   FakeMetaGraph,
@@ -25,11 +28,11 @@ type Harness = {
   service: MetaReportingService;
 };
 
-function createHarness(): Harness {
+function createHarness(env: Record<string, string> = {}): Harness {
   const graph = new FakeMetaGraph();
   const prisma = createFakeReportingPrisma();
   const adapter = new MetaAdapter(
-    { META_GRAPH_SLOW_LOG_MS: "999999" },
+    { META_GRAPH_SLOW_LOG_MS: "999999", ...env },
     graph.fetch,
   );
   const service = new MetaReportingService(
@@ -155,8 +158,14 @@ describe("MetaReportingService preview reuse", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
   });
+
+  function advanceClock(ms: number): void {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(Date.now() + ms));
+  }
 
   function previewLogLines(): string[] {
     return logSpy.mock.calls
@@ -212,11 +221,11 @@ describe("MetaReportingService preview reuse", () => {
     expect(savedAd(harness, "w1", "a3")?.previewUrl).toBe(url1);
     expect(savedAd(harness, "w1", "a1")?.spendCents).toBe(150);
     expect(previewLogLines().at(-1)).toMatch(
-      /distinctCreatives=2 reused=2 requested=0 .*creativeBatches=0 .*videoBatches=0/,
+      /distinctCreatives=2 reused=2 skipped=0 requested=0 .*creativeBatches=0 .*videoBatches=0/,
     );
   });
 
-  it("refreshes expired, expiring, unknown-host and new creatives but reuses the valid one", async () => {
+  it("reuses every saved preview regardless of the CDN expiry hint and requests only new creatives", async () => {
     const harness = createHarness();
     seedWorkspace(harness, "w1", [
       { id: "ra1", businessId: "b1", adAccountId: "act_1" },
@@ -233,45 +242,33 @@ describe("MetaReportingService preview reuse", () => {
     );
     await sync(harness, "w1");
 
-    setSavedPreview(harness, "w1", "a1", fbcdnUrl("old1", hoursFromNow(-2)));
-    setSavedPreview(
-      harness,
-      "w1",
-      "a2",
-      "https://cdn.example.com/a2.jpg?oe=7fffffff",
-    );
-    setSavedPreview(harness, "w1", "a3", fbcdnUrl("old3", hoursFromNow(2)));
+    const expired = fbcdnUrl("old1", hoursFromNow(-2));
+    const otherHost = "https://cdn.example.com/a2.jpg?oe=7fffffff";
+    const expiring = fbcdnUrl("old3", hoursFromNow(2));
+    setSavedPreview(harness, "w1", "a1", expired);
+    setSavedPreview(harness, "w1", "a2", otherHost);
+    setSavedPreview(harness, "w1", "a3", expiring);
     const kept4 = savedAd(harness, "w1", "a4")?.previewUrl;
     ads.push(ad("a5", "cr5"));
     harness.graph.accounts.set("act_1", fakeAccount(ads));
-    const fresh = {
-      cr1: imageCreative(harness.graph, "cr1", 96),
-      cr2: imageCreative(harness.graph, "cr2", 96),
-      cr3: imageCreative(harness.graph, "cr3", 96),
-      cr5: imageCreative(harness.graph, "cr5", 96),
-    };
+    const fresh5 = imageCreative(harness.graph, "cr5", 96);
     harness.graph.resetCounters();
 
     await sync(harness, "w1");
 
-    expect(harness.graph.creativeSubrequestIds.sort()).toEqual([
-      "cr1",
-      "cr2",
-      "cr3",
-      "cr5",
-    ]);
+    expect(harness.graph.creativeSubrequestIds).toEqual(["cr5"]);
     expect(harness.graph.creativeBatches).toBe(1);
-    expect(savedAd(harness, "w1", "a1")?.previewUrl).toBe(fresh.cr1);
-    expect(savedAd(harness, "w1", "a2")?.previewUrl).toBe(fresh.cr2);
-    expect(savedAd(harness, "w1", "a3")?.previewUrl).toBe(fresh.cr3);
+    expect(savedAd(harness, "w1", "a1")?.previewUrl).toBe(expired);
+    expect(savedAd(harness, "w1", "a2")?.previewUrl).toBe(otherHost);
+    expect(savedAd(harness, "w1", "a3")?.previewUrl).toBe(expiring);
     expect(savedAd(harness, "w1", "a4")?.previewUrl).toBe(kept4);
-    expect(savedAd(harness, "w1", "a5")?.previewUrl).toBe(fresh.cr5);
+    expect(savedAd(harness, "w1", "a5")?.previewUrl).toBe(fresh5);
     expect(previewLogLines().at(-1)).toMatch(
-      /reused=1 requested=4 succeeded=4 failed=0/,
+      /reused=4 skipped=0 requested=1 succeeded=1 failed=0/,
     );
   });
 
-  it("preserves the prior same-creative preview when the whole creative batch is rate limited", async () => {
+  it("does not call Graph for creatives with saved previews even while Graph is rate limited", async () => {
     const harness = createHarness();
     seedWorkspace(harness, "w1", [
       { id: "ra1", businessId: "b1", adAccountId: "act_1" },
@@ -283,7 +280,7 @@ describe("MetaReportingService preview reuse", () => {
     imageCreative(harness.graph, "cr1");
     imageCreative(harness.graph, "cr2");
     await sync(harness, "w1");
-    const stale1 = fbcdnUrl("stale1", hoursFromNow(3));
+    const stale1 = fbcdnUrl("stale1", hoursFromNow(-3));
     const stale2 = fbcdnUrl("stale2", hoursFromNow(3));
     setSavedPreview(harness, "w1", "a1", stale1);
     setSavedPreview(harness, "w1", "a2", stale2);
@@ -294,15 +291,12 @@ describe("MetaReportingService preview reuse", () => {
     const result = await sync(harness, "w1");
 
     expect(result).toMatchObject({ accountsSynced: 1, accountsFailed: 0 });
-    expect(harness.graph.creativeBatches).toBe(1);
+    expect(harness.graph.creativeBatches).toBe(0);
     expect(savedAd(harness, "w1", "a1")?.previewUrl).toBe(stale1);
     expect(savedAd(harness, "w1", "a2")?.previewUrl).toBe(stale2);
-    expect(previewLogLines().at(-1)).toMatch(
-      /failed=2 .*rateLimited=2 .*preservedAfterFailure=2/,
-    );
   });
 
-  it("preserves only the failing item's prior preview on a per-item 500", async () => {
+  it("does not request a new creative that failed again until the miss TTL expires", async () => {
     const harness = createHarness();
     seedWorkspace(harness, "w1", [
       { id: "ra1", businessId: "b1", adAccountId: "act_1" },
@@ -311,28 +305,54 @@ describe("MetaReportingService preview reuse", () => {
       "act_1",
       fakeAccount([ad("a1", "cr1"), ad("a2", "cr2")]),
     );
-    imageCreative(harness.graph, "cr1");
-    imageCreative(harness.graph, "cr2");
-    await sync(harness, "w1");
-    const stale1 = fbcdnUrl("stale1", hoursFromNow(3));
-    setSavedPreview(harness, "w1", "a1", stale1);
-    setSavedPreview(harness, "w1", "a2", fbcdnUrl("stale2", hoursFromNow(3)));
-    const fresh2 = imageCreative(harness.graph, "cr2", 96);
+    const url1 = imageCreative(harness.graph, "cr1");
+    const url2 = imageCreative(harness.graph, "cr2");
     harness.graph.itemFault = (kind, key) =>
-      kind === "creative" && key === "cr1" ? { kind: "code", code: 500 } : null;
-    harness.graph.resetCounters();
+      kind === "creative" && key === "cr2" ? { kind: "code", code: 500 } : null;
 
     await sync(harness, "w1");
+    expect(savedAd(harness, "w1", "a1")?.previewUrl).toBe(url1);
+    expect(savedAd(harness, "w1", "a2")?.previewUrl).toBeNull();
 
-    expect(savedAd(harness, "w1", "a1")?.previewUrl).toBe(stale1);
-    expect(savedAd(harness, "w1", "a2")?.previewUrl).toBe(fresh2);
-    expect(previewLogLines().at(-1)).toMatch(
-      /succeeded=1 failed=1 .*rateLimited=0 serverError=1 .*preservedAfterFailure=1/,
-    );
+    harness.graph.itemFault = () => null;
+    harness.graph.resetCounters();
+    await sync(harness, "w1");
+    expect(harness.graph.creativeBatches).toBe(0);
+    expect(savedAd(harness, "w1", "a2")?.previewUrl).toBeNull();
+    expect(previewLogLines().at(-1)).toMatch(/reused=1 skipped=1 requested=0/);
+
+    advanceClock(META_PREVIEW_MISS_TTL_MS + 60_000);
+    harness.graph.resetCounters();
+    await sync(harness, "w1");
+    expect(harness.graph.creativeSubrequestIds).toEqual(["cr2"]);
+    expect(savedAd(harness, "w1", "a2")?.previewUrl).toBe(url2);
   });
 
-  it("preserves a prior video preview when only the video thumbnail batch fails", async () => {
+  it("uses the creative's own thumbnail for video creatives and never calls /{video}/thumbnails by default", async () => {
     const harness = createHarness();
+    seedWorkspace(harness, "w1", [
+      { id: "ra1", businessId: "b1", adAccountId: "act_1" },
+    ]);
+    harness.graph.accounts.set("act_1", fakeAccount([ad("a1", "cr1")]));
+    const small = fbcdnUrl("small", hoursFromNow(72));
+    harness.graph.creatives.set("cr1", {
+      id: "cr1",
+      videoId: "v1",
+      thumbnailUrl: small,
+    });
+    harness.graph.videoThumbnails.set("v1", [
+      { uri: fbcdnUrl("big", hoursFromNow(72)), width: 1080, height: 1080 },
+    ]);
+
+    await sync(harness, "w1");
+
+    expect(harness.graph.creativeBatches).toBe(1);
+    expect(harness.graph.videoBatches).toBe(0);
+    expect(savedAd(harness, "w1", "a1")?.previewUrl).toBe(small);
+  });
+
+  it("still uses the larger video thumbnail when META_VIDEO_THUMBNAILS_ENABLED=true", async () => {
+    const harness = createHarness({ META_VIDEO_THUMBNAILS_ENABLED: "true" });
     seedWorkspace(harness, "w1", [
       { id: "ra1", businessId: "b1", adAccountId: "act_1" },
     ]);
@@ -342,21 +362,15 @@ describe("MetaReportingService preview reuse", () => {
       videoId: "v1",
       thumbnailUrl: fbcdnUrl("small", hoursFromNow(72)),
     });
+    const big = fbcdnUrl("big", hoursFromNow(72));
     harness.graph.videoThumbnails.set("v1", [
-      { uri: fbcdnUrl("big", hoursFromNow(72)), width: 1080, height: 1080 },
+      { uri: big, width: 1080, height: 1080 },
     ]);
-    await sync(harness, "w1");
-    const stale = fbcdnUrl("stale-big", hoursFromNow(3));
-    setSavedPreview(harness, "w1", "a1", stale);
-    harness.graph.batchFault = (kind) =>
-      kind === "video" ? { kind: "http", status: 500 } : null;
-    harness.graph.resetCounters();
 
     await sync(harness, "w1");
 
-    expect(harness.graph.creativeBatches).toBe(1);
     expect(harness.graph.videoBatches).toBe(1);
-    expect(savedAd(harness, "w1", "a1")?.previewUrl).toBe(stale);
+    expect(savedAd(harness, "w1", "a1")?.previewUrl).toBe(big);
   });
 
   it("clears the old image when the ad's creative changed and the new creative fails", async () => {
@@ -409,15 +423,12 @@ describe("MetaReportingService preview reuse", () => {
     });
   });
 
-  it("writes null when Graph successfully returns the same creative without media", async () => {
+  it("writes null for a creative Graph returns without media and does not request it again within the TTL", async () => {
     const harness = createHarness();
     seedWorkspace(harness, "w1", [
       { id: "ra1", businessId: "b1", adAccountId: "act_1" },
     ]);
     harness.graph.accounts.set("act_1", fakeAccount([ad("a1", "cr1")]));
-    imageCreative(harness.graph, "cr1");
-    await sync(harness, "w1");
-    setSavedPreview(harness, "w1", "a1", fbcdnUrl("stale", hoursFromNow(3)));
     harness.graph.creatives.set("cr1", { id: "cr1" });
 
     await sync(harness, "w1");
@@ -426,6 +437,11 @@ describe("MetaReportingService preview reuse", () => {
     expect(previewLogLines().at(-1)).toMatch(
       /absent=1 .*preservedAfterFailure=0/,
     );
+
+    harness.graph.resetCounters();
+    await sync(harness, "w1");
+    expect(harness.graph.creativeBatches).toBe(0);
+    expect(previewLogLines().at(-1)).toMatch(/skipped=1 requested=0/);
   });
 
   it("preserves the list thumbnail on transient omission only for the same creative", async () => {
@@ -644,7 +660,7 @@ describe("MetaReportingService preview reuse", () => {
       await sync(harness, "wBig");
       const warm = snapshot(harness);
 
-      // Mixed: 100 saved video previews close to expiry + 150 brand-new ads/creatives
+      // Mixed: 100 saved video previews close to expiry (reused anyway) + 150 brand-new ads/creatives
       // (50 on new videos, 25 on already-known videos, 75 images).
       for (let index = 0; index < 100; index += 1) {
         for (const row of harness.prisma.metaAd.rows) {
@@ -667,6 +683,7 @@ describe("MetaReportingService preview reuse", () => {
           harness.graph.creatives.set(creativeId, {
             id: creativeId,
             videoId: `vNew${index}`,
+            thumbnailUrl: fbcdnUrl(`smallNew${index}`, hoursFromNow(72)),
           });
           harness.graph.videoThumbnails.set(`vNew${index}`, [
             {
@@ -679,6 +696,7 @@ describe("MetaReportingService preview reuse", () => {
           harness.graph.creatives.set(creativeId, {
             id: creativeId,
             videoId: `v${200 + (index - 50)}`,
+            thumbnailUrl: fbcdnUrl(`smallKnown${index}`, hoursFromNow(72)),
           });
         } else {
           imageCreative(harness.graph, creativeId);
@@ -697,13 +715,15 @@ describe("MetaReportingService preview reuse", () => {
         `[large-account-harness] ${JSON.stringify({ ads: ADS, creatives: CREATIVES, videoIds: VIDEO_IDS, cold, warm, mixed, warmAfterMixed })}\n`,
       );
 
+      // Video thumbnails are opt-in (META_VIDEO_THUMBNAILS_ENABLED), so there
+      // are no /{video}/thumbnails batches at all.
       expect(cold).toEqual({
         creativeBatches: 48,
         creativeSubrequests: 2400,
         distinctCreativeSubrequests: 2400,
-        videoBatches: 10,
-        videoSubrequests: 500,
-        distinctVideoSubrequests: 500,
+        videoBatches: 0,
+        videoSubrequests: 0,
+        distinctVideoSubrequests: 0,
         getRequests: cold.getRequests,
       });
       expect(warm).toEqual({
@@ -715,15 +735,15 @@ describe("MetaReportingService preview reuse", () => {
         distinctVideoSubrequests: 0,
         getRequests: cold.getRequests,
       });
-      // 100 expiring + 150 new = 250 creatives -> 5 batches.
-      // Videos: v0..v99 (expiring) + v200..v224 (known, used by new) + 50 new = 175 -> 4 batches.
+      // Expiring saved previews are reused; only the 150 new creatives are
+      // requested -> 3 batches, and no video thumbnail batches.
       expect(mixed).toMatchObject({
-        creativeBatches: 5,
-        creativeSubrequests: 250,
-        distinctCreativeSubrequests: 250,
-        videoBatches: 4,
-        videoSubrequests: 175,
-        distinctVideoSubrequests: 175,
+        creativeBatches: 3,
+        creativeSubrequests: 150,
+        distinctCreativeSubrequests: 150,
+        videoBatches: 0,
+        videoSubrequests: 0,
+        distinctVideoSubrequests: 0,
       });
       expect(mixedResult).toMatchObject({ accountsSynced: 1, adsSynced: 3150 });
       expect(warmAfterMixed).toMatchObject({
