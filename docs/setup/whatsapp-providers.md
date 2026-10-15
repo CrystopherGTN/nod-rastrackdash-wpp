@@ -15,9 +15,9 @@ qualquer provedor.
 
 | Modelo | Onde se cria | Escopo | Providers |
 |---|---|---|---|
-| **Conexão de provedor + receiver** (`WhatsappInstance`) | `/integrations` → painel **"Provedores e receivers"** | **Por workspace, quantas você quiser** | `uazapi_byo`, `nod_api`, `waha`, `zapi` |
-| **Conexão de webhook de entrada** (`InboundWebhookConnection`) | `/integrations` → painel **"Webhooks de entrada"** | **Por workspace, quantas você quiser** | `umbler`, `gupshup`, `data_crazy`, `meta_cloud` (self-service); `uazapi` só automático (ver abaixo) |
-| **Meta Ads (conta de anúncios)** | `/integrations` → conexão manual Meta | Por workspace | `meta` — token de usuário do sistema, veja [`meta-manual.md`](meta-manual.md) |
+| **Conexão de provedor + receiver** (`WhatsappInstance`) | `/integrations` → aba **WhatsApp** → card do provedor (Uazapi; WAHA, Z-API e NOD API aparecem como "Em breve" — conexões já existentes continuam gerenciáveis) | **Por workspace, quantas você quiser** | `uazapi_byo`, `nod_api`, `waha`, `zapi` |
+| **Conexão de webhook de entrada** (`InboundWebhookConnection`) | `/integrations` → aba **Atendimento e vendas** → card Umbler Talk / Gupshup / Data Crazy; aba **WhatsApp** → card **WhatsApp Cloud API** (Meta) | **Por workspace, quantas você quiser** | `umbler`, `gupshup`, `data_crazy`, `meta_cloud` (self-service); `uazapi` só automático (ver abaixo) |
+| **Meta Ads (conta de anúncios)** | `/integrations` → aba **Anúncios** → card **Meta Ads** (login social ou token; não recebe conversas) | Por workspace | `meta` — token de usuário do sistema, veja [`meta-manual.md`](meta-manual.md) |
 
 Os dois primeiros modelos entregam **mensagens**. O terceiro entrega
 **anúncios, Pixel e destino de conversão** — ele não recebe mensagem
@@ -42,27 +42,27 @@ Na prática:
   só para todos) e para o card de status global "Instância Uazapi (BYO)"
   que ainda aparece no fim da página de Integrações.
 
-> ⚠️ O card **"Instância Uazapi (BYO)"** no rodapé de `/integrations`
-> continua descrevendo só o modo env único ("Esta edição conecta uma única
-> instância Uazapi configurada por variável de ambiente"). Esse texto se
-> refere **àquele card**, não ao painel "Provedores e receivers" logo
-> acima, que é por workspace. Se o aluno perguntar, é isso: dois painéis,
-> dois escopos.
+> ⚠️ Dentro do card **Uazapi** (aba WhatsApp), o bloco **"Instância Uazapi
+> (BYO)"** continua descrevendo só o modo env único ("Esta edição também lê
+> uma instância Uazapi configurada por variável de ambiente"). Esse texto se
+> refere **àquele bloco** (status global do deployment), não às conexões
+> por workspace listadas acima dele no mesmo card. Se o aluno perguntar, é
+> isso: dois blocos, dois escopos.
 
-## Painel "Provedores e receivers" — o que o aluno faz
+## Aba WhatsApp — Uazapi (WAHA, Z-API e NOD API: Em breve): o que o aluno faz
 
-Em `/integrations`, no painel **Provedores e receivers**:
+Em `/integrations`, aba **WhatsApp**, clique no card do provedor (Uazapi; WAHA, Z-API e NOD API estão como "Em breve" para novas conexões). A janela que abre já vem fixa nesse provedor:
 
-1. **Criar a conexão.** Escolha o **Provedor**, dê um **Nome** (é esse
+1. **Criar a conexão.** Dê um **Nome** (é esse
    nome que a exclusão vai pedir de volta) e um **Nome exibido**
    opcional. Os campos de credencial mudam por provedor:
 
    | Provedor | Campos pedidos na UI |
    |---|---|
    | Uazapi (BYO) | URL da API, Token, Instance ID (opcional) |
-   | WAHA | URL da API, API key, Sessão |
-   | Z-API | URL da API, Token, Instance ID |
-   | NOD API | Instance ID, Instance token |
+   | WAHA (Em breve no Hub; só conexões já existentes) | URL da API, API key, Sessão |
+   | Z-API (Em breve no Hub; só conexões já existentes) | URL da API, Token, Instance ID |
+   | NOD API (Em breve no Hub; só conexões já existentes) | Instance ID, Instance token |
 
    As credenciais vão **criptografadas** para o banco da API e nunca
    voltam para a tela. Digite direto no formulário — nunca em chat.
@@ -95,9 +95,9 @@ Em `/integrations`, no painel **Provedores e receivers**:
 | Rota | Autenticação confirmada | Vínculo obrigatório do payload | Status |
 |---|---|---|---|
 | `POST /webhooks/whatsapp/:id` — **Uazapi (BYO)** | Token do receiver (header `x-wpptrack-webhook-token`, Bearer ou `?token=`) comparado ao hash salvo | — | **Pronto** |
-| `POST /webhooks/whatsapp/:id` — **WAHA** | Idem | `payload.session` precisa ser **exatamente** a Sessão salva na conexão | **Pronto** |
-| `POST /webhooks/whatsapp/:id` — **Z-API** | Idem | `body.instanceId` precisa ser **exatamente** o Instance ID salvo | **Pronto** |
-| `POST /webhooks/whatsapp/:id` — **NOD API** | Idem | — | **Ainda não existe** — a rota responde `501` ("Receiver inbound para nod_api ainda nao esta disponivel") |
+| `POST /webhooks/whatsapp/:id` — **WAHA** | Idem | `payload.session` precisa ser **exatamente** a Sessão salva na conexão | **Pronto** — Em breve no Hub: só para conexões já existentes |
+| `POST /webhooks/whatsapp/:id` — **Z-API** | Idem | `body.instanceId` precisa ser **exatamente** o Instance ID salvo | **Pronto** — Em breve no Hub: só para conexões já existentes |
+| `POST /webhooks/whatsapp/:id` — **NOD API** | Idem | — | **Ainda não existe** — a rota responde `501` ("Receiver inbound para nod_api ainda nao esta disponivel"). Em breve no Hub: só para conexões já existentes |
 | `POST /webhooks/inbound/:id?token=` — **Umbler / Gupshup / Data Crazy** | `?token=` comparado ao `secretHash` da conexão (rotacionável) | — | **Pronto** |
 | `POST /webhooks/inbound/:id` — **Meta WhatsApp (Cloud API)** | `x-hub-signature-256` via `META_APP_SECRET`; **sem** `META_APP_SECRET`, só é aceito enquanto a conexão está em **observação** | — | **Pronto (CTWA)** — veja a seção Meta Cloud |
 | `GET /webhooks/inbound/:id` — handshake Meta Cloud | `hub.verify_token` comparado ao **Verify token** daquela conexão | `hub.mode=subscribe` | **Pronto** |
@@ -151,16 +151,18 @@ configuração mais comum hoje.
   origem "Mensagem no WhatsApp" com autor **equipe** nunca vai casar numa
   conexão `meta_cloud`. Quem precisa disso hoje usa **Uazapi (BYO)** ou
   **Umbler Talk**.
-- **Gatilhos vindos de CRM / call center** (Kommo, Kinbox e similares):
+- **Gatilhos vindos de CRM** — **Kommo existe** e é conectado em
+  `/integrations` → aba **CRM** → card **Kommo** (somente o dono da conta);
+  ele não depende da conexão Meta Cloud. **Kinbox e outros CRM / call center**:
   **futuro**, não existe no código.
 - Mensagem recebida **sem** `referral.ctwa_clid` é ignorada
   (`ignored_no_ctwa`) — não vira lead.
 
 ### Passo a passo
 
-1. Em `/integrations`, painel **Webhooks de entrada**, clique em
-   **Adicionar conexão** e escolha a plataforma **Meta WhatsApp (Cloud
-   API)**. Dê um nome à conexão e clique em **Gerar webhook**.
+1. Em `/integrations`, aba **WhatsApp**, abra o card **WhatsApp Cloud API**,
+   clique em **Adicionar conexão** (já aberto quando não há nenhuma), dê
+   um nome à conexão e clique em **Gerar webhook**.
 2. A tela mostra, **uma única vez**, dois valores em linhas separadas:
    **URL de callback** e **Verify token (token de verificação)**. Copie
    os dois agora — eles não voltam a aparecer. (Diferente de
@@ -268,8 +270,8 @@ use o segredo PalmUP nem envie o valor por chat.
 Use Data Crazy como uma conexão inbound por workspace; ele não exige
 credencial ou variável de ambiente própria neste template.
 
-1. Em `/integrations` → **Webhooks de entrada** → **Adicionar conexão**,
-   escolha **Data Crazy**, dê um nome e clique em **Gerar webhook**.
+1. Em `/integrations` → aba **Atendimento e vendas** → card **Data Crazy**,
+   dê um nome e clique em **Gerar webhook**.
 2. Copie a **URL de callback** completa, incluindo `?token=`. Ela aparece
    uma única vez; se perder, use **Gerar nova URL**, que invalida a URL
    anterior.
@@ -290,9 +292,8 @@ credencial ou variável de ambiente própria neste template.
 
 ## Umbler Talk e Gupshup — conexão de webhook de entrada
 
-1. Em `/integrations` → **Webhooks de entrada** → **Adicionar conexão**,
-   escolha **Umbler Talk** ou **Gupshup**, dê um nome e clique em
-   **Gerar webhook**.
+1. Em `/integrations` → aba **Atendimento e vendas** → card **Umbler Talk**
+   ou **Gupshup**, dê um nome e clique em **Gerar webhook**.
 2. Copie a **URL de callback** (aqui ela já vem com o `?token=`) e cole
    no campo de webhook do painel da Umbler/Gupshup. Ela aparece **uma
    única vez**; se perder, use **Gerar nova URL** (isso invalida a
@@ -311,8 +312,8 @@ número recebe.
 
 ## Uazapi, NOD API, WAHA e Z-API — por onde os gatilhos aparecem
 
-As conexões desse painel **não** aparecem sozinhas na lista de
-"Webhooks de entrada": para Uazapi, o produto cria a origem de gatilhos
+As conexões desses provedores **não** aparecem sozinhas nos cards de
+webhook de entrada (Umbler, Gupshup, Data Crazy e WhatsApp Cloud API): para Uazapi, o produto cria a origem de gatilhos
 automaticamente (`UazapiConversionBridgeService`) a partir da conexão
 WhatsApp — uma conexão vira uma origem e um canal, de forma idempotente.
 
@@ -336,10 +337,10 @@ Consequências práticas, confirmadas no código:
   passo que você esqueceu de clicar.
 - **NOD API** ainda não tem receiver inbound (a rota responde `501`).
 
-> ⚠️ Os cartões de status do painel "Provedores e receivers" ainda trazem
-> o texto antigo *"Ingestion pendente: receiver e parser WAHA/Z-API ainda
-> nao existem"*. Esse texto está desatualizado em relação ao backend
-> (os receivers existem e estão ligados). Vale o que está na matriz acima.
+> ℹ️ No Hub, WAHA, Z-API e NOD API aparecem como **Em breve**: não é possível
+> criar conexões novas; as já existentes continuam gerenciáveis. Os receivers
+> de WAHA e Z-API existem no backend (matriz acima), mas só quem já tem a
+> conexão os usa por enquanto.
 
 ## Gatilhos de conversão exigem as envs `INBOUND_*`
 
@@ -380,6 +381,7 @@ Depois, **redeploy da API**. Detalhe de cada variável em
   `NOD_API_BROKER_URL` (já preenchida no `.env.example`); o broker
   autentica com a `LICENSE_KEY` + fingerprint da instância.
 - Status/health: pronto. **Receiver inbound: ainda não existe** (`501`).
+- **Em breve no Hub:** não é possível criar conexões novas; as já existentes continuam gerenciáveis.
 
 ### WAHA (`waha`, self-host)
 
@@ -391,6 +393,7 @@ Depois, **redeploy da API**. Detalhe de cada variável em
   Se você mudou a sessão, use **Gerar receiver** de novo (isso também
   regrava a sessão a partir da configuração salva).
 - Ainda **sem** ponte automática para a central de Gatilhos.
+- **Em breve no Hub:** não é possível criar conexões novas; as já existentes continuam gerenciáveis.
 
 ### Z-API (`zapi`)
 
@@ -400,6 +403,7 @@ Depois, **redeploy da API**. Detalhe de cada variável em
 - Receiver inbound: **pronto**, com o mesmo vínculo estrito —
   `body.instanceId` precisa bater com o Instance ID salvo.
 - Ainda **sem** ponte automática para a central de Gatilhos.
+- **Em breve no Hub:** não é possível criar conexões novas; as já existentes continuam gerenciáveis.
 
 ### Data Crazy (`data_crazy`)
 

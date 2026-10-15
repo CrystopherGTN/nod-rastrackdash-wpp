@@ -9,6 +9,44 @@ This is the **initial public release** of the `nod-rastrackdash-wpp` student tem
 
 ### Changed
 
+- **Integrations hub** (`/integrations`, web only): the page is now a catalog
+  with four tabs — **WhatsApp** (Uazapi, WhatsApp Cloud API; WAHA, Z-API and
+  NOD API show "Em breve"), **Atendimento e vendas** (Umbler Talk, Gupshup,
+  Data Crazy), **Anúncios** (Meta Ads: social login or token, traffic data and
+  CAPI conversions — it receives no conversations) and **CRM** (Kommo) — with
+  logo cards (**Ativo** / **Disponível**) and one connection modal per
+  platform. WAHA / Z-API / NOD API: no new connections, but an existing one stays
+  active and manageable. The modals reuse the existing panels, scoped
+  to the platform. New files: `apps/web/src/app/(app)/integrations/hub/*`,
+  `apps/web/src/components/modal.tsx`, logos in `apps/web/public/integrations/`
+  (see `SOURCES.md`; a missing logo falls back to the platform initials). Old
+  `?aba=conversoes|vendas` links open Atendimento e vendas; `?aba=anuncios`
+  opens Anúncios.
+- **Kommo moved from Settings to Integrations → CRM.** Same manager and
+  safeguards; Settings keeps a shortcut card and the rule builder's Kommo
+  option now links to the hub card (`kommoManagerAnchorId` →
+  `kommoManagerHref` in `ProviderConversionRulePanel`).
+- **Removing a WhatsApp number** stays in the provider card (**Excluir**, type
+  the connection name to confirm) — no billing or package flow.
+- **Locked license (HTTP 423)** now shows "Licença bloqueada: alterações
+  indisponíveis…" on WhatsApp-connection, inbound-webhook and Meta writes done
+  from this screen, instead of a generic error. While the license is locked, the write controls of the WhatsApp and
+  inbound-webhook modals are disabled with an explanatory note.
+- No new environment variable, no migration, no new dependency (`pnpm-lock.yaml`
+  unchanged). Web only: rebuild shared, rebuild and redeploy the web; the API is
+  untouched.
+- **If you customized** `integrations/page.tsx`, the Kommo block of
+  `settings/page.tsx`, `settings/kommo-crm-manager.tsx`,
+  `provider-conversion-rule-panel.tsx` or `layout-system.css`, expect merge
+  conflicts: take the official file and re-apply your change in the matching
+  block (each hub modal is an entry of `panels` in `integrations/page.tsx`).
+  Branding (`BRAND_*`), the residual footer, the fixed sidebar and the license
+  guard are not touched.
+- **Verify:** open `/integrations` (four tabs, logo cards, your existing
+  connections under **Ativos**); open a card and check its connections; as the
+  owner open **CRM → Kommo**; as a member confirm there are no write buttons.
+  **Roll back:** revert this change in the web and redeploy — no data changes.
+
 - **Leads novos × leads que voltaram** across Visão Geral, Leads and
   Relatórios: a "lead novo" is a lead whose first contact
   (`Lead.firstMessageAt`, else `createdAt`, America/Sao_Paulo) falls in the
