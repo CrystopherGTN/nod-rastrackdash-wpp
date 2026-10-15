@@ -134,6 +134,7 @@ Conexões por workspace, cada uma com segredo próprio. **Umbler Talk** e **Gups
 1. Abra o card da plataforma (Umbler Talk ou Gupshup) → **Gerar webhook** (a janela já vem fixa na plataforma; use **Adicionar conexão** se já houver outra) e copie a **URL de callback** (aparece uma única vez) para o painel da Umbler/Gupshup.
 2. **Cadastre o canal/número agora**, com o botão **Cadastrar canal/número** — você **não precisa** esperar o primeiro lead chegar. O canal fica provisório e é mesclado automaticamente quando a primeira mensagem real daquele número chegar.
 3. Vá em `/conversions` (menu **Conversões**) → **Nova regra** e escolha o alcance: **Todos os números** ou **Números específicos**.
+4. Os parsers **Umbler v1** e **Gupshup v1** já vêm certificados pela atualização (mesmos contratos em produção no SaaS). A conexão e cada regra só vão para produção quando você ativar, uma a uma.
 
 **Data Crazy** também é uma conexão inbound por workspace, mas o fluxo de
 canal é diferente:
@@ -149,9 +150,11 @@ canal é diferente:
 4. Apenas mensagens inbound com **CTWA** viram leads operacionais.
    Palavra-chave, tag e outros gatilhos de automação do Data Crazy não
    fazem parte do parser v1.
-5. Depois que uma entrega CTWA real for processada em observação, certifique
-   o parser **Data Crazy v1** no backoffice; então configure a rota Meta e
-   ative produção, no mesmo gate de Gupshup e Meta Cloud.
+5. O parser **Data Crazy v1** já vem certificado pela atualização (é o mesmo
+   contrato validado com CTWAs reais no SaaS); não há passo de certificação.
+   Depois que uma entrega CTWA real for processada em observação, configure
+   a rota Meta e ative produção (a conexão e cada regra, uma a uma), no mesmo
+   gate de Gupshup e Meta Cloud. Nada vai para produção sozinho.
 
 ### 10.3 Meta WhatsApp (Cloud API) — conectar a Meta direto (CTWA)
 
@@ -195,7 +198,7 @@ suportado como conexão inbound por webhook, conforme o passo 10.2.
 
 Detalhe completo de cada variável em [`setup/environment.md`](setup/environment.md#gatilhos-de-conversão--obrigatórias-no-caminho-do-aluno).
 
-A origem aparece na central de Gatilhos assim que existe uma conexão inbound (Umbler, Gupshup, Meta Cloud). **Data Crazy** segue o fluxo CTWA de observação, certificação e produção do passo 10.2; o canal só é descoberto após o primeiro webhook. Para **Uazapi**, a origem é criada automaticamente pelo produto quando chega a primeira mensagem **enviada pelo número conectado** ou uma mudança de etiqueta. **WAHA e Z-API** recebem leads normalmente, mas **ainda não** têm essa criação automática de origem na central de Gatilhos — é uma lacuna conhecida, não um passo esquecido.
+A origem aparece na central de Gatilhos assim que existe uma conexão inbound (Umbler, Gupshup, Meta Cloud). **Data Crazy** segue o fluxo CTWA de observação e ativação de produção do passo 10.2 (o parser já vem certificado); o canal só é descoberto após o primeiro webhook. Para **Uazapi**, a origem é criada automaticamente pelo produto quando chega a primeira mensagem **enviada pelo número conectado** ou uma mudança de etiqueta. **WAHA e Z-API** recebem leads normalmente, mas **ainda não** têm essa criação automática de origem na central de Gatilhos — é uma lacuna conhecida, não um passo esquecido.
 
 ## 11. Marca (whitelabel) — opcional
 
