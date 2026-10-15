@@ -74,6 +74,93 @@ This is the **initial public release** of the `nod-rastrackdash-wpp` student tem
   Read-only, so the license soft-lock does not block it. New API dependency
   `exceljs` 4.4.0 — run `pnpm install` on local installs (Docker builds
   already install it).
+- **Conversões — rule scope and "Unificar" (API + shared, Fase 3
+  backend)**: provider conversion rules gain a scope, **Todos os números**
+  (`all_numbers`, every compatible number of the workspace, including numbers
+  connected later) or **Números específicos** (`specific_numbers`, the
+  historical behaviour). A specific rule with the same origin and event
+  replaces the global one on its number; a global rule runs once per phone
+  when the same line is connected twice (Umbler + Uazapi). Capability matrix
+  of this edition: team phrases on Umbler and Uazapi, contact phrases and
+  structured catalog on Umbler, labels on Uazapi (matched by name across
+  instances); WAHA, Z-API and NOD API are not part of provider rules yet
+  ("Em breve"). New endpoints under `/conversion-rules`:
+  `GET providers/capabilities`, `GET providers/unify-candidates`,
+  `POST providers/unify`, `GET providers/create-receipt` (plus the
+  `Idempotency-Key` header on `POST providers`) and `GET legacy` (old
+  keyword/label rules, read-only). Kommo rules keep using the existing
+  `GET /workspaces/:id/kommo/connections`. Every new write goes through the
+  license soft-lock (HTTP 423). Old keyword/label rules can no longer be
+  edited through `PATCH /conversion-rules/:id` once they have a provider
+  configuration (409); edit those through `PATCH providers/:id`.
+  **Migration** `20261015140000_provider_rule_workspace_scope` (additive; the
+  Docker image runs `prisma migrate deploy` at API boot, local installs run it
+  by hand; back up the database first): new table
+  `ProviderRuleCreateClaim`, enum `ProviderConversionRuleScope`, columns
+  `scope` (default `specific_numbers`) and `unifiedIntoProviderRuleId`,
+  `connectionId`/`parserReleaseId` become nullable, with a data precheck
+  before the new CHECKs. Existing rules keep working exactly as before until
+  the student unifies them or creates a "Todos os números" rule. No new env
+  var, no new dependency. The Conversões screen (web) is described in the
+  next entry.
+  **Roll back:** before downgrading, DELETE (pausing is not enough) every rule
+  without a connection ("Todos os números" rules and specific rules spanning
+  connections) and reactivate unified originals. Any such row, even paused,
+  makes the previous version fail on `GET /conversion-rules/providers` (Prisma
+  P2032). `SELECT count(*) FROM "ProviderConversionRuleConfig" WHERE
+  "connectionId" IS NULL AND "removedAt" IS NULL` must return 0; execution
+  history of the deleted rules may not open in the previous version. Optional
+  rollback SQL in `docs/releases/unreleased.json`.
+- Uazapi team messages now evaluate structured catalog rules (as the SaaS);
+  existing catalog rules bound to a Uazapi connection, which never fired
+  before, start firing after upgrade.
+
+- **Conversões screen** (`/conversions`, web; Fase 3 UI): a new
+  **Conversões** item in the sidebar (group Gestão, between Integrações and
+  Configurações, for people who manage integrations) lists every rule in one
+  place — phrase, WhatsApp label, catalog order, Umbler automation and, for
+  the account owner, the Kommo stages (read-only, with **Gerenciar no Hub** →
+  `/integrations?abrir=kommo`). Filters: origem, número, evento and status
+  (envio automático, observação, pausadas, unificadas). **Nova regra** has four
+  steps (Origem → Evento → Alcance → Detalhes), offers only what
+  `GET /conversion-rules/providers/capabilities` says this edition supports
+  and the student has connected, and lets the reach be **Todos os números**
+  (new numbers join automatically) or **Números específicos**. WAHA, Z-API
+  and NOD API numbers show as **Em breve**; Gupshup, Data Crazy and WhatsApp
+  Cloud API numbers keep working (their conversions arrive through the
+  provider webhook) and are only noted as not using phrase/label/catalog rules. "Substituída em X" notes explain
+  where a specific rule replaces a global one. **Unificar** is offered, never
+  forced, and the review explains it can be undone. **Gerenciar** edits a
+  rule, shows the Umbler automation address (a new address is shown once) and
+  setup, tests a catalog order and deletes; **Execuções** is the history of
+  any rule, while **Eventos recebidos** (payload and Reprocessar) exists only
+  for the Umbler automation. Old keyword/label rules appear as **Regras
+  antigas** (pause, edit value, connect to numbers). New create is idempotent
+  (`Idempotency-Key`); an unconfirmed create is checked with
+  `GET providers/create-receipt` before anything is resent, and never after a
+  license 423. With a locked license every write control is disabled and shows
+  "Licença bloqueada: …". New files: `apps/web/src/app/(app)/conversions/*`,
+  CSS block at the end of `layout-system.css`; no new dependency or env var.
+- **Settings keeps only "Jornada"**: the "Jornada e gatilhos" section is now
+  "Jornada" (funnel stages) and no longer loads or shows rule panels or the
+  Kommo shortcut. Provider rules live in Conversões; Kommo rules are edited in
+  Integrações → CRM → Kommo. `ProviderConversionRulePanel`
+  (`integrations/provider-conversion-rule-panel.tsx`) and
+  `integrations/provider-conversion-rule-actions.ts` were removed; the actions
+  now live in `conversions/actions.ts` (with license 423 handling). **If you
+  customized** `settings/page.tsx`, `integrations/page.tsx` (the "Regras de
+  conversão" card links now open `/conversions`), `integrations/inbound-webhook-panel.tsx`
+  ("Gerenciar gatilhos" is now "Abrir Conversões", linking to `/conversions`)
+  or those two files, take the official
+  `settings/page.tsx` and re-apply your change inside "Jornada" (or, for rule
+  panels, in `conversions/new-rule-flow.tsx`, `rule-manage.tsx`,
+  `message-phrase-fields.tsx`); accept the removal of the two deleted files.
+  Branding, the residual footer, the fixed sidebar and the license banner are
+  untouched. **Verify:** open Conversões (existing rules show as "Números
+  específicos"), Configurações (only Jornada) and Integrações → CRM → Kommo;
+  as a member the Conversões item is hidden. **Roll back:** revert the web
+  change (including the `integrations/page.tsx` and `inbound-webhook-panel.tsx`
+  links) and redeploy; no data changes.
 
 ### Fixed
 
