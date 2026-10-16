@@ -25,7 +25,7 @@ const names = [
 ];
 const tuple = (v: string) => [...v.matchAll(/"(\w+)"/g)].map((m) => m[1]);
 describe("Pipedrive migration ordering (student edition)", () => {
-  it("is the latest migration and runs after the ConversionEventLog (workspaceId, id) key it references", () => {
+  it("runs after the ConversionEventLog (workspaceId, id) key it references and before Unnichat (Fase 4b)", () => {
     const dir = resolve(__dirname, "../prisma/migrations");
     const names = readdirSync(dir, { withFileTypes: true })
       .filter((entry) => entry.isDirectory())
@@ -33,12 +33,15 @@ describe("Pipedrive migration ordering (student edition)", () => {
       .sort();
     const own = "20261016120000_pipedrive_integration";
     const key = "20261016090000_conversion_event_log_workspace_id_key";
-    expect(names.at(-1)).toBe(own);
+    expect(names).toContain(own);
+    expect(names.indexOf(own)).toBeLessThan(
+      names.indexOf("20261016130000_unnichat_inbound_provider"),
+    );
     expect(names.indexOf(key)).toBeGreaterThan(-1);
     expect(names.indexOf(key)).toBeLessThan(names.indexOf(own));
-    expect(
-      readFileSync(resolve(dir, key, "migration.sql"), "utf8"),
-    ).toContain('ON "ConversionEventLog"("workspaceId", "id")');
+    expect(readFileSync(resolve(dir, key, "migration.sql"), "utf8")).toContain(
+      'ON "ConversionEventLog"("workspaceId", "id")',
+    );
     expect(sql).toContain(
       'REFERENCES "ConversionEventLog"("workspaceId", "id") ON DELETE RESTRICT',
     );
@@ -108,14 +111,16 @@ describe("Pipedrive webhook SQL/schema structural invariants (no PostgreSQL)", (
       ...sql.matchAll(
         /ALTER TABLE "(\w+)" ADD CONSTRAINT "[^"]+" FOREIGN KEY \(([^)]+)\) REFERENCES "(\w+)"\(([^)]+)\) ON DELETE (\w+) ON UPDATE (\w+)/g,
       ),
-    ].map((m) => ({
-      child: m[1],
-      fields: tuple(m[2]),
-      parent: m[3],
-      references: tuple(m[4]),
-      onDelete: m[5],
-      onUpdate: m[6],
-    })).filter((fk) => names.includes(fk.child));
+    ]
+      .map((m) => ({
+        child: m[1],
+        fields: tuple(m[2]),
+        parent: m[3],
+        references: tuple(m[4]),
+        onDelete: m[5],
+        onUpdate: m[6],
+      }))
+      .filter((fk) => names.includes(fk.child));
     const expected = names.flatMap((name) =>
       models.get(name)!.fields.flatMap((f) => {
         const r = f.attrs.match(
@@ -204,7 +209,7 @@ describe("Pipedrive webhook SQL/schema structural invariants (no PostgreSQL)", (
   it("enforces modes, triggers, change kinds, the full catalog and coherent leases/retry/value facts", () => {
     expect(sql).toContain("\"mode\" IN ('observation', 'production')");
     expect(sql).toContain(
-      "(\"trigger\" = 'deal_won' AND \"stageId\" IS NULL AND \"eventName\" = 'Purchase')",
+      '("trigger" = \'deal_won\' AND "stageId" IS NULL AND "eventName" = \'Purchase\')',
     );
     expect(sql).toContain(
       "\"changeKind\" IN ('stage_change', 'deal_won', 'deal_lost', 'ignored')",
