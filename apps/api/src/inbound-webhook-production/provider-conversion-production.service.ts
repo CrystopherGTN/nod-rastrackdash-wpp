@@ -25,6 +25,7 @@ import {
   PAYT_SALE_EVENT_NAMES,
   PAYT_VALUE_CORRECTION_REASON,
   paytLegacyTotalPriceCents,
+  paytProductFilterMatches,
 } from "../inbound-webhooks/providers/payt/payt-automation-v1.parser";
 import { Prisma } from "@prisma/client";
 import {
@@ -149,6 +150,62 @@ type ExecutionRecord = Prisma.ProviderConversionRuleExecutionGetPayload<{
  * ("specific_numbers", exactly the historical check) or a channel whose
  * provider supports the rule origin ("all_numbers", evaluated live).
  */
+/**
+ * Fase 5.3 (SaaS 73a9a56): Meta identity of an Unnichat automation
+ * conversion, derived from the business fact (not the execution), so the
+ * same callback evaluated by two rules (old per-rule URL + per-event URL
+ * routed to another rule) becomes ONE conversion. Lifetime events
+ * (QualifiedLead...): once per lead and click. Others (Purchase...): once per
+ * callback occurrence. Events already sent keep their historical ids.
+ */
+export type AutomationIdentityInput = {
+  workspaceId: string;
+  eventName: string;
+  dedupeMode: "lifetime" | "rolling_window";
+  leadId: string;
+  ctwaClid: string;
+  occurrenceKey: string;
+};
+
+/** Providers whose automation conversions carry a business identity. */
+export const AUTOMATION_IDENTITY_PROVIDERS = ["unnichat", "umbler"] as const;
+export type AutomationIdentityProvider =
+  (typeof AUTOMATION_IDENTITY_PROVIDERS)[number];
+
+/**
+ * Same identity for Umbler (Fase 5.3 review): its occurrence key also comes
+ * only from the callback body (conversation + automation), so the same
+ * callback through the old per-rule URL and the per-event URL, evaluated by
+ * two rules, is one conversion.
+ */
+export function automationConversionIdentity(
+  provider: AutomationIdentityProvider,
+  input: AutomationIdentityInput,
+): string {
+  const namespace = `${provider}-automation-v1`;
+  return createHash("sha256")
+    .update(
+      JSON.stringify(
+        input.dedupeMode === "lifetime"
+          ? [
+              namespace,
+              input.workspaceId,
+              input.eventName,
+              input.leadId,
+              input.ctwaClid,
+            ]
+          : [namespace, input.workspaceId, input.eventName, input.occurrenceKey],
+      ),
+    )
+    .digest("hex");
+}
+
+export function unnichatAutomationConversionIdentity(
+  input: AutomationIdentityInput,
+): string {
+  return automationConversionIdentity("unnichat", input);
+}
+
 function executionChannelInRuleScope(execution: ExecutionRecord): boolean {
   if (!execution.channelId) return false;
   return providerRuleCoversChannel(execution.providerRule, {
@@ -1012,6 +1069,29 @@ export class ProviderConversionProductionService
         occurrence.externalMessageId ??
         occurrence.externalEventId ??
         occurrence.occurrenceKey;
+      // Fase 5.3: an Unnichat automation event may reach two rules (old
+      // per-rule URL + per-event URL routed to another rule). Its Meta
+      // identity comes from the business fact, so both resolve to ONE
+      // conversion (the second one is a dedupe hit, never a second send).
+      const automationIdentity =
+        !purchaseKey &&
+        (AUTOMATION_IDENTITY_PROVIDERS as readonly string[]).includes(
+          occurrence.provider,
+        ) &&
+        decision.rule.triggerType === "provider_automation" &&
+        lead.ctwaClid
+          ? automationConversionIdentity(
+              occurrence.provider as AutomationIdentityProvider,
+              {
+                workspaceId: execution.workspaceId,
+                eventName,
+                dedupeMode: dedupePolicy.mode,
+                leadId: lead.id,
+                ctwaClid: lead.ctwaClid,
+                occurrenceKey: occurrence.occurrenceKey,
+              },
+            )
+          : null;
       const conversion = await this.conversions.recordExternalConversion(
         {
           workspaceId: execution.workspaceId,
@@ -1024,8 +1104,14 @@ export class ProviderConversionProductionService
             ? eventName === "Purchase"
               ? `conversion_purchase_${purchaseKey.slice(9)}`
               : `conversion_${conversionEventMetaEventIdPrefix(eventName)}_${purchaseKey.slice(9)}`
-            : this.metaEventId(execution.id, eventName),
-          dedupeKey: purchaseKey ?? `provider-conversion:${execution.id}`,
+            : automationIdentity
+              ? `${occurrence.provider}_${conversionEventMetaEventIdPrefix(eventName)}_${automationIdentity}`
+              : this.metaEventId(execution.id, eventName),
+          dedupeKey:
+            purchaseKey ??
+            (automationIdentity
+              ? `provider-automation:${occurrence.provider}:${automationIdentity}`
+              : `provider-conversion:${execution.id}`),
           leadId: lead.id,
           phoneHash: lead.phoneHash,
           businessSource: "paid",
@@ -1918,8 +2004,13 @@ export class ProviderConversionProductionService
       eventName: parsed.value.eventName,
     });
     if (
-      // The preserved postback must still be the event of this rule.
+      // The preserved postback must still be the event of this rule and,
+      // when the rule is limited to some products (Fase 5.3), one of them.
       parsed.value.eventName !== decision.occurrence.eventName ||
+      !paytProductFilterMatches(
+        execution.providerRule.productFilterCodes,
+        parsed.value.productCodes ?? [],
+      ) ||
       // The buyer phone may be an equivalent BR form of the lead identity
       // (with/without 55 or the mobile 9th digit).
       !hashPhoneIdentityVariants(parsed.value.phoneCandidates).includes(

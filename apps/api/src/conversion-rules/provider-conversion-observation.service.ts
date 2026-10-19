@@ -25,7 +25,10 @@ import { RUNTIME_ENV, type RuntimeEnv } from "../common/runtime/runtime.module";
 import { parseInboundWebhooksConfig } from "../config/deployment-config";
 import type { ParsedInboundWebhookEvent } from "../inbound-webhooks/providers/inbound-webhook-parser";
 import type { ParsedUmblerAutomationV1 } from "../inbound-webhooks/providers/umbler/umbler-automation-v1.parser";
-import type { ParsedPaytAutomationV1 } from "../inbound-webhooks/providers/payt/payt-automation-v1.parser";
+import {
+  paytProductFilterMatches,
+  type ParsedPaytAutomationV1,
+} from "../inbound-webhooks/providers/payt/payt-automation-v1.parser";
 import type { ParsedUnnichatAutomationV1 } from "../inbound-webhooks/providers/unnichat/unnichat-automation-v1.parser";
 import {
   PAYT_LEAD_OTHER_CHANNEL_REASON,
@@ -53,6 +56,9 @@ import {
   resolveApplicableProviderRules,
   resolveProviderRuleScopeChannelIds,
 } from "./provider-rule-scope";
+
+/** Fase 5.3: sale of a product outside the rule product filter. */
+export const PAYT_PRODUCT_NOT_IN_RULE_REASON = "payt_product_not_in_rule";
 
 const observedRuleInclude = {
   conversionRule: true,
@@ -224,6 +230,12 @@ export class ProviderConversionObservationService {
     evaluationMode?: ProviderConversionEvaluationMode;
     /** Only the explicit production "Reprocessar selecionados" action. */
     manualReplayApproval?: ProviderConversionManualReplayApproval;
+    /**
+     * Fase 5.3 (Umbler): number the URL por evento proved for this callback
+     * (channel.phone or the single number of the contact). A hint, checked
+     * against the rule scope: outside it, the rule does not own the callback.
+     */
+    routedChannelId?: string | null;
   }): Promise<ProviderConversionAutomationObservationResult> {
     if (input.automation.provider === "payt") {
       // One sale (seller + order + event) is one occurrence, whatever endpoint
@@ -281,6 +293,28 @@ export class ProviderConversionObservationService {
       "phoneCandidates" in input.automation
         ? input.automation.phoneCandidates
         : undefined;
+    // Fase 5.3: a sales-platform rule may be limited to some products (by
+    // code). A sale of another product is not this rule's: ignored, never an
+    // error, never sent by it.
+    if (
+      input.automation.provider === "payt" &&
+      !paytProductFilterMatches(
+        rule.productFilterCodes,
+        input.automation.productCodes ?? [],
+      )
+    ) {
+      return {
+        decisionId: null,
+        decisionCode: null,
+        reasonCode: PAYT_PRODUCT_NOT_IN_RULE_REASON,
+        disposition: "ignored",
+        executionId: null,
+        eligibleExecutionId: null,
+        reviewId: null,
+        channelId: null,
+        leadResolved: false,
+      };
+    }
     // Fase 4b (as in the SaaS): an Unnichat automation without ctwa_clid is
     // recorded as blocked (ctwa_missing) and nothing reaches Meta.
     if (this.isUnnichatWithoutCtwa(input.automation)) {
@@ -309,16 +343,21 @@ export class ProviderConversionObservationService {
       deliveryReceivedAt: input.deliveryReceivedAt,
       purchaseLead,
       rule,
+      routedChannelId: input.routedChannelId ?? null,
     });
     // A workspace-wide ("all numbers") automation yields to the specific rule
     // of the same origin and event that owns the resolved number: that rule
     // receives the same callback on its own endpoint and sends it.
     if (channel && providerRuleScope(rule) === "all_numbers") {
-      const overriddenBy = await findOverridingSpecificRuleIds(this.prisma, {
-        workspaceId: input.workspaceId,
-        rule,
-        channelId: channel.id,
-      });
+      const overriddenBy = await this.productAwareOverrides(
+        await findOverridingSpecificRuleIds(this.prisma, {
+          workspaceId: input.workspaceId,
+          rule,
+          channelId: channel.id,
+        }),
+        input.workspaceId,
+        input.automation,
+      );
       if (overriddenBy.length > 0) {
         this.logger.log(
           JSON.stringify({
@@ -458,6 +497,33 @@ export class ProviderConversionObservationService {
       channelId: channel?.id ?? null,
       leadResolved: leadResolution.status === "resolved",
     };
+  }
+
+  /**
+   * Fase 5.3: a specific Payt rule only replaces the global one for the sales
+   * it accepts. A specific rule limited to product A does not silence the
+   * global rule for a sale of product B. Other origins keep the plain
+   * precedence.
+   */
+  private async productAwareOverrides(
+    ruleIds: string[],
+    workspaceId: string,
+    automation: ParsedProviderAutomation,
+  ): Promise<string[]> {
+    if (ruleIds.length === 0 || automation.provider !== "payt") return ruleIds;
+    const filters = await this.prisma.providerConversionRuleConfig.findMany({
+      where: { workspaceId, id: { in: ruleIds } },
+      select: { id: true, productFilterCodes: true },
+    });
+    const byId = new Map(
+      filters.map((rule) => [rule.id, rule.productFilterCodes ?? []]),
+    );
+    return ruleIds.filter((id) =>
+      paytProductFilterMatches(
+        byId.get(id) ?? [],
+        automation.productCodes ?? [],
+      ),
+    );
   }
 
   private async evaluateMessageDelivery(
@@ -800,6 +866,7 @@ export class ProviderConversionObservationService {
     deliveryReceivedAt: Date;
     rule: AutomationRule;
     purchaseLead?: ProviderConversionPaidLeadResolutionDto | null;
+    routedChannelId?: string | null;
   }): Promise<ObservedChannel | null> {
     const contactIdentityHashes = [
       ...new Set(
@@ -894,6 +961,29 @@ export class ProviderConversionObservationService {
       if (candidates.length !== 1) return null;
       if (proof && candidates[0]!.id !== proof.channelId) return null;
       return candidates[0]!;
+    }
+
+    // Fase 5.3: an Umbler callback routed by the URL por evento already has
+    // its number (channel.phone or the contact's single number). Recomputing
+    // it by the last message could pick another number (two numbers within
+    // 30 days) and silently drop or duplicate the conversion.
+    if (input.rule.parserRelease.provider === "umbler" && input.routedChannelId) {
+      if (!channelIds.includes(input.routedChannelId)) return null;
+      return this.prisma.inboundWebhookChannel.findFirst({
+        where: {
+          id: input.routedChannelId,
+          workspaceId: input.workspaceId,
+          connectionId: input.connectionId,
+        },
+        select: {
+          id: true,
+          organizationId: true,
+          providerChannelId: true,
+          status: true,
+          productionActivatedAt: true,
+          conversionEngineMode: true,
+        },
+      });
     }
 
     const recentEvent = await this.prisma.inboundWebhookEvent.findFirst({
