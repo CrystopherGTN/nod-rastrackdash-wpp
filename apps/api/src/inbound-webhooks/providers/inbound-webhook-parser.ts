@@ -24,6 +24,9 @@ export type InboundWebhookDeliveryNormalizedSummary = {
   classification: InboundWebhookEventClassification;
   classificationReason: string;
   eventCount: number;
+  /** Set when a CTWA click is known even without a parsed event (WAHA v2). */
+  hasCtwa?: boolean;
+  adId?: string | null;
 };
 
 export type InboundWebhookEventNormalizedSummary = {
@@ -71,6 +74,12 @@ export type ParsedInboundWebhookContact = {
   externalContactId: string;
   phoneNumber: string;
   name: string | null;
+  /**
+   * WhatsApp LID (Linked ID) of the contact, when the provider reports one
+   * (WAHA GoWS). Kept apart on purpose: it is never used as phoneNumber nor
+   * as the lead identity, which stays the real phone.
+   */
+  lid?: string | null;
 };
 
 export type ParsedInboundWebhookAd = {

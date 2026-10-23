@@ -10,12 +10,12 @@ This is the **initial public release** of the `nod-rastrackdash-wpp` student tem
 ### Changed
 
 - **Integrations hub** (`/integrations`, web only): the page is now a catalog
-  with four tabs — **WhatsApp** (Uazapi, WhatsApp Cloud API; WAHA, Z-API and
+  with four tabs — **WhatsApp** (Uazapi, WAHA, WhatsApp Cloud API; Z-API and
   NOD API show "Em breve"), **Atendimento e vendas** (Umbler Talk, Gupshup,
   Data Crazy), **Anúncios** (Meta Ads: social login or token, traffic data and
   CAPI conversions — it receives no conversations) and **CRM** (Kommo) — with
   logo cards (**Ativo** / **Disponível**) and one connection modal per
-  platform. WAHA / Z-API / NOD API: no new connections, but an existing one stays
+  platform. Z-API / NOD API: no new connections, but an existing one stays
   active and manageable. The modals reuse the existing panels, scoped
   to the platform. New files: `apps/web/src/app/(app)/integrations/hub/*`,
   `apps/web/src/components/modal.tsx`, logos in `apps/web/public/integrations/`
@@ -60,6 +60,86 @@ This is the **initial public release** of the `nod-rastrackdash-wpp` student tem
   migration, no new env var.
 
 ### Added
+
+- **WAHA screen (web)**: the WAHA card in the Hub is released (no "Em breve";
+  the panel mounts even without a connection). The modal asks for name,
+  server URL, API key and session (required) with a short "your own WAHA"
+  guide; **Testar conexão** shows the session status (WORKING, SCAN_QR_CODE,
+  STARTING, STOPPED, FAILED) with what to do in each one (e.g. read the QR in
+  the student's own WAHA panel); **Configurar webhook** calls
+  `configure-webhook` and shows the subscribed events or the pt-BR reason of
+  the refusal; **Configuração manual** asks for confirmation (rotating the
+  token invalidates the current webhook), then shows once the URL with
+  `?token=`, the events and the `X-Wpptrack-Webhook-Token` header. The API key
+  never comes back to the screen; the standard license message appears on a
+  423. Conversions keep WAHA under "Em breve nas regras", with a note that ad
+  lead entry (CTWA) already works. No QR and no server in the app. New file:
+  `waha-session-guidance.ts`; no migration, no new env var.
+- **WAHA with the GoWS engine (API and shared)**.
+  The WAHA server is the student's own: they host it, create the session and
+  scan the QR in their WAHA panel. The app never creates a session nor shows a
+  QR; the connection stores the server URL, the API key and the session
+  (required).
+  - **Parser `waha` v2** (`waha-v2.parser.ts`, registered next to the
+    untouched v1): reads `payload._data.Info` / `payload._data.Message`. Phone
+    from a phone JID or `Info.SenderAlt` (received) / `Info.RecipientAlt`
+    (team), the `:NN` device suffix stripped, the store's own number never a
+    contact; the LID is kept apart in `contact.lid` and never used as the
+    phone (a contact by `@lid` or by phone resolves to the same lead).
+    Groups, Status (`status@broadcast`), broadcast lists and newsletters are
+    discarded. Received messages only from `message`, team messages only from
+    `message.any` (no double count). `ctwa_clid` only from
+    `externalAdReply.ctwaClid`/`ctwa_clid`, searched in every message type and
+    inside `ephemeralMessage`/`viewOnceMessage*` (as the Rastrackapp
+    `findCtwaContext`); `ctwaPayload` is never a clid. `fromMe` must be a real
+    boolean.
+  - **Certified release:** migrations `20261022130000_waha_inbound_provider`
+    (enum value `waha` in `InboundWebhookProvider`) and
+    `20261022130100_waha_parser_release` (`waha`/`v2` certified; retired stays
+    retired). `POST /webhooks/whatsapp/:id` uses v2 while that release is
+    certified, otherwise v1. WAHA has no generic inbound connection (refused
+    with 409, left out of the capabilities).
+  - **Lead entry:** with a clid, ad lead + `LeadSubmitted` (same path as the
+    other providers; the push name only fills an empty lead name). Only
+    `sourceID`, no clid (WhatsApp Status ads, ~22% of clicks): ad lead
+    attributed by the ad id with the `sourceURL`, as in the Rastrackapp, and
+    nothing sent to Meta (`LeadSubmitted` and rules need a clid; the
+    `ctwaPayload` is never used as one). Organic: logged, no lead. WAHA only;
+    Uazapi unchanged.
+    Idempotency keys include the event (`message` / `message.any`);
+    `session.status` updates the connection health; the webhook log keeps a
+    structural summary only (no text, name, LID, phone, clid or thumbnail).
+  - **Adapter:** Testar reads `GET /api/sessions/{s}` and returns the raw
+    status (`providerStatus`: WORKING, SCAN_QR_CODE, STARTING, FAILED,
+    STOPPED); another engine is reported as an error.
+    `POST /integrations/whatsapp-connections/:id/configure-webhook` reads the
+    session and `PUT`s it back with its config preserved, replacing only our
+    webhook (`message`, `message.any`, `session.status`, token in the
+    `X-Wpptrack-Webhook-Token` header, linear retries); the token hash is
+    stored only after the WAHA accepts it. `rotate-webhook-token` adds
+    `wahaManualSetup` (URL with `?token=`, events, header name). No HMAC yet.
+  - **Shared contracts:** `WAHA_GOWS_WEBHOOK_EVENTS`,
+    `WAHA_WEBHOOK_TOKEN_HEADER`, `wahaWebhookManualSetupSchema`,
+    `whatsappConnectionWebhookConfigureResultSchema`, `providerStatus` on the
+    test result, `waha` in `inboundWebhookProviders`.
+  - WAHA phrase rules stay locked (`UNSUPPORTED_RULE_WHATSAPP_PROVIDERS`).
+    Synthetic GoWS fixtures in `apps/api/test/fixtures/waha-gows/` (README; an
+    anonymity test guards them). Guide: `docs/setup/whatsapp-providers.md`.
+    No new env var or dependency. Roll back: see `docs/releases/unreleased.json`.
+  - **Review fixes:** the session `PUT` (it restarts the session) waits up to
+    30 s and, on timeout or 5xx, re-reads the session and succeeds only if our
+    webhook with the new token is saved; no `PUT` when the session config
+    returns masked secrets (`masked_secrets`, manual setup suggested); an
+    ad click whose contact only has a LID keeps the metric
+    (`ctwa_contact_phone_unresolved`, `hasCtwa`/`adId` in the log) and is
+    resolved through the student's WAHA (`GET /api/{session}/lids/{lid}`, 3 s,
+    best effort) before giving up; `session.status` only applies when newer
+    than the last health check (envelope `timestamp`); `fromMe` falls back to
+    `Info.IsFromMe` and the time to the envelope `timestamp`; manual setup
+    leads with the header (`webhookUrl` in `wahaManualSetup`), the `?token=`
+    URL is the alternative; "Configurar webhook" asks to confirm the restart
+    and a 403 has its own message. Migrations renamed to
+    `20261022130000_*`/`20261022130100_*` (not applied anywhere yet).
 
 - **Fase 5.3 — Single URL per platform and per-event URLs (API, shared and screens)**,
   ported from the SaaS (`6d4aa02`, `a9d2d3c`, `613beb3`, `22c6506`, `46fb0df`,

@@ -15,7 +15,7 @@ qualquer provedor.
 
 | Modelo | Onde se cria | Escopo | Providers |
 |---|---|---|---|
-| **Conexão de provedor + receiver** (`WhatsappInstance`) | `/integrations` → aba **WhatsApp** → card do provedor (Uazapi; WAHA, Z-API e NOD API aparecem como "Em breve" — conexões já existentes continuam gerenciáveis) | **Por workspace, quantas você quiser** | `uazapi_byo`, `nod_api`, `waha`, `zapi` |
+| **Conexão de provedor + receiver** (`WhatsappInstance`) | `/integrations` → aba **WhatsApp** → card do provedor (Uazapi e WAHA; Z-API e NOD API aparecem como "Em breve" — conexões já existentes continuam gerenciáveis) | **Por workspace, quantas você quiser** | `uazapi_byo`, `nod_api`, `waha`, `zapi` |
 | **Conexão de webhook de entrada** (`InboundWebhookConnection`) | `/integrations` → aba **Atendimento e vendas** → card Umbler Talk / Gupshup / Data Crazy / Unnichat; aba **WhatsApp** → card **WhatsApp Cloud API** (Meta) | **Por workspace, quantas você quiser** | `umbler`, `gupshup`, `data_crazy`, `unnichat` (conexão presa ao número; [`unnichat.md`](unnichat.md)), `meta_cloud` (self-service); `uazapi` só automático (ver abaixo) |
 | **Meta Ads (conta de anúncios)** | `/integrations` → aba **Anúncios** → card **Meta Ads** (login social ou token; não recebe conversas) | Por workspace | `meta` — token de usuário do sistema, veja [`meta-manual.md`](meta-manual.md) |
 
@@ -49,9 +49,9 @@ Na prática:
 > por workspace listadas acima dele no mesmo card. Se o aluno perguntar, é
 > isso: dois blocos, dois escopos.
 
-## Aba WhatsApp — Uazapi (WAHA, Z-API e NOD API: Em breve): o que o aluno faz
+## Aba WhatsApp — Uazapi e WAHA (Z-API e NOD API: Em breve): o que o aluno faz
 
-Em `/integrations`, aba **WhatsApp**, clique no card do provedor (Uazapi; WAHA, Z-API e NOD API estão como "Em breve" para novas conexões). A janela que abre já vem fixa nesse provedor:
+Em `/integrations`, aba **WhatsApp**, clique no card do provedor (Uazapi ou WAHA; Z-API e NOD API estão como "Em breve" para novas conexões). A janela que abre já vem fixa nesse provedor:
 
 1. **Criar a conexão.** Dê um **Nome** (é esse
    nome que a exclusão vai pedir de volta) e um **Nome exibido**
@@ -60,7 +60,7 @@ Em `/integrations`, aba **WhatsApp**, clique no card do provedor (Uazapi; WAHA, 
    | Provedor | Campos pedidos na UI |
    |---|---|
    | Uazapi (BYO) | URL da API, Token, Instance ID (opcional) |
-   | WAHA (Em breve no Hub; só conexões já existentes) | URL da API, API key, Sessão |
+   | WAHA (GoWS, servidor seu) | Nome, URL da API, API key, **Sessão** (obrigatória); veja [WAHA com motor GoWS](#waha-com-motor-gows-waha-servidor-do-aluno) |
    | Z-API (Em breve no Hub; só conexões já existentes) | URL da API, Token, Instance ID |
    | NOD API (Em breve no Hub; só conexões já existentes) | Instance ID, Instance token |
 
@@ -95,7 +95,7 @@ Em `/integrations`, aba **WhatsApp**, clique no card do provedor (Uazapi; WAHA, 
 | Rota | Autenticação confirmada | Vínculo obrigatório do payload | Status |
 |---|---|---|---|
 | `POST /webhooks/whatsapp/:id` — **Uazapi (BYO)** | Token do receiver (header `x-wpptrack-webhook-token`, Bearer ou `?token=`) comparado ao hash salvo | — | **Pronto** |
-| `POST /webhooks/whatsapp/:id` — **WAHA** | Idem | `payload.session` precisa ser **exatamente** a Sessão salva na conexão | **Pronto** — Em breve no Hub: só para conexões já existentes |
+| `POST /webhooks/whatsapp/:id` — **WAHA** (motor GoWS) | Idem (a configuração automática manda o token no cabeçalho `X-Wpptrack-Webhook-Token`) | `session` do envelope precisa ser **exatamente** a Sessão salva na conexão | **Pronto** — parser `waha` v2 (GoWS) enquanto a release certificada existir; veja [WAHA com motor GoWS](#waha-com-motor-gows-waha-servidor-do-aluno). Liberada no Hub (regras de frase da WAHA em breve) |
 | `POST /webhooks/whatsapp/:id` — **Z-API** | Idem | `body.instanceId` precisa ser **exatamente** o Instance ID salvo | **Pronto** — Em breve no Hub: só para conexões já existentes |
 | `POST /webhooks/whatsapp/:id` — **NOD API** | Idem | — | **Ainda não existe** — a rota responde `501` ("Receiver inbound para nod_api ainda nao esta disponivel"). Em breve no Hub: só para conexões já existentes |
 | `POST /webhooks/inbound/:id?token=` — **Umbler / Gupshup / Data Crazy / Unnichat** | `?token=` comparado ao `secretHash` da conexão (rotacionável) | — | **Pronto** |
@@ -121,7 +121,8 @@ O que muda de provedor para provedor é **quais mensagens chegam**:
 | Gupshup | Sim | Não — envelope Cloud API só traz mensagens recebidas |
 | Data Crazy | Sim | Não — mensagens inbound só viram lead quando têm CTWA |
 | Meta WhatsApp (Cloud API) | Sim | **Não** — veja abaixo |
-| WAHA / Z-API | Sim | Não (mensagens `fromMe` são classificadas `ignored_outbound`) |
+| WAHA (GoWS) | Sim (evento `message`) | Lidas pelo evento `message.any` e registradas como `ignored_outbound`; **regras de frase da WAHA ainda não liberadas** |
+| Z-API | Sim | Não (mensagens `fromMe` são classificadas `ignored_outbound`) |
 
 Isso decide qual gatilho faz sentido em cada origem — é o erro de
 configuração mais comum hoje.
@@ -355,10 +356,10 @@ Consequências práticas, confirmadas no código:
   passo que você esqueceu de clicar.
 - **NOD API** ainda não tem receiver inbound (a rota responde `501`).
 
-> ℹ️ No Hub, WAHA, Z-API e NOD API aparecem como **Em breve**: não é possível
-> criar conexões novas; as já existentes continuam gerenciáveis. Os receivers
-> de WAHA e Z-API existem no backend (matriz acima), mas só quem já tem a
-> conexão os usa por enquanto.
+> ℹ️ No Hub, Z-API e NOD API aparecem como **Em breve**: não é possível
+> criar conexões novas; as já existentes continuam gerenciáveis. O receiver
+> da Z-API existe no backend (matriz acima), mas só quem já tem a conexão o
+> usa por enquanto. A WAHA (GoWS) já cria conexões novas.
 
 ## Gatilhos de conversão exigem as envs `INBOUND_*`
 
@@ -401,17 +402,106 @@ Depois, **redeploy da API**. Detalhe de cada variável em
 - Status/health: pronto. **Receiver inbound: ainda não existe** (`501`).
 - **Em breve no Hub:** não é possível criar conexões novas; as já existentes continuam gerenciáveis.
 
-### WAHA (`waha`, self-host)
+### WAHA com motor GoWS (`waha`, servidor do aluno)
 
-- Você roda sua própria instância [WAHA](https://github.com/devlikeape/waha).
-- Credenciais na UI: URL da API, API key e **Sessão** (padrão `default`).
-  Env de fallback: `WAHA_BASE_URL`, `WAHA_API_KEY`, `WAHA_SESSION`.
-- Receiver inbound: **pronto**, mas o `payload.session` de cada entrega
-  precisa bater exatamente com a Sessão salva — se não bater, `401`.
-  Se você mudou a sessão, use **Gerar receiver** de novo (isso também
-  regrava a sessão a partir da configuração salva).
-- Ainda **sem** ponte automática para a central de Gatilhos.
-- **Em breve no Hub:** não é possível criar conexões novas; as já existentes continuam gerenciáveis.
+A WAHA é **sua**: você hospeda o servidor
+([WAHA](https://waha.devlike.pro/)), cria a sessão e lê o QR **no painel da
+sua WAHA**. O RastrackDash não tem servidor WAHA, não cria sessão e não
+mostra QR. Por enquanto só o motor **GOWS** é lido; outro motor (NOWEB,
+WEBJS) só se algum aluno pedir.
+
+**1. No painel da sua WAHA**
+
+- Suba o servidor com o motor GOWS e anote a **URL do servidor** (a que a
+  API do RastrackDash alcança) e a **API key** (`WAHA_API_KEY` do seu
+  servidor).
+- Crie a **sessão** (o nome é livre, ex.: `cliente-loja`) e leia o QR com
+  o celular do número. A sessão precisa ficar em **WORKING**.
+
+**2. No RastrackDash** (`/integrations` → aba **WhatsApp** → WAHA)
+
+| Campo | O que informar |
+| --- | --- |
+| Nome / Nome exibido | Livre (a exclusão pede o nome de volta) |
+| URL da API | URL do seu servidor WAHA, sem `/api` no fim (ex.: `https://waha.seudominio.com`) |
+| API key | A API key do seu servidor WAHA (fica criptografada; nunca volta para a tela) |
+| Sessão | **Obrigatória.** O nome exato da sessão criada no painel |
+
+Depois de salvar, **Testar conexão** consulta `GET /api/sessions/{sessão}` na
+sua WAHA e mostra o status: `WORKING` = conectada; `SCAN_QR_CODE` = leia o QR
+no painel da WAHA; `STARTING` = subindo; `STOPPED` = sessão parada;
+`FAILED` = erro na sessão. Uma sessão com outro motor aparece como erro
+(“use GOWS”).
+
+**3. Webhook da sessão** — dois caminhos:
+
+- **Automático** (`POST /integrations/whatsapp-connections/:id/configure-webhook`):
+  o app gera um token novo, lê a configuração da sessão e grava, pela API da
+  sua WAHA (`PUT /api/sessions/{sessão}`), um webhook para
+  `{API_PUBLIC_URL}/webhooks/whatsapp/{ID_DA_CONEXAO}` com os eventos
+  `message`, `message.any` e `session.status` e o token no cabeçalho
+  `X-Wpptrack-Webhook-Token`. O resto da configuração da sessão (proxy,
+  metadados, outros webhooks) é preservado. **Salvar reinicia a sessão na
+  WAHA**: ela volta em alguns segundos, sem novo QR, e mensagens podem atrasar
+  nesse intervalo — por isso o botão **Configurar webhook** pede confirmação
+  antes. O app espera até 30 s por esse salvamento; se o prazo estourar ou a
+  WAHA responder erro 5xx, ele relê a sessão e só considera configurado se o
+  webhook com o token novo estiver lá. Se a WAHA recusar (sessão inexistente,
+  API key errada, servidor fora do ar, outro motor), **nada muda** no app e o
+  token anterior continua valendo. Se a configuração da sessão vier com
+  **senhas mascaradas** (`***` na senha do proxy, no `hmac.key` ou nos
+  cabeçalhos de outro webhook), o app **não grava nada** — gravar de volta
+  trocaria o segredo real pelos asteriscos — e pede a configuração manual.
+  A tela mostra os eventos assinados ou o motivo da recusa e oferece a
+  configuração manual.
+- **Manual**: o botão **Configuração manual** pede confirmação (gerar um novo
+  token faz o webhook atual deixar de valer) e mostra uma única vez a URL, o
+  token, o cabeçalho e os eventos. No painel da WAHA, em *Webhooks* da sessão:
+  1. cole a **URL** (sem token);
+  2. adicione o cabeçalho **`X-Wpptrack-Webhook-Token`** com o **token**
+     (opção recomendada);
+  3. marque os eventos `message`, `message.any` e `session.status`.
+
+  Alternativa, só se a sua WAHA não aceitar cabeçalho: a URL com `?token=`.
+  Ela funciona, mas o token pode aparecer nos logs da WAHA e do proxy.
+  Gerar de novo invalida o token anterior. HMAC da WAHA fica fora por enquanto.
+
+**4. O que acontece com cada mensagem** (parser `waha` v2)
+
+| Chegou | Resultado |
+| --- | --- |
+| Clique em anúncio com `ctwa_clid` (`externalAdReply.ctwaClid`), inclusive quando a 1ª mensagem é foto, vídeo, áudio, temporária ou de visualização única | Lead de anúncio + `LeadSubmitted` à Meta, como nos outros provedores |
+| Anúncio só com `sourceID`, sem `ctwa_clid` (anúncios no **Status** do WhatsApp: a Meta não manda o clid; cerca de 22% dos cliques) | **Cria lead de anúncio**, como o Rastrackapp: o lead guarda o ID do anúncio (campanha e conjunto vêm do anúncio sincronizado) e a `sourceURL`. **Nenhum evento vai à Meta**: o `LeadSubmitted` e as regras exigem `ctwa_clid`, e o `ctwaPayload` nunca é usado no lugar dele (a Meta o rejeita, erro 2804087). Se depois chegar um clique com clid do mesmo contato, o mesmo lead recebe o clid e o `LeadSubmitted` |
+| Mensagem orgânica | Registrada; não cria lead (igual à Uazapi) |
+| Mensagem do seu time (`message.any`, `fromMe`) | Registrada como `ignored_outbound`; regras de frase da WAHA ainda não estão liberadas |
+| Cópia `message.any` de mensagem recebida | Descartada (a recebida já veio por `message`; nada conta duas vezes) |
+| Grupo, Status (`status@broadcast`), lista de transmissão, canal | Descartados |
+| Clique em anúncio com contato só por LID (sem `SenderAlt`) | O app consulta a sua WAHA (`GET /api/{sessão}/lids/{lid}`, prazo de 3 s): com o telefone, segue como clique com clid (lead + `LeadSubmitted`). Sem resposta útil, fica registrado como `ctwa_contact_phone_unresolved` com o ID do anúncio (a métrica não se perde), sem lead |
+| Mensagem orgânica só com LID | Registrada como `contact_phone_unresolved`; não consulta a WAHA. O LID **nunca** vira telefone |
+| `session.status` | Atualiza o status da conexão (o mesmo do **Testar**), só se for mais novo que o último status registrado (retentativas fora de ordem não voltam o status) |
+
+O telefone do contato vem do JID de telefone ou de `SenderAlt` (recebida) /
+`RecipientAlt` (enviada pelo time), sem o sufixo de aparelho `:NN`; o
+número da própria loja nunca vira contato. O lead continua identificado pelo
+telefone: o mesmo contato chegando por `@lid` ou por telefone cai no mesmo
+lead. Sem `payload.fromMe` booleano, vale o `Info.IsFromMe` do GoWS (um texto
+como `"false"` nunca é aceito); sem hora na mensagem, vale a hora do envelope
+da WAHA. JIDs `@hosted`/`@hosted.lid` não são lidos (o Rastrackapp também
+não os trata). O log do webhook guarda só um resumo estrutural (sem texto, nome, LID,
+telefone, clid ou miniatura).
+
+**5. Versão do parser.** O receptor usa o parser `waha` v2 enquanto a release
+`waha`/`v2` estiver **certificada** (a migration
+`20261022130100_waha_parser_release` já a cria certificada). Sem essa
+release, ou com ela em observação/retirada, o receptor volta ao v1, que não
+lê anúncios do GoWS.
+
+**Ainda não suportado:** grupos, Status, regras de frase/palavra do time na
+WAHA, ponte automática para a central de Gatilhos, HMAC e outros motores
+além do GOWS. Env de fallback (`WAHA_BASE_URL`, `WAHA_API_KEY`,
+`WAHA_SESSION`) vale só para o **Testar**; a configuração automática do
+webhook usa somente o que está salvo na conexão.
+- **No Hub:** a WAHA está liberada para novas conexões (entrada de lead de anúncio). As **regras de frase** da WAHA seguem como "Em breve" em Conversões.
 
 ### Z-API (`zapi`)
 
@@ -448,7 +538,7 @@ provedor; não invente variáveis de ambiente para ele.
 |---|---|
 | Uazapi BYO | Painel da própria instância Uazapi |
 | NOD API | Instance ID/token do add-on PalmUP; o broker usa a `LICENSE_KEY` já configurada |
-| WAHA | Painel/configuração da própria instância WAHA self-hosted |
+| WAHA | Painel da sua WAHA (motor GOWS): URL do servidor, API key e nome da sessão |
 | Z-API | Painel da conta Z-API do aluno |
 | Umbler / Gupshup | Painel de cada serviço — lá você cola a URL de callback (com `?token=`) gerada aqui |
 | Data Crazy | Automação HTTP de mensagem recebida — lá você cola a URL de callback (com `?token=`) gerada aqui |
