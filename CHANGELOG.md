@@ -7,7 +7,9 @@ Version 1.0.0 was the initial public release of the `nod-rastrackdash-wpp` stude
 
 ## [Unreleased]
 
-Upgrade notes for students: [`docs/releases/unreleased.json`](docs/releases/unreleased.json). No migration, no new environment variable.
+## [1.2.0] - 2026-10-24
+
+Upgrade notes for students: [`docs/releases/1.2.0.json`](docs/releases/1.2.0.json). No migration, no new environment variable.
 
 ### Added
 
@@ -45,6 +47,27 @@ Upgrade notes for students: [`docs/releases/unreleased.json`](docs/releases/unre
   the WABA) and documents the panel subscription and the manual fallback;
   `docs/setup/meta-cloud-recovery.md` and `docs/GUIA-ALUNO.md` follow. Team
   phrase rules remain unavailable on Meta Cloud.
+- Meta Cloud guide: explains that Meta does not deliver team-sent messages
+  through the Cloud API webhook, so team phrase rules do not work on a Meta
+  Cloud connection. Numbers on coexistence (WhatsApp Business app alongside
+  the Cloud API) should be connected through the student's own Uazapi (CTWA
+  plus team messages); without coexistence, phrase conversion depends on
+  integrating the platform the team answers from (CRM/support), for example
+  by calling the single conversion URL.
+
+### Fixed
+
+- Docs no longer claim Z-API handles ad leads (CTWA) or phrase rules: the
+  `zapi/v1` parser does not read the real Z-API payload, so Z-API is
+  "Em breve" in `whatsapp-providers.md`, `GUIA-ALUNO.md`,
+  `troubleshooting.md`, both READMEs and the onboarding prompt. The WAHA text
+  in `GUIA-ALUNO.md` now says it has ad leads and team phrase rules.
+- Accents on user-visible labels in `packages/shared` (client/backoffice
+  navigation, "Integração externa", "Compra atribuída" and validation
+  messages). Codes, enums and CSV headers are untouched. The conversion event
+  catalog stays ASCII on purpose (the web accents it via `event-copy.ts`), and
+  "Selecione ao menos um numero" stays as is because the web maps that exact
+  message.
 
 ## [1.1.1] - 2026-10-24
 
