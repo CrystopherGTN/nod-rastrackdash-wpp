@@ -35,7 +35,9 @@ import {
   parseWahaV2Webhook,
   WAHA_V2_PARSER_VERSION,
   wahaV2UnresolvedContactLid,
+  wahaV2UnresolvedTeamContactLid,
   withWahaResolvedContactPhone,
+  withWahaResolvedTeamContactPhone,
 } from "../inbound-webhooks/providers/waha/waha-v2.parser";
 import { WahaLidResolverService } from "../integrations/whatsapp-providers/waha-lid-resolver.service";
 import { parseZapiV1Webhook } from "../inbound-webhooks/providers/zapi/zapi-v1.parser";
@@ -621,6 +623,9 @@ export class WebhooksController {
     }
 
     const message = this.recordValue(body.message);
+    if (message !== undefined) {
+      await this.touchBridgedChannel(resolvedContext);
+    }
     const isInboundMessage =
       message !== undefined &&
       message.fromMe === false &&
@@ -769,6 +774,34 @@ export class WebhooksController {
         }
       }
     }
+
+    // Mensagem do time para um contato só com LID (sem RecipientAlt): o
+    // telefone vem da WAHA do aluno, como no clique de anúncio, para a regra
+    // de frase achar o lead. Sem resposta, segue sem evento (sem regra).
+    if (
+      isWahaV2 &&
+      parsed.classificationReason === "contact_phone_unresolved" &&
+      this.wahaLidResolver
+    ) {
+      const lid = wahaV2UnresolvedTeamContactLid(body);
+      const phone = lid
+        ? await this.wahaLidResolver.resolvePhone({ ...context, lid })
+        : null;
+
+      if (phone) {
+        const reparsed = parser.parse(
+          withWahaResolvedTeamContactPhone(body, phone),
+        );
+
+        if (
+          reparsed.events.length > 0 &&
+          reparsed.events[0]?.message.direction === "outbound"
+        ) {
+          parsed = reparsed;
+          contactResolvedByLid = true;
+        }
+      }
+    }
     const event = parsed.events[0] ?? null;
     const phoneHash = event
       ? hashPhoneIdentity(event.contact.phoneNumber)
@@ -815,6 +848,12 @@ export class WebhooksController {
 
     if (diagnostic.status === "duplicate" || diagnostic.status === "conflict") {
       return { ...diagnostic, conversion: emptyConversion };
+    }
+
+    // A WAHA message (contact or team) marks its bridged number as alive:
+    // the canonical channel of a phone prefers the one still receiving.
+    if (isWahaV2 && event) {
+      await this.touchBridgedChannel(context);
     }
 
     // From here on this request holds the WebhookLog claim and must settle
@@ -939,6 +978,22 @@ export class WebhooksController {
     adWithoutClidCreatesLead = false,
   ) {
     const emptyConversion = { created: [], duplicates: [], queued: [] };
+
+    // WAHA v2: a mensagem do time (`message.any` com fromMe) entra no MESMO
+    // pipeline das regras de frase da Uazapi (ponte, decisão congelada,
+    // execução e envio). Nunca cria lead. A cópia `message` do fromMe já foi
+    // descartada pelo parser, e a reentrega do webhook bate no WebhookLog e,
+    // depois, na decisão congelada da ocorrência: uma execução só.
+    if (
+      provider === "waha" &&
+      adWithoutClidCreatesLead &&
+      event?.message.direction === "outbound" &&
+      event.providerEventType === "message.any"
+    ) {
+      const teamMessage = await this.evaluateWahaTeamMessage(context, event);
+
+      return { ...emptyConversion, teamMessage };
+    }
 
     if (!event || event.message.direction !== "inbound") {
       return emptyConversion;
@@ -1252,6 +1307,83 @@ export class WebhooksController {
         }),
       );
     }
+  }
+
+  /**
+   * Last activity of the number bridged from this WhatsApp connection
+   * (Uazapi/WAHA), used to pick the live channel when the same phone has an
+   * old connection that stopped receiving. At most one write per minute per
+   * number; best-effort (never fails the delivery).
+   */
+  private async touchBridgedChannel(context: {
+    workspaceId: string;
+    whatsappInstanceId: string;
+  }): Promise<void> {
+    const now = new Date();
+    try {
+      await this.prisma.inboundWebhookChannel.updateMany({
+        where: {
+          workspaceId: context.workspaceId,
+          whatsappInstanceId: context.whatsappInstanceId,
+          lastSeenAt: { lt: new Date(now.getTime() - 60_000) },
+        },
+        data: { lastSeenAt: now },
+      });
+    } catch {
+      // best-effort
+    }
+  }
+
+  /**
+   * Regras de frase da equipe numa conexão WAHA: mesmo serviço da Uazapi com
+   * o provedor "waha". O contato é o telefone que o parser v2 resolveu
+   * (RecipientAlt, to, Chat ou o LID consultado na WAHA). Corre dentro da
+   * reivindicação do WebhookLog: uma falha marca a entrega como falha e a
+   * retentativa da WAHA reprocessa a mesma mensagem sem duplicar (decisão
+   * congelada por ocorrência).
+   */
+  private async evaluateWahaTeamMessage(
+    context: VerifiedConnectionContext,
+    event: ParsedInboundWebhookEvent,
+  ): Promise<{ evaluated: boolean; eligibleExecutionId: string | null }> {
+    const none = { evaluated: false, eligibleExecutionId: null };
+    const phone = event.contact.phoneNumber?.trim();
+    const messageText = event.message.text?.trim();
+
+    if (!phone || !messageText) {
+      return none;
+    }
+
+    const instance = await this.prisma.whatsappInstance.findFirst({
+      where: {
+        id: context.whatsappInstanceId,
+        workspaceId: context.workspaceId,
+        provider: "waha",
+      },
+      select: {
+        id: true,
+        workspaceId: true,
+        name: true,
+        providerInstanceId: true,
+      },
+    });
+
+    if (!instance) {
+      return none;
+    }
+
+    return this.uazapiProviderConversion.evaluateTeamMessage({
+      workspaceId: context.workspaceId,
+      provider: "waha",
+      instance: {
+        ...instance,
+        connectedPhone: event.channel.connectedPhone || null,
+      },
+      phone,
+      messageText,
+      externalMessageId: event.externalMessageId,
+      occurredAt: event.occurredAt,
+    });
   }
 
   private async evaluateUazapiLabels(
