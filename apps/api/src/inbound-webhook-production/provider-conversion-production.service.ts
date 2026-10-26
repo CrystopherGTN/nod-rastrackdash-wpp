@@ -82,6 +82,12 @@ import {
   providerMessageAuthorAllowed,
 } from "../conversion-rules/structured-catalog-message.parser";
 import { ConversionEventsService } from "../conversion-events/conversion-events.service";
+import {
+  findPriorLeadLifetimeConversion,
+  isLeadLifetimeEvent,
+  lockLeadConversionIdentity,
+  resolveLeadConversionIdentity,
+} from "../conversion-events/lead-lifetime-conversion-guard";
 import { InboundWebhookMetaRouteReaderService } from "../inbound-webhooks/inbound-webhook-meta-route-reader.service";
 import { InboundWebhookPayloadEncryptionService } from "../inbound-webhooks/inbound-webhook-payload-encryption.service";
 import {
@@ -607,6 +613,14 @@ export class ProviderConversionProductionService
           where: {
             id: { not: execution.id },
             workspaceId: execution.workspaceId,
+            // #84: the dedupe is local to the number (and connection) that
+            // observed the fact; once-per-lead events across numbers are the
+            // lead-lifetime guard's job (#153).
+            channelId: execution.channelId,
+            leadId: lead.id,
+            sourceDelivery: {
+              connectionId: execution.sourceDelivery.connectionId,
+            },
             contactIdentityHash: lead.phoneHash,
             status: "materialized",
             occurredAt: {
@@ -864,6 +878,7 @@ export class ProviderConversionProductionService
       );
     }
 
+    const conversionDestinationId: string = route.conversionDestinationId;
     const dedupePolicy = occurrence.businessDedupePolicy;
     const lock = this.lockKeys(
       execution.workspaceId,
@@ -936,6 +951,26 @@ export class ProviderConversionProductionService
         );
         await transaction.$queryRaw`SELECT pg_advisory_xact_lock(CAST(${phoneLock.first} AS integer), CAST(${phoneLock.second} AS integer))::text`;
       }
+      // Once-per-lead events: the business scope lock above is per number;
+      // serialize the same lead identity + event across every number and the
+      // CTWA entry too (lock taken last). Purchases and +-24h events keep
+      // their per-number / per-order dedupe only.
+      const lifetimeIdentity =
+        !purchaseKey && isLeadLifetimeEvent(eventName)
+          ? await resolveLeadConversionIdentity(
+              transaction,
+              execution.workspaceId,
+              lead.id,
+            )
+          : null;
+      if (lifetimeIdentity) {
+        await lockLeadConversionIdentity(
+          transaction,
+          execution.workspaceId,
+          lifetimeIdentity,
+          eventName,
+        );
+      }
 
       const current =
         await transaction.providerConversionRuleExecution.findFirst({
@@ -974,12 +1009,33 @@ export class ProviderConversionProductionService
         {
           id: { not: execution.id },
           workspaceId: execution.workspaceId,
+          // #84: per number (and connection), like the decision scope key.
+          channelId: execution.channelId,
+          leadId: lead.id,
+          sourceDelivery: {
+            connectionId: execution.sourceDelivery.connectionId,
+          },
           status: "materialized",
           OR: [
             {
               providerDecision: {
                 is: {
                   businessDedupeScopeKey: dedupePolicy.scopeKey,
+                },
+              },
+            },
+            // nod upgrade bridge: decisions frozen before #84 carry the old
+            // workspace-wide key (event:workspace:lead). The filters above
+            // already restrict it to this number and lead, so a repeat on
+            // the same number across the update is still a duplicate.
+            {
+              providerDecision: {
+                is: {
+                  businessDedupeScopeKey: [
+                    eventName,
+                    execution.workspaceId,
+                    lead.id,
+                  ].join(":"),
                 },
               },
             },
@@ -1018,7 +1074,7 @@ export class ProviderConversionProductionService
             },
           })
         : null;
-      const duplicate = purchaseKey
+      const sameNumberDuplicate = purchaseKey
         ? purchaseClaim
           ? { id: purchaseClaim.winnerExecutionId }
           : null
@@ -1026,13 +1082,58 @@ export class ProviderConversionProductionService
             where: duplicateWhere,
             select: { id: true },
           });
+      // Fase 5.3: an Unnichat automation event may reach two rules (old
+      // per-rule URL + per-event URL routed to another rule). Its Meta
+      // identity comes from the business fact, so both resolve to ONE
+      // conversion (the second one is a dedupe hit, never a second send).
+      const automationIdentity =
+        !purchaseKey &&
+        (AUTOMATION_IDENTITY_PROVIDERS as readonly string[]).includes(
+          occurrence.provider,
+        ) &&
+        decision.rule.triggerType === "provider_automation" &&
+        lead.ctwaClid
+          ? automationConversionIdentity(
+              occurrence.provider as AutomationIdentityProvider,
+              {
+                workspaceId: execution.workspaceId,
+                eventName,
+                dedupeMode: dedupePolicy.mode,
+                leadId: lead.id,
+                ctwaClid: lead.ctwaClid,
+                occurrenceKey: occurrence.occurrenceKey,
+              },
+            )
+          : null;
+      const dedupeKey =
+        purchaseKey ??
+        (automationIdentity
+          ? `provider-automation:${occurrence.provider}:${automationIdentity}`
+          : `provider-conversion:${execution.id}`);
+      // Once-per-lead events only: the same lead identity already converted
+      // for this Meta destination by another number or by the CTWA entry.
+      const otherNumberDuplicate =
+        sameNumberDuplicate || !lifetimeIdentity
+          ? null
+          : await findPriorLeadLifetimeConversion(transaction, {
+              workspaceId: execution.workspaceId,
+              identity: lifetimeIdentity,
+              eventName,
+              conversionDestinationId,
+              channelId: execution.channelId,
+              pipeline: "provider_rule",
+              ownDedupeKey: dedupeKey,
+            });
+      const duplicate = sameNumberDuplicate ?? otherNumberDuplicate;
 
       if (duplicate) {
         const reasonCode = purchaseKey
           ? "purchase_duplicate"
-          : dedupePolicy.mode === "rolling_window"
-            ? "purchase_within_24h"
-            : "qualified_lead_already_materialized";
+          : otherNumberDuplicate
+            ? otherNumberDuplicate.reasonCode
+            : dedupePolicy.mode === "rolling_window"
+              ? "purchase_within_24h"
+              : "qualified_lead_already_materialized";
         await transaction.providerConversionRuleExecution.update({
           where: { id: execution.id },
           data: {
@@ -1070,29 +1171,6 @@ export class ProviderConversionProductionService
         occurrence.externalMessageId ??
         occurrence.externalEventId ??
         occurrence.occurrenceKey;
-      // Fase 5.3: an Unnichat automation event may reach two rules (old
-      // per-rule URL + per-event URL routed to another rule). Its Meta
-      // identity comes from the business fact, so both resolve to ONE
-      // conversion (the second one is a dedupe hit, never a second send).
-      const automationIdentity =
-        !purchaseKey &&
-        (AUTOMATION_IDENTITY_PROVIDERS as readonly string[]).includes(
-          occurrence.provider,
-        ) &&
-        decision.rule.triggerType === "provider_automation" &&
-        lead.ctwaClid
-          ? automationConversionIdentity(
-              occurrence.provider as AutomationIdentityProvider,
-              {
-                workspaceId: execution.workspaceId,
-                eventName,
-                dedupeMode: dedupePolicy.mode,
-                leadId: lead.id,
-                ctwaClid: lead.ctwaClid,
-                occurrenceKey: occurrence.occurrenceKey,
-              },
-            )
-          : null;
       const conversion = await this.conversions.recordExternalConversion(
         {
           workspaceId: execution.workspaceId,
@@ -1107,12 +1185,14 @@ export class ProviderConversionProductionService
               : `conversion_${conversionEventMetaEventIdPrefix(eventName)}_${purchaseKey.slice(9)}`
             : automationIdentity
               ? `${occurrence.provider}_${conversionEventMetaEventIdPrefix(eventName)}_${automationIdentity}`
-              : this.metaEventId(execution.id, eventName),
-          dedupeKey:
-            purchaseKey ??
-            (automationIdentity
-              ? `provider-automation:${occurrence.provider}:${automationIdentity}`
-              : `provider-conversion:${execution.id}`),
+              : lifetimeIdentity
+                ? this.leadLifetimeMetaEventId(
+                    execution.workspaceId,
+                    lifetimeIdentity.lockIdentity,
+                    eventName,
+                  )
+                : this.metaEventId(execution.id, eventName),
+          dedupeKey,
           leadId: lead.id,
           phoneHash: lead.phoneHash,
           businessSource: "paid",
@@ -1307,6 +1387,7 @@ export class ProviderConversionProductionService
     // Events that only make sense once per lead (QualifiedLead, LeadSubmitted)
     // dedupe for a lifetime; the rest keeps the 24h rolling window.
     const rollingWindow = conversionEventDedupeMode(eventName) !== "lifetime";
+    const conversionDestinationId: string = route.conversionDestinationId;
 
     const lock = this.lockKeys(
       execution.workspaceId,
@@ -1322,6 +1403,22 @@ export class ProviderConversionProductionService
           ) AS text
         ) AS "lockAcquired"
       `;
+      // Once-per-lead events only (see lead-lifetime-conversion-guard.ts).
+      const lifetimeIdentity = rollingWindow
+        ? null
+        : await resolveLeadConversionIdentity(
+            transaction,
+            execution.workspaceId,
+            lead.id,
+          );
+      if (lifetimeIdentity) {
+        await lockLeadConversionIdentity(
+          transaction,
+          execution.workspaceId,
+          lifetimeIdentity,
+          eventName,
+        );
+      }
 
       const current =
         await transaction.providerConversionRuleExecution.findFirst({
@@ -1347,11 +1444,19 @@ export class ProviderConversionProductionService
         );
       }
 
-      const duplicate =
+      const sameNumberDuplicate =
         await transaction.providerConversionRuleExecution.findFirst({
           where: {
             id: { not: execution.id },
             workspaceId: execution.workspaceId,
+            // #84: the dedupe is local to the number (and connection) that
+            // observed the fact; once-per-lead events across numbers are the
+            // lead-lifetime guard's job (#153).
+            channelId: execution.channelId,
+            leadId: lead.id,
+            sourceDelivery: {
+              connectionId: execution.sourceDelivery.connectionId,
+            },
             contactIdentityHash: lead.phoneHash,
             status: "materialized",
             ...(rollingWindow
@@ -1375,10 +1480,26 @@ export class ProviderConversionProductionService
           select: { id: true },
         });
 
+      const otherNumberDuplicate =
+        sameNumberDuplicate || !lifetimeIdentity
+          ? null
+          : await findPriorLeadLifetimeConversion(transaction, {
+              workspaceId: execution.workspaceId,
+              identity: lifetimeIdentity,
+              eventName,
+              conversionDestinationId,
+              channelId: execution.channelId,
+              pipeline: "provider_rule",
+              ownDedupeKey: `provider-conversion:${execution.id}`,
+            });
+      const duplicate = sameNumberDuplicate ?? otherNumberDuplicate;
+
       if (duplicate) {
-        const reasonCode = rollingWindow
-          ? "purchase_within_24h"
-          : "qualified_lead_already_materialized";
+        const reasonCode = otherNumberDuplicate
+          ? otherNumberDuplicate.reasonCode
+          : rollingWindow
+            ? "purchase_within_24h"
+            : "qualified_lead_already_materialized";
         await transaction.providerConversionRuleExecution.update({
           where: { id: execution.id },
           data: {
@@ -1411,7 +1532,13 @@ export class ProviderConversionProductionService
           sourceEventId: parsed.externalExecutionKey,
           sourceTrigger: "inbound_webhook:umbler:provider_automation",
           eventName: parsed.eventName,
-          eventId: this.metaEventId(execution.id, parsed.eventName),
+          eventId: lifetimeIdentity
+            ? this.leadLifetimeMetaEventId(
+                execution.workspaceId,
+                lifetimeIdentity.lockIdentity,
+                eventName,
+              )
+            : this.metaEventId(execution.id, parsed.eventName),
           dedupeKey: `provider-conversion:${execution.id}`,
           leadId: lead.id,
           phoneHash: lead.phoneHash,
@@ -2358,6 +2485,34 @@ export class ProviderConversionProductionService
         execution.workspaceId,
       );
     }
+  }
+
+  /**
+   * Meta event_id of a once-per-lead (lifetime) event: deterministic per
+   * workspace + lead identity (canonical phone line, so old duplicate Lead
+   * rows of the same line share it) + event, so if two sends ever slipped
+   * past the local dedupe, Meta itself would drop the second on the same
+   * dataset. Neutral prefix: it only applies to NEW conversions (logs keep
+   * the id they were sent with; ids already sent never change).
+   * Rolling-window events (Purchase...) keep the per-execution id: a lead may
+   * legitimately buy again after 24h, inside Meta's 48h dedupe window.
+   */
+  private leadLifetimeMetaEventId(
+    workspaceId: string,
+    leadIdentity: string,
+    eventName: ConversionEventNameDto,
+  ): string {
+    const digest = createHash("sha256")
+      .update(
+        JSON.stringify([
+          "provider-lead-conversion-v1",
+          workspaceId,
+          leadIdentity,
+          eventName,
+        ]),
+      )
+      .digest("hex");
+    return `lead_${conversionEventMetaEventIdPrefix(eventName)}_${digest}`;
   }
 
   private lockKeys(
