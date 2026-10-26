@@ -87,6 +87,7 @@ import {
   ruleAcceptsReprocess,
 } from "./provider-rule-blocked-reprocess";
 import { InboundWebhookMetaRouteReaderService } from "../inbound-webhooks/inbound-webhook-meta-route-reader.service";
+import { isBridgedWhatsappProvider } from "../inbound-webhooks/bridged-whatsapp-providers";
 import {
   listWorkspaceScopeChannels,
   PROVIDER_RULE_GLOBAL_PRECEDENCE,
@@ -95,6 +96,8 @@ import {
   scanWorkspaceScopeChannels,
   providerRuleCoversChannel,
   providerRuleGateConnectionId,
+  providerRuleIsSalesPlatform,
+  providerRuleNumberGateConnectionId,
   providerRuleOrigin,
   providerRuleOriginRequiresConnection,
   providerRuleOriginUnifiable,
@@ -2889,13 +2892,17 @@ export class ProviderConversionRulesService {
     })) as PendingChannelRow[];
     const byId = new Map(rows.map((row) => [row.id, row]));
     // Bound rules: their own connection. Unbound rules and Umbler/Unnichat
-    // rules for all numbers: the connection of each covered number.
+    // rules for all numbers: the connection of each covered number. Payt
+    // (porte do #171): the anchor, then the number's own connection (a
+    // number live only on the anchor never sends).
     const gateOf = (rule: PersistedProviderRule, channel: PendingChannelRow) =>
       rule.connectionId &&
       rule.connection &&
-      providerRuleGateConnectionId(rule, {
-        connectionId: channel.connection.id,
-      }) === rule.connectionId
+      providerRuleNumberGateConnectionId(
+        rule,
+        { connectionId: channel.connection.id },
+        rule.connection.status,
+      ) === rule.connectionId
         ? {
             id: rule.connection.id,
             provider: rule.connection.provider as string,
@@ -2989,7 +2996,8 @@ export class ProviderConversionRulesService {
         (number) =>
           number.activatable &&
           number.channelStatus !== "paused" &&
-          number.connectionStatus !== "paused",
+          number.connectionStatus !== "paused" &&
+          !this.salesNumberOwnConnectionGate(rule, number),
       );
       const results: GlobalNumberActivation[] = [];
       for (const number of candidates.slice(0, GLOBAL_RULE_CASCADE_LIMIT)) {
@@ -3054,6 +3062,31 @@ export class ProviderConversionRulesService {
   }
 
   /**
+   * A sales-platform number held back by its OWN connection (the anchor is
+   * live). Only the explicit "Ativar envio neste número" promotes that
+   * connection: it may carry other rules and numbers, so neither the save
+   * cascade nor the automatic activation touches it.
+   *
+   * Adaptação nod: a ponte Uazapi/WAHA é uma conexão por número (1:1 com a
+   * conexão WhatsApp do aluno), a mesma que a regra global de frase já ativa
+   * sozinha; ela segue o cascade e a ativação automática normais.
+   */
+  private salesNumberOwnConnectionGate(
+    rule: PersistedProviderRule,
+    number: Pick<
+      ProviderConversionRulePendingNumberDto,
+      "connectionId" | "provider"
+    >,
+  ): boolean {
+    return (
+      providerRuleIsSalesPlatform(rule) &&
+      rule.connectionId !== null &&
+      number.connectionId !== rule.connectionId &&
+      !isBridgedWhatsappProvider(number.provider)
+    );
+  }
+
+  /**
    * Promotes ONE covered number with the same activation the Integrations
    * buttons run (channel "Ativar envio", then the connection's "Ativar envios
    * automáticos"), inside its own transaction.
@@ -3076,11 +3109,26 @@ export class ProviderConversionRulesService {
           workspaceId,
           channelId,
         );
-        const gate = await requireInboundWebhookConnection(
+        const anchorGate = await requireInboundWebhookConnection(
           transaction,
           workspaceId,
           providerRuleGateConnectionId(input.rule, channel),
         );
+        // Payt: with the anchor live, the number's own connection is the
+        // gate that still holds the number back.
+        const numberGateId = providerRuleNumberGateConnectionId(
+          input.rule,
+          channel,
+          anchorGate.status,
+        );
+        const gate =
+          numberGateId === anchorGate.id
+            ? anchorGate
+            : await requireInboundWebhookConnection(
+                transaction,
+                workspaceId,
+                numberGateId,
+              );
         if (gate.status === "production" && channel.status === "active") {
           return { channelId, outcome: "already_live" as const, reason: null };
         }
@@ -3227,7 +3275,8 @@ export class ProviderConversionRulesService {
         if (
           !number.activatable ||
           number.channelStatus === "paused" ||
-          number.connectionStatus === "paused"
+          number.connectionStatus === "paused" ||
+          this.salesNumberOwnConnectionGate(rule, number)
         ) {
           continue;
         }
@@ -3258,12 +3307,17 @@ export class ProviderConversionRulesService {
       },
     });
     const channelById = new Map(channelRows.map((row) => [row.id, row]));
+    // Payt (porte do #171): with the anchor live, the gate is the number's
+    // own connection (only the Uazapi/WAHA bridge reaches here; see
+    // salesNumberOwnConnectionGate).
     const gateOf = (target: { rule: PersistedProviderRule; channelId: string }) => {
       const channelConnectionId = channelById.get(target.channelId)?.connectionId;
       return channelConnectionId
-        ? providerRuleGateConnectionId(target.rule, {
-            connectionId: channelConnectionId,
-          })
+        ? providerRuleNumberGateConnectionId(
+            target.rule,
+            { connectionId: channelConnectionId },
+            target.rule.connection?.status,
+          )
         : (target.rule.connectionId ?? null);
     };
     const gateIds = [

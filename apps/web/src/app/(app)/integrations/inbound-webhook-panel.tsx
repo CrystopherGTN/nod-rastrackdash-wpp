@@ -53,6 +53,12 @@ export type InboundWebhookConnectionView = {
   overview: InboundWebhookConnectionOverviewDto;
   channels: InboundWebhookChannelDto[];
   detailState?: "real" | "error";
+  /**
+   * GET /channels of this connection failed (porte do #165): `channels` is
+   * empty because it could not be read, never because the connection has no
+   * number.
+   */
+  channelsState?: "real" | "error";
 };
 
 export type InboundWebhookPanelProps = {
@@ -476,7 +482,7 @@ export function InboundWebhookPanel({
             </div>
           </div>
         ) : (
-          connections.map(({ overview, channels, detailState }) => {
+          connections.map(({ overview, channels, detailState, channelsState }) => {
             const connection = overview.connection;
             const connectionPending = pendingAction?.includes(connection.id);
 
@@ -648,27 +654,37 @@ export function InboundWebhookPanel({
                           ? "Retomar observação"
                           : "Pausar conexão"}
                       </button>
-                      <button
-                        className="button"
-                        type="button"
-                        disabled={Boolean(connectionPending)}
-                        onClick={() => {
-                          if (
-                            window.confirm(
-                              "Gerar uma nova URL inválida a URL atual. Continuar?",
-                            )
-                          ) {
-                            void runConnectionAction(
-                              `rotate-${connection.id}`,
-                              rotateSecretAction,
-                              { connectionId: connection.id },
-                            );
-                          }
-                        }}
-                      >
-                        <RefreshCw size={15} aria-hidden="true" />
-                        Gerar nova URL
-                      </button>
+                      {connection.provider === "uazapi" ||
+                      connection.provider === "waha" ? (
+                        // Porte do #105 do SaaS (com a ponte WAHA): a ponte
+                        // recebe pelo webhook da conexão WhatsApp.
+                        <span className="muted">
+                          Esta conexão recebe pelo webhook da conexão
+                          WhatsApp; gerar URL aqui não se aplica.
+                        </span>
+                      ) : (
+                        <button
+                          className="button"
+                          type="button"
+                          disabled={Boolean(connectionPending)}
+                          onClick={() => {
+                            if (
+                              window.confirm(
+                                "Gerar uma nova URL inválida a URL atual. Continuar?",
+                              )
+                            ) {
+                              void runConnectionAction(
+                                `rotate-${connection.id}`,
+                                rotateSecretAction,
+                                { connectionId: connection.id },
+                              );
+                            }
+                          }}
+                        >
+                          <RefreshCw size={15} aria-hidden="true" />
+                          Gerar nova URL
+                        </button>
+                      )}
                       <button
                         className="button danger"
                         type="button"
@@ -716,7 +732,12 @@ export function InboundWebhookPanel({
                         }
                       />
                     ) : null}
-                    {channels.length === 0 ? (
+                    {channels.length === 0 && channelsState === "error" ? (
+                      <p className="action-note warn inbound-channel-empty">
+                        Não foi possível carregar os números desta conexão
+                        agora. Recarregue a página em instantes.
+                      </p>
+                    ) : channels.length === 0 ? (
                       <p className="muted inbound-channel-empty">
                         {connection.provider === "data_crazy"
                           ? "O canal aparece sozinho quando o primeiro webhook do Data Crazy chegar. Envie uma mensagem de teste para liberar as regras."
@@ -1219,6 +1240,10 @@ function readinessBlockerLabel(
     payload_unavailable: `${readiness.payloadUnavailableCtwa} CTWA não possuem mais payload disponível.`,
     payload_expiring_soon:
       "O payload preservado mais próximo expira em menos de 48 horas.",
+    // Porte do #179: "Bloqueado" sempre com motivo.
+    ctwa_send_failed: `${readiness.sendFailedCtwa ?? 0} CTWA falharam ou foram ignorados no envio e não entram em um novo envio automático.`,
+    ctwa_in_progress: `${readiness.inProgressCtwa ?? 0} CTWA estão sendo processados agora. Aguarde alguns minutos e atualize a página.`,
+    ctwa_not_eligible: `${readiness.notEligibleCtwa ?? 0} CTWA foram descartados pela triagem (por exemplo, mensagem enviada pelo próprio número ou lead fora do rastreamento) e não serão enviados à Meta. Nenhuma ação é necessária.`,
   } as const;
 
   return labels[blocker];

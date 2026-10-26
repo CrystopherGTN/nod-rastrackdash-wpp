@@ -91,6 +91,7 @@ import {
   preflightMetaCapiEvent,
   type MetaCapiSendEventErrorCode,
 } from "./meta-capi.adapter";
+import { metaCapiFirstNameEnabled } from "./meta-capi-first-name";
 import { LicenseClientService } from "../licensing-client/license-client.service";
 import { RUNTIME_ENV, type RuntimeEnv } from "../common/runtime/runtime.module";
 import { parseInboundWebhooksConfig } from "../config/deployment-config";
@@ -172,6 +173,13 @@ type ConversionEventPrismaClient = Pick<
 export type RecordExternalConversionInput = {
   /** CTWA lead with ctwa_clid and no known ad: the authorized page/pixel. */
   ctwaDestination?: AuthorizedCtwaDestination;
+  /**
+   * Apply Meta's seven-day event_time window to ad-attributed events too
+   * (CTWA destinations always apply it). Used by provider automations, whose
+   * callbacks may be replayed manually long after the original sale (porte
+   * do 75f6f4b3 do SaaS).
+   */
+  enforceMetaEventWindow?: boolean;
   workspaceId: string;
   externalConnectorId?: string | null;
   sourceEventId: string;
@@ -1414,6 +1422,7 @@ export class ConversionEventsService {
       eventName: log.eventName,
       dedupeKey: eventId,
       phoneHash: log.phoneHash,
+      leadName: await this.leadNameForCapi(log),
       adId: log.adId,
       ctwaClid: log.ctwaClid,
       valueCents: log.valueCents,
@@ -1772,6 +1781,7 @@ export class ConversionEventsService {
       eventName: log.eventName,
       dedupeKey: eventId,
       phoneHash: log.phoneHash,
+      leadName: await this.leadNameForCapi(log),
       adId: log.adId,
       ctwaClid: log.ctwaClid,
       valueCents: log.valueCents,
@@ -2597,6 +2607,31 @@ export class ConversionEventsService {
    * ready_to_send (nothing reached Meta) but never silently: the reason is
    * persisted so the audit shows it and the owner can requeue the event.
    */
+  /**
+   * Nome do lead para o `fn` da CAPI (porte do #179/#180 do SaaS; o adapter
+   * normaliza, filtra e aplica o hash, e só envia com
+   * META_CAPI_SEND_FIRST_NAME ligado). Enriquecimento opcional: qualquer falha
+   * na leitura envia sem `fn`, nunca bloqueia o envio nem altera
+   * event_id/deduplicação.
+   */
+  private async leadNameForCapi(log: {
+    leadId?: string | null;
+    workspaceId?: string | null;
+  }): Promise<string | null> {
+    // Desligado (padrão): nem consulta o lead. Mesmo env do MetaCapiAdapter.
+    if (!metaCapiFirstNameEnabled(process.env)) return null;
+    if (!log.leadId || !log.workspaceId) return null;
+    try {
+      const lead = await this.prisma.lead.findFirst({
+        where: { id: log.leadId, workspaceId: log.workspaceId },
+        select: { name: true },
+      });
+      return lead?.name ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   private async recordCtwaSendSkip(
     log: ConversionEventLogRecord,
     reason: string,
@@ -2666,6 +2701,7 @@ export class ConversionEventsService {
     if (claim.denial) return this.recordCtwaSendSkip(log, claim.denial);
     if (!claim.claimed) return skipped;
     const startedAt = new Date();
+    const leadName = await this.leadNameForCapi(log);
     const started = await this.prisma.$transaction(async (tx) => {
       await lockUnnichatMetaPolicy(tx, intent.workspaceId);
       const current = await tx.conversionEventLog.findFirst({
@@ -2706,6 +2742,7 @@ export class ConversionEventsService {
           eventName: log.eventName,
           dedupeKey: log.eventId!,
           phoneHash: log.phoneHash,
+          leadName,
           // Optional enrichment only: a non-numeric ad hint is never sent.
           adId: log.adId && /^\d{1,32}$/u.test(log.adId) ? log.adId : null,
           ctwaClid: log.ctwaClid,
@@ -3315,6 +3352,19 @@ export class ConversionEventsService {
         errorCode: "MetaEventTimeExpired",
         errorMessage:
           "Local CTWA lead retained; original event time is outside Meta's seven day window",
+      };
+    // Ad-attributed provider events: only the age is checked here (a small
+    // provider clock skew into the future must not drop a live sale).
+    if (
+      input.enforceMetaEventWindow &&
+      (!Number.isFinite(input.eventOccurredAt.getTime()) ||
+        Date.now() - input.eventOccurredAt.getTime() > 7 * 86400000)
+    )
+      return {
+        status: "not_eligible",
+        errorCode: "MetaEventTimeExpired",
+        errorMessage:
+          "Conversion retained locally; original event time is outside Meta's seven day window",
       };
     const resolved = this.resolveInitialStatus({
       eventName: input.eventName,
