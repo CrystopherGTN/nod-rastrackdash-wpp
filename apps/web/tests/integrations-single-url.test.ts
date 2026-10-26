@@ -815,6 +815,48 @@ describe("Regra da Payt: filtro de produto e URL nova", () => {
   });
 });
 
+// Fase 6.1a: porte do SaaS (42ccbc7c, #159).
+describe("Conversions: URL tab state is coherent", () => {
+  it("a rule created for the event URL only never says “sem URL ativa” nor shows an empty old-URL block", () => {
+    const rule = {
+      ...providerRule({
+        id: "rule_event_only",
+        triggerType: "provider_automation",
+        origin: "automation_unnichat",
+        eventName: "QualifiedLead",
+        connectionId: "conn_unnichat",
+        scope: "all_numbers",
+      }),
+      endpoint: null,
+    };
+    render(
+      createElement(RuleEndpoint, {
+        rule,
+        origin: "automation_unnichat",
+        canManage: true,
+        rotateAction: vi.fn(),
+        onRotated: vi.fn(),
+        onDismiss: vi.fn(),
+        integrationEndpoint: endpoint({
+          id: "ie_q",
+          provider: "unnichat",
+          kind: "automation_event",
+          eventName: "QualifiedLead",
+          url: null,
+          lastDeliveryAt: at,
+        }),
+        singleUrlActions: { ...actions(), reveal: vi.fn() },
+      }),
+    );
+    // The event URL keeps the masked "Mostrar URL" pattern and its own status.
+    expect(screen.getByRole("button", { name: /Mostrar URL/ })).toBeTruthy();
+    expect(screen.getByText("Último recebimento")).toBeTruthy();
+    expect(screen.queryByText("Esta regra não tem um endereço ativo.")).toBeNull();
+    expect(screen.queryByText("Último evento recebido")).toBeNull();
+    expect(screen.queryByRole("region", { name: /URL antiga/ })).toBeNull();
+  });
+});
+
 describe("Card da Payt no Hub", () => {
   it("URL criada e nenhuma regra ainda fica ativo com aviso", () => {
     const cards = buildIntegrationCards({
@@ -830,5 +872,92 @@ describe("Card da Payt no Hub", () => {
     const payt = cards.find((card) => card.id === "payt");
 
     expect(payt?.status.label).toBe("URL criada, sem regras");
+  });
+});
+
+// Fase 6.1a: porte do SaaS (5141e217, #160), com os textos do nod.
+describe("Conversions: legacy URL section copy", () => {
+  function legacyRule(origin: "automation_unnichat" | "automation_umbler") {
+    return {
+      ...providerRule({
+        id: "rule_legacy",
+        triggerType: "provider_automation",
+        origin,
+        eventName: "QualifiedLead",
+        connectionId: "conn_umbler",
+        channelIds: ["ch_01"],
+        phrases: [],
+      }),
+      endpoint: {
+        id: "ep_1",
+        workspaceId: "workspace_1",
+        providerRuleId: "rule_legacy",
+        secretVersion: 1,
+        lastDeliveryAt: at,
+        lastSuccessfulParseAt: at,
+        rotatedAt: at,
+        removedAt: null,
+        publicUrlDisabledAt: null,
+        createdAt: at,
+        updatedAt: at,
+      },
+    };
+  }
+
+  it("asks to generate the event URL first and never offers to rotate the old one", () => {
+    render(
+      createElement(RuleEndpoint, {
+        rule: legacyRule("automation_umbler"),
+        origin: "automation_umbler",
+        canManage: true,
+        rotateAction: vi.fn(),
+        onRotated: vi.fn(),
+        onDismiss: vi.fn(),
+        integrationEndpoint: null,
+        singleUrlActions: actions(),
+      }),
+    );
+    expect(
+      screen.getByText(
+        /Esta regra ainda recebe pela URL antiga desta conexão .*Gere a URL do evento acima, cole na Umbler em todos os números e depois desative a antiga\./,
+      ),
+    ).toBeTruthy();
+    const legacy = screen.getByRole("region", { name: "URL antiga desta conexão" });
+    expect(within(legacy).getByText("Último evento recebido nela")).toBeTruthy();
+    expect(
+      within(legacy).queryByRole("button", { name: /Gerar novo endereço/ }),
+    ).toBeNull();
+    expect(screen.queryByText("Endereço gerado de novo em")).toBeNull();
+    expect(screen.getByRole("button", { name: "Desativar URL antiga" })).toBeTruthy();
+  });
+
+  it("with the event URL ready, asks to paste it in every number before disabling the old one", () => {
+    render(
+      createElement(RuleEndpoint, {
+        rule: legacyRule("automation_unnichat"),
+        origin: "automation_unnichat",
+        canManage: true,
+        rotateAction: vi.fn(),
+        onRotated: vi.fn(),
+        onDismiss: vi.fn(),
+        integrationEndpoint: endpoint({
+          id: "ie_q",
+          provider: "unnichat",
+          kind: "automation_event",
+          eventName: "QualifiedLead",
+          url: null,
+          lastDeliveryAt: at,
+        }),
+        singleUrlActions: actions(),
+      }),
+    );
+    expect(
+      screen.getByText(
+        /Depois de colar a URL do evento no Unnichat em todos os números, desative a antiga aqui/,
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("heading", { name: "URL antiga (desta conexão)" }),
+    ).toBeTruthy();
   });
 });

@@ -103,7 +103,7 @@ function matches(
   return true;
 }
 
-function createWorld() {
+function createWorld(options: { unnichat?: boolean } = {}) {
   const releases: Row[] = [
     { id: "release_umbler", provider: "umbler", version: "v1", status: "certified" },
     {
@@ -135,6 +135,14 @@ function createWorld() {
     { id: "connection_qr_b", provider: "uazapi", parserReleaseId: "release_uazapi" },
     { id: "connection_gupshup", provider: "gupshup", parserReleaseId: "release_gupshup" },
     { id: "connection_unnichat", provider: "unnichat", parserReleaseId: "release_unnichat" },
+    // Fase 6.1a (#159): Unnichat creates one connection per number.
+    ...(options.unnichat
+      ? ["un_5159", "un_5520", "un_third"].map((id) => ({
+          id: `connection_${id}`,
+          provider: "unnichat",
+          parserReleaseId: "release_unnichat",
+        }))
+      : []),
   ].map((connection) => ({
     workspaceId,
     status: "production",
@@ -152,6 +160,13 @@ function createWorld() {
     { id: "channel_qr_b", connectionId: "connection_qr_b", whatsappInstanceId: "instance_b" },
     { id: "channel_gupshup", connectionId: "connection_gupshup", whatsappInstanceId: null },
     { id: "channel_unnichat", connectionId: "connection_unnichat", whatsappInstanceId: null },
+    ...(options.unnichat
+      ? ["un_5159", "un_5520", "un_third"].map((id) => ({
+          id: `channel_${id}`,
+          connectionId: `connection_${id}`,
+          whatsappInstanceId: null,
+        }))
+      : []),
   ].map((channel, index) => ({
     workspaceId,
     status: "active",
@@ -289,6 +304,10 @@ function createWorld() {
       findMany: vi.fn(async ({ where }: Row) =>
         providerRules.map(hydrateRule).filter((item) => matches(item, where)),
       ),
+      count: vi.fn(
+        async ({ where }: Row) =>
+          providerRules.filter((item) => matches(item, where)).length,
+      ),
     },
     providerConversionRuleChannel: {
       createMany: vi.fn(async ({ data }: Row) => {
@@ -323,6 +342,11 @@ function createWorld() {
         const row = endpoints.find((item) => item.id === where.id)!;
         Object.assign(row, data);
         return row;
+      }),
+      updateMany: vi.fn(async ({ where, data }: Row) => {
+        const rows = endpoints.filter((item) => matches(item, where));
+        rows.forEach((row) => Object.assign(row, data));
+        return { count: rows.length };
       }),
     },
     providerRuleCreateClaim: {
@@ -1070,7 +1094,9 @@ describe("provider rules API: unify", () => {
       }),
       "user_1",
     );
-    // The Umbler automation is never a candidate (its URL lives in Umbler).
+    // Fase 6.1a (#159): Umbler/Unnichat automations of one event are now
+    // their own group (one rule per provider + event; the old URLs keep
+    // working). They never join the phrase group.
     for (let index = 0; index < 2; index += 1) {
       await world.service.createRule(
         workspaceId,
@@ -1088,8 +1114,13 @@ describe("provider rules API: unify", () => {
     const candidates = await world.service.listUnifyCandidates(workspaceId);
 
     expect(providerConversionRuleUnifyCandidatesSchema.parse(candidates).groups)
-      .toHaveLength(1);
-    expect(candidates.groups[0]).toMatchObject({
+      .toHaveLength(2);
+    expect(
+      candidates.groups.find((group) => group.origin === "automation_umbler"),
+    ).toMatchObject({ eventName: "QualifiedLead", differences: [] });
+    expect(
+      candidates.groups.find((group) => group.origin === "message_phrase"),
+    ).toMatchObject({
       origin: "message_phrase",
       eventName: "QualifiedLead",
       ruleIds,
@@ -1341,6 +1372,227 @@ describe("provider rules API: unify", () => {
       overriddenChannelIds: [],
       duplicatePhoneChannelIds: ["channel_qr_b"],
     });
+  });
+});
+
+// Fase 6.1a: porte do SaaS (42ccbc7c, #159), adaptado ao mundo do nod.
+describe("provider rules API: Unificar for Unnichat automations (one rule for every number)", () => {
+  function unnichatRule(
+    world: ReturnType<typeof createWorld>,
+    number: "un_5159" | "un_5520" | "un_third",
+    extra: Record<string, unknown> = {},
+  ) {
+    return world.service.createRule(
+      workspaceId,
+      providerConversionRuleCreateInputSchema.parse({
+        name: "Lead Qualificado",
+        triggerType: "provider_automation",
+        eventName: "QualifiedLead",
+        connectionId: `connection_${number}`,
+        channelIds: [`channel_${number}`],
+        ...extra,
+      }),
+      "user_1",
+    );
+  }
+
+  it("covers every Unnichat number only with the explicit 'todas as conexões' option; a plain 'Todos os números' keeps its connection", async () => {
+    const world = createWorld({ unnichat: true });
+    const { rule } = await unnichatRule(world, "un_5159", {
+      scope: "all_numbers",
+      crossConnectionScope: true,
+      channelIds: undefined,
+    });
+    expect(rule).toMatchObject({
+      scope: "all_numbers",
+      crossConnectionScope: true,
+      origin: "automation_unnichat",
+      connectionId: "connection_un_5159",
+      // nod world: the base Unnichat number is one more connection.
+      effectiveChannelIds: [
+        "channel_unnichat",
+        "channel_un_5159",
+        "channel_un_5520",
+        "channel_un_third",
+      ],
+      numberRemoved: false,
+    });
+    const { rule: legacy } = await unnichatRule(world, "un_5520", {
+      scope: "all_numbers",
+      channelIds: undefined,
+    });
+    expect(legacy).toMatchObject({
+      crossConnectionScope: false,
+      effectiveChannelIds: ["channel_un_5520"],
+    });
+    // "Ampliar para todas as conexões" (audited like any edit).
+    const widened = await world.service.updateRule(
+      workspaceId,
+      legacy.id,
+      { crossConnectionScope: true },
+      "user_1",
+    );
+    expect(widened).toMatchObject({ crossConnectionScope: true });
+    expect(widened.effectiveChannelIds?.length).toBeGreaterThan(1);
+    // Never for other origins.
+    await expect(
+      world.service.createRule(
+        workspaceId,
+        providerConversionRuleCreateInputSchema.parse({
+          name: "Payt",
+          triggerType: "provider_automation",
+          automationSource: "payt",
+          eventName: "Purchase",
+          connectionId: "connection_umbler",
+          scope: "all_numbers",
+          crossConnectionScope: true,
+        }),
+        "user_1",
+      ),
+    ).rejects.toMatchObject({ status: 400 });
+  });
+
+  it("shows value/mode differences, which rule prevails, and requires confirmation", async () => {
+    const world = createWorld({ unnichat: true });
+    const first = await unnichatRule(world, "un_5159", { eventName: "Purchase", defaultValueCents: 10_000 });
+    const second = await unnichatRule(world, "un_5520", { eventName: "Purchase", defaultValueCents: 25_000 });
+    const { groups } = await world.service.listUnifyCandidates(workspaceId);
+    expect(groups[0]).toMatchObject({
+      targetRuleId: first.rule.id,
+      differences: ["value"],
+    });
+    expect(groups[0]!.members?.map((member) => member.defaultValueCents).sort()).toEqual([10_000, 25_000]);
+    await expect(
+      world.service.unifyRules(workspaceId, { ruleIds: groups[0]!.ruleIds }, "user_1"),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(world.providerRules.every((rule) => rule.unifiedIntoProviderRuleId === null)).toBe(true);
+    const unified = await world.service.unifyRules(
+      workspaceId,
+      { ruleIds: groups[0]!.ruleIds, acknowledgeDifferences: true },
+      "user_1",
+    );
+    // The target keeps ITS value.
+    expect(unified.rule).toMatchObject({
+      id: first.rule.id,
+      crossConnectionScope: true,
+      conversionRule: { defaultValueCents: 10_000 },
+    });
+    expect(unified.deactivatedRuleIds).toEqual([second.rule.id]);
+  });
+
+  it("offers Unificar for the per-connection rules (incl. the one whose number was removed) and promotes the oldest live one", async () => {
+    const world = createWorld({ unnichat: true });
+    const first = await unnichatRule(world, "un_5159");
+    const second = await unnichatRule(world, "un_5520");
+    const orphan = await unnichatRule(world, "un_third");
+    // The customer deleted the 3rd number: its connection was removed.
+    world.connections.find((c) => c.id === "connection_un_third")!.removedAt =
+      new Date(now.getTime() - 86_400_000);
+
+    const listed = await world.service.listRules(workspaceId);
+    expect(listed.find((r) => r.id === orphan.rule.id)!.numberRemoved).toBe(true);
+    expect(listed.find((r) => r.id === first.rule.id)!.numberRemoved).toBe(false);
+
+    const { groups } = await world.service.listUnifyCandidates(workspaceId);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]).toMatchObject({
+      origin: "automation_unnichat",
+      eventName: "QualifiedLead",
+      existingGlobalRuleId: null,
+    });
+    expect([...groups[0]!.ruleIds].sort()).toEqual(
+      [first.rule.id, second.rule.id, orphan.rule.id].sort(),
+    );
+
+    const unified = await world.service.unifyRules(
+      workspaceId,
+      { ruleIds: groups[0]!.ruleIds },
+      "user_1",
+    );
+    // The oldest rule with a live connection becomes the rule for all
+    // numbers: same id, same connection and the same signed URL.
+    expect(unified).toMatchObject({
+      outcome: "created",
+      rule: {
+        id: first.rule.id,
+        scope: "all_numbers",
+        connectionId: "connection_un_5159",
+        channelIds: [],
+        effectiveChannelIds: [
+          "channel_unnichat",
+          "channel_un_5159",
+          "channel_un_5520",
+        ],
+      },
+    });
+    expect(unified.rule.endpoint?.id).toBe(first.rule.endpoint?.id);
+    expect([...unified.deactivatedRuleIds].sort()).toEqual(
+      [second.rule.id, orphan.rule.id].sort(),
+    );
+    for (const id of [second.rule.id, orphan.rule.id]) {
+      const paused = world.providerRules.find((rule) => rule.id === id)!;
+      expect(paused).toMatchObject({
+        unifiedIntoProviderRuleId: first.rule.id,
+        removedAt: null,
+      });
+      // Nothing deleted: the paused rule keeps its URL and number rows.
+      expect(world.endpoints.some((e) => e.providerRuleId === id)).toBe(true);
+      expect(world.ruleChannels.some((scope) => scope.providerRuleId === id)).toBe(true);
+    }
+    const audit = world.audits.find(
+      (entry) => entry.action === "provider_conversion_rule.unified",
+    )!;
+    expect(audit).toMatchObject({
+      resultStatus: "promoted_member",
+      afterSummary: { previousChannelIds: ["channel_un_5159"] },
+    });
+
+    // Idempotent: the same request again is a replay, nothing changes.
+    const replay = await world.service.unifyRules(
+      workspaceId,
+      { ruleIds: groups[0]!.ruleIds },
+      "user_1",
+    );
+    expect(replay).toMatchObject({ outcome: "replayed", rule: { id: first.rule.id } });
+    expect((await world.service.listUnifyCandidates(workspaceId)).groups).toEqual([]);
+  });
+
+  it("folds a single per-connection rule into the existing rule for all numbers", async () => {
+    const world = createWorld({ unnichat: true });
+    const global = await unnichatRule(world, "un_5159", {
+      scope: "all_numbers",
+      crossConnectionScope: true,
+      channelIds: undefined,
+    });
+    const specific = await unnichatRule(world, "un_5520");
+
+    const { groups } = await world.service.listUnifyCandidates(workspaceId);
+    expect(groups[0]).toMatchObject({
+      ruleIds: [specific.rule.id],
+      existingGlobalRuleId: global.rule.id,
+    });
+    const unified = await world.service.unifyRules(
+      workspaceId,
+      { ruleIds: [specific.rule.id] },
+      "user_1",
+    );
+    expect(unified).toMatchObject({
+      outcome: "reused_existing",
+      rule: { id: global.rule.id },
+      deactivatedRuleIds: [specific.rule.id],
+    });
+  });
+
+  it("still asks for two rules of other origins", async () => {
+    const world = createWorld();
+    const { rule } = await world.service.createRule(
+      workspaceId,
+      messageInput({ connectionId: "connection_umbler", channelIds: ["channel_umbler"] }),
+      "user_1",
+    );
+    await expect(
+      world.service.unifyRules(workspaceId, { ruleIds: [rule.id] }, "user_1"),
+    ).rejects.toMatchObject({ status: 400 });
   });
 });
 
@@ -1781,5 +2033,122 @@ describe("Fase 5.3: product filter, URL própria and 'Desativar URL antiga'", ()
         "user_1",
       ),
     ).rejects.toMatchObject({ status: 400 });
+  });
+});
+
+// Fase 6.1a: porte do SaaS (0f6e010d, #161).
+describe("provider rules API: excluir regras unificadas e em lote", () => {
+  async function unifiedWorld() {
+    const world = createWorld({ unnichat: true });
+    const create = (number: "un_5159" | "un_5520" | "un_third") =>
+      world.service.createRule(
+        workspaceId,
+        providerConversionRuleCreateInputSchema.parse({
+          name: "Lead Qualificado",
+          triggerType: "provider_automation",
+          eventName: "QualifiedLead",
+          connectionId: `connection_${number}`,
+          channelIds: [`channel_${number}`],
+        }),
+        "user_1",
+      );
+    const target = await create("un_5159");
+    const member = await create("un_5520");
+    const orphan = await create("un_third");
+    world.connections.find((c) => c.id === "connection_un_third")!.removedAt =
+      new Date(now.getTime() - 86_400_000);
+    const { groups } = await world.service.listUnifyCandidates(workspaceId);
+    await world.service.unifyRules(
+      workspaceId,
+      { ruleIds: groups[0]!.ruleIds },
+      "user_1",
+    );
+    return { world, target: target.rule, member: member.rule, orphan: orphan.rule };
+  }
+
+  it("deletes a unified member and a unified rule whose number was removed (used to answer 404)", async () => {
+    const { world, member, orphan } = await unifiedWorld();
+
+    await world.service.removeRule(workspaceId, member.id, "user_1");
+    await world.service.removeRule(workspaceId, orphan.id, "user_1");
+
+    for (const id of [member.id, orphan.id]) {
+      const row = world.providerRules.find((rule) => rule.id === id)!;
+      expect(row.removedAt).toBeInstanceOf(Date);
+      expect(
+        world.endpoints.find((endpoint) => endpoint.providerRuleId === id)!
+          .removedAt,
+      ).toBeInstanceOf(Date);
+    }
+    expect(
+      world.audits.filter((a) => a.action === "provider_conversion_rule.removed"),
+    ).toHaveLength(2);
+    expect(
+      (await world.service.listRules(workspaceId)).map((rule) => rule.id),
+    ).not.toContain(orphan.id);
+  });
+
+  it("bulk: removes members and orphans, reports a missing rule and removes the target last", async () => {
+    const { world, target, member, orphan } = await unifiedWorld();
+
+    const result = await world.service.removeRules(
+      workspaceId,
+      { ruleIds: [target.id, member.id, "missing_rule", orphan.id] },
+      "user_1",
+    );
+    // Members of the same batch go first, so the target has none left.
+    expect(result.results.map((item) => [item.ruleId, item.status])).toEqual([
+      [target.id, "removed"],
+      [member.id, "removed"],
+      ["missing_rule", "not_found"],
+      [orphan.id, "removed"],
+    ]);
+    expect(result.removedCount).toBe(3);
+  });
+
+  it("bulk: a target that still has unified rules needs its own confirmation", async () => {
+    const { world, target, member } = await unifiedWorld();
+
+    const refused = await world.service.removeRules(
+      workspaceId,
+      { ruleIds: [target.id] },
+      "user_1",
+    );
+    expect(refused.results[0]!.status).toBe("needs_target_confirmation");
+    expect(
+      world.providerRules.find((rule) => rule.id === target.id)!.removedAt,
+    ).toBeNull();
+
+    const confirmed = await world.service.removeRules(
+      workspaceId,
+      { ruleIds: [target.id], confirmTargetRuleIds: [target.id] },
+      "user_1",
+    );
+    expect(confirmed.results[0]!.status).toBe("removed");
+    expect(
+      world.providerRules.find((rule) => rule.id === member.id)!.removedAt,
+    ).toBeNull();
+  });
+
+  it("bulk: one failing deletion does not stop the others", async () => {
+    const { world, member, orphan } = await unifiedWorld();
+    const original = world.prisma.providerConversionRuleConfig.update;
+    world.prisma.providerConversionRuleConfig.update = vi.fn(
+      async (args: Row) => {
+        if (args.where.id === member.id) throw new Error("db down");
+        return original(args);
+      },
+    );
+
+    const result = await world.service.removeRules(
+      workspaceId,
+      { ruleIds: [member.id, orphan.id] },
+      "user_1",
+    );
+    expect(result.results.map((item) => item.status)).toEqual([
+      "failed",
+      "removed",
+    ]);
+    expect(result.removedCount).toBe(1);
   });
 });
