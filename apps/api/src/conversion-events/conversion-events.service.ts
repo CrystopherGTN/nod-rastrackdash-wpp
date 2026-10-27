@@ -67,7 +67,10 @@ import {
   MANUAL_META_WINDOW_MS,
   manualDispatchingSince,
 } from "../leads/manual-conversion-payload";
-import { CTWA_SEND_SKIPPED_ERROR_CODE } from "./conversion-event-retry";
+import {
+  CTWA_SEND_SKIPPED_ERROR_CODE,
+  RETIRED_LEAD_FORM_CRM_TRIGGER,
+} from "./conversion-event-retry";
 import { providerAutomationManualReplayApproved } from "../conversion-rules/provider-manual-replay-approval";
 import {
   providerRuleCoversChannel,
@@ -99,15 +102,6 @@ import type {
 import { PrismaService } from "../common/prisma/prisma.service";
 import { loadWorkspaceConversionCurrency } from "../currency/workspace-currency";
 import { MetaTokenEncryptionService } from "../integrations/meta/meta-token-encryption.service";
-import { META_LEAD_FORM_CRM_TRIGGER } from "../meta-lead-forms/meta-crm-capi";
-import {
-  findLatestLeadFormSubmission,
-  previewLeadFormCrmStage,
-  recordLeadFormCrmConversion,
-  sendLeadFormCrmEvent,
-  type LeadFormCrmPreview,
-  type RecordLeadFormCrmResult,
-} from "../meta-lead-forms/meta-lead-form-crm-events";
 import {
   MetaConnectionResolverService,
   type ResolvedMetaCapiRoute,
@@ -135,6 +129,10 @@ import {
   isConversionEventRequiringValue,
   isSupportedConversionEventName,
 } from "./conversion-event-registry";
+
+/** 1.3.1: motivo gravado numa etapa de CRM de formulário Meta que sobrou. */
+const RETIRED_LEAD_FORM_CRM_MESSAGE =
+  "Formulários Meta foram retirados na 1.3.1: esta etapa do CRM não é mais enviada.";
 
 export type RecordRuleMatchesInput = {
   workspaceId: string;
@@ -418,7 +416,22 @@ export type SendReadyEventResult = {
 type SendReadyEventOptions = {
   workspaceId?: string;
   testEventCode?: string;
+  /**
+   * 1.3.1: nova tentativa do BullMQ (job.attemptsMade > 0). Um envio comum
+   * que falhou de forma passageira (MetaCapiNetworkError: rede ou limite de
+   * uso da Meta) volta a ready_to_send para ser enviado de novo com o mesmo
+   * event_id. Os envios com trava de envio único nunca gravam esse código
+   * (viram MetaCapiDeliveryUnknown) e ficam de fora.
+   */
+  queueRetry?: boolean;
 };
+
+/** Origens com registro de envio único: a fila nunca as rearma. */
+const QUEUE_RETRY_EXCLUDED_TRIGGERS = [
+  "kommo_stage",
+  "pipedrive_stage",
+  "inbound_webhook:meta_cloud",
+];
 
 @Injectable()
 export class ConversionEventsService {
@@ -1724,52 +1737,6 @@ export class ConversionEventsService {
     };
   }
 
-  /**
-   * Fase 6.9 (PR #91 do nod): CRM stage of the lead's latest Meta instant-form
-   * submission, recorded when the lead is qualified by the manual conversion
-   * (#158) or the CRM Kanban (#176). Null when the lead (or another Lead row
-   * of the same phone) has no form submission read on the Graph.
-   */
-  async recordLeadFormCrmStage(input: {
-    workspaceId: string;
-    leadId: string;
-    leadIds?: string[];
-    phoneHash: string;
-    actorUserId: string;
-    qualifiedAt?: Date;
-    originConversionEventLogId?: string | null;
-  }): Promise<RecordLeadFormCrmResult | null> {
-    const submission = await findLatestLeadFormSubmission(
-      this.prisma,
-      input.workspaceId,
-      input.leadIds?.length ? input.leadIds : [input.leadId],
-    );
-    if (!submission) return null;
-    return recordLeadFormCrmConversion(this.prisma, {
-      workspaceId: input.workspaceId,
-      leadId: input.leadId,
-      phoneHash: input.phoneHash,
-      customerIdentityKey: this.resolveCustomerIdentityKey(input.phoneHash),
-      submission,
-      actorUserId: input.actorUserId,
-      qualifiedAt: input.qualifiedAt ?? new Date(),
-      originConversionEventLogId: input.originConversionEventLogId ?? null,
-    });
-  }
-
-  /** Read-only side of recordLeadFormCrmStage (confirmation step). */
-  async previewLeadFormCrmStage(
-    workspaceId: string,
-    leadIds: string[],
-  ): Promise<LeadFormCrmPreview | null> {
-    const submission = await findLatestLeadFormSubmission(
-      this.prisma,
-      workspaceId,
-      leadIds,
-    );
-    return submission ? previewLeadFormCrmStage(this.prisma, submission) : null;
-  }
-
   async sendReadyEvent(
     logId: string,
     options: SendReadyEventOptions = {},
@@ -1785,6 +1752,29 @@ export class ConversionEventsService {
 
     if (!log && options.workspaceId !== undefined) {
       throw new NotFoundException("Evento de conversão não encontrado");
+    }
+
+    if (
+      options.queueRetry &&
+      log?.status === "error" &&
+      log.errorCode === "MetaCapiNetworkError" &&
+      !QUEUE_RETRY_EXCLUDED_TRIGGERS.includes(log.sourceTrigger ?? "")
+    ) {
+      // Troca condicional: só um worker rearma; o envio continua protegido
+      // pela troca ready_to_send -> envio de sempre.
+      const rearmed = await this.prisma.conversionEventLog.updateMany({
+        where: {
+          id: log.id,
+          status: "error",
+          errorCode: "MetaCapiNetworkError",
+        },
+        data: { status: "ready_to_send", errorCode: null, errorMessage: null },
+      });
+      if (rearmed.count === 1) {
+        log = (await this.prisma.conversionEventLog.findUnique({
+          where: { id: log.id },
+        })) as ConversionEventLogRecord | null;
+      }
     }
 
     if (
@@ -1832,19 +1822,24 @@ export class ConversionEventsService {
       };
     }
 
-    // Fase 6.9 (PR #91 do nod): CRM stage of a Meta instant form. Its own
-    // dataset and token, never the messaging route nor the CAPI batch.
-    if (log.sourceTrigger === META_LEAD_FORM_CRM_TRIGGER)
-      return sendLeadFormCrmEvent(
-        {
-          prisma: this.prisma,
-          decrypt: (token) => this.metaTokenEncryption.decrypt(token),
-          graphVersion: this.env.META_GRAPH_API_VERSION ?? "v21.0",
+    // 1.3.1: a etapa de CRM dos formulários Meta (1.3.0) foi retirada. Uma
+    // linha que já existia (fila, "Reenviar bloqueados", nova tentativa)
+    // nunca vai para a rota comum de mensagens: encerra como skipped.
+    if (log.sourceTrigger === RETIRED_LEAD_FORM_CRM_TRIGGER) {
+      await this.prisma.conversionEventLog.updateMany({
+        where: { id: log.id, status: "ready_to_send" },
+        data: {
+          status: "skipped",
+          errorCode: null,
+          errorMessage: RETIRED_LEAD_FORM_CRM_MESSAGE,
         },
-        log,
-        eventId,
-        { testEventCode: options.testEventCode ?? null },
-      );
+      });
+      return {
+        conversionEventLogId: log.id,
+        workspaceId: log.workspaceId,
+        status: "skipped",
+      };
+    }
 
     if (!(await this.externalCapiDeliveryOwnedByWppTrack(log))) {
       await this.prisma.conversionEventLog.updateMany({

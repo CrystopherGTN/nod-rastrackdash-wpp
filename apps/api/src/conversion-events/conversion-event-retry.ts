@@ -21,6 +21,14 @@ export const STALLED_READY_TO_SEND_MS = 10 * 60_000;
 
 export const BLOCKED_CONVERSION_RETRY_LIMIT = 500;
 
+/**
+ * sourceTrigger da etapa de CRM dos formulários Meta da 1.3.0. O recurso foi
+ * retirado na 1.3.1 (as tabelas ficam no banco, sem uso): linhas que já
+ * existirem nunca são enviadas pela rota comum de mensagens (ver
+ * sendReadyEvent) nem entram no "Reenviar recusados" ou no "Reenviar bloqueados".
+ */
+export const RETIRED_LEAD_FORM_CRM_TRIGGER = "meta_lead_form_crm";
+
 const configurationErrorCodes = [
   "MissingAccessToken",
   "MissingMetaDestination",
@@ -28,6 +36,7 @@ const configurationErrorCodes = [
 
 export const configurationBlockedConversionEventWhere = {
   status: "not_configured",
+  sourceTrigger: { not: RETIRED_LEAD_FORM_CRM_TRIGGER },
   OR: [{ errorCode: { in: configurationErrorCodes } }, { errorCode: null }],
 } satisfies Prisma.ConversionEventLogWhereInput;
 
@@ -36,6 +45,7 @@ export function isConfigurationBlockedConversionEvent(
 ): boolean {
   return (
     event.status === "not_configured" &&
+    event.sourceTrigger !== RETIRED_LEAD_FORM_CRM_TRIGGER &&
     (event.errorCode === null ||
       configurationErrorCodes.includes(event.errorCode))
   );
@@ -76,6 +86,18 @@ export const META_AUTH_FAILURE_GRAPH_CODES = [190, 102] as const;
  */
 const singleDispatchLedgerSourceTriggers = ["kommo_stage", "pipedrive_stage"];
 
+/**
+ * Fora do "Reenviar bloqueados e falhas de login da Meta": além da Kommo e do
+ * Pipedrive, o Meta Cloud (inbound_webhook:meta_cloud), cuja trava permanente
+ * inbound-meta-dispatch:<id> devolveria skipped e deixaria o evento para
+ * sempre "na fila", e a etapa de CRM retirada na 1.3.1.
+ */
+const authFailureRetryExcludedSourceTriggers = [
+  ...singleDispatchLedgerSourceTriggers,
+  "inbound_webhook:meta_cloud",
+  RETIRED_LEAD_FORM_CRM_TRIGGER,
+];
+
 /** error.code of a stored Meta response ({"error":{"code":190,...}}). */
 export function metaGraphErrorCodeFromResponse(
   summary: unknown,
@@ -111,7 +133,7 @@ export function isMetaAuthFailureConversionEvent(
   return (
     event.status === "error" &&
     event.errorCode === "MetaCapiRejected" &&
-    !singleDispatchLedgerSourceTriggers.includes(event.sourceTrigger ?? "") &&
+    !authFailureRetryExcludedSourceTriggers.includes(event.sourceTrigger ?? "") &&
     isMetaAuthFailureResponse(event.providerResponseSummary)
   );
 }
@@ -155,7 +177,7 @@ const metaAuthFailureResponseWhere = META_AUTH_FAILURE_GRAPH_CODES.flatMap(
 export const metaAuthFailureConversionEventWhere = {
   status: "error",
   errorCode: "MetaCapiRejected",
-  sourceTrigger: { notIn: singleDispatchLedgerSourceTriggers },
+  sourceTrigger: { notIn: authFailureRetryExcludedSourceTriggers },
   OR: metaAuthFailureResponseWhere,
 } satisfies Prisma.ConversionEventLogWhereInput;
 
@@ -188,3 +210,79 @@ export function canRetryConversionEvent(
     canRetryMetaAuthFailureConversionEvent(event, now)
   );
 }
+
+/**
+ * "Reenviar recusados" (1.3.1): recusas da Meta cuja causa o aluno corrige no
+ * painel (configuração, parâmetro ou permissão): 100 (com qualquer
+ * subcódigo), 10 e 200-299 (inclui 294). Ficam de fora 190/102 (falha de
+ * login, já no "Reenviar bloqueados"), os limites de uso (voltam para a fila
+ * sozinhos) e 368 (bloqueio por política da Meta). Recusas antigas, gravadas
+ * antes do código da Meta (só { httpStatus }), também entram.
+ */
+export function isFixableMetaRejectionCode(code: number): boolean {
+  return code === 100 || code === 10 || (code >= 200 && code <= 299);
+}
+
+export function isFixableMetaRejectionResponse(summary: unknown): boolean {
+  const code = metaGraphErrorCodeFromResponse(summary);
+  if (code !== null) return isFixableMetaRejectionCode(code);
+  // 1.2.0 e anteriores: a recusa guardava só o status HTTP, sem "error".
+  return (
+    !!summary &&
+    typeof summary === "object" &&
+    !Array.isArray(summary) &&
+    !("error" in summary) &&
+    typeof (summary as { httpStatus?: unknown }).httpStatus === "number"
+  );
+}
+
+/**
+ * Fora do "Reenviar recusados": Kommo e Pipedrive (registro de envio único,
+ * a mesma regra do "Reenviar bloqueados" para recusas), Meta Cloud (trava
+ * permanente de um envio por evento: o reenvio ficaria parado na fila) e a
+ * etapa de CRM retirada na 1.3.1 (RETIRED_LEAD_FORM_CRM_TRIGGER).
+ */
+export const rejectedRetryExcludedSourceTriggers = [
+  ...singleDispatchLedgerSourceTriggers,
+  "inbound_webhook:meta_cloud",
+  RETIRED_LEAD_FORM_CRM_TRIGGER,
+];
+
+export function isFixableMetaRejectionConversionEvent(
+  event: ConversionEventRetryState,
+): boolean {
+  return (
+    event.status === "error" &&
+    event.errorCode === "MetaCapiRejected" &&
+    !rejectedRetryExcludedSourceTriggers.includes(event.sourceTrigger ?? "") &&
+    isFixableMetaRejectionResponse(event.providerResponseSummary)
+  );
+}
+
+export function canRetryFixableMetaRejectionConversionEvent(
+  event: ConversionEventRetryState,
+  now = Date.now(),
+): boolean {
+  return (
+    isFixableMetaRejectionConversionEvent(event) &&
+    !isOutsideMetaEventTimeWindow(event, now)
+  );
+}
+
+/**
+ * SQL side (candidates): recusas dentro dos 7 dias, fora das origens
+ * excluídas. O código é conferido em JS (isFixableMetaRejectionResponse).
+ */
+export function fixableMetaRejectionCandidateWhere(
+  now = Date.now(),
+): Prisma.ConversionEventLogWhereInput {
+  return {
+    status: "error",
+    errorCode: "MetaCapiRejected",
+    sourceTrigger: { notIn: rejectedRetryExcludedSourceTriggers },
+    eventOccurredAt: { gte: new Date(now - META_EVENT_TIME_WINDOW_MS) },
+  };
+}
+
+/** Candidatos lidos por clique antes do filtro de código (janela de 7 dias). */
+export const REJECTED_RETRY_CANDIDATE_LIMIT = 1_000;
