@@ -17,7 +17,10 @@ import { InboundWebhooksModule } from "./inbound-webhooks/inbound-webhooks.modul
 import { InboundWebhookProductionModule } from "./inbound-webhook-production/inbound-webhook-production.module";
 import { InboundWebhookReplayModule } from "./inbound-webhook-replay/inbound-webhook-replay.module";
 import { IntegrationsModule } from "./integrations/integrations.module";
+import { CrmModule } from "./crm/crm.module";
 import { LeadsModule } from "./leads/leads.module";
+import { ManualConversionsModule } from "./leads/manual-conversions.module";
+import { MetaLeadFormsModule } from "./meta-lead-forms/meta-lead-forms.module";
 import { LicenseClientModule } from "./licensing-client/license-client.module";
 import { OnboardingModule } from "./onboarding/onboarding.module";
 import { ReportingModule } from "./reporting/reporting.module";
@@ -46,6 +49,9 @@ import { PipedriveModule } from "./pipedrive/pipedrive.module";
     InboundWebhookReplayModule,
     ConversionRulesModule,
     LeadsModule,
+    ManualConversionsModule,
+    MetaLeadFormsModule,
+    CrmModule,
     ReportingModule,
     WebhooksModule,
     OpsAlertsModule,

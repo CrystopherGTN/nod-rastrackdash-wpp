@@ -34,6 +34,10 @@ import type {
   InboundWebhookOneTimeSecret,
 } from "./inbound-webhook-actions";
 import { InboundWebhookRouteEditor } from "./inbound-webhook-route-editor";
+import {
+  WhatsappInstanceActivitySummary,
+  type WhatsappInstanceActivities,
+} from "./whatsapp-instance-activity";
 import { InboundWebhookRoutingMode } from "./inbound-webhook-routing-mode";
 import { InboundRecoveryPanel } from "./inbound-recovery-panel";
 import { MetaCloudWabaSubscriptionPanel } from "./meta-cloud-waba-subscription";
@@ -44,6 +48,7 @@ import {
   unnichatRoutingSourceLabel,
 } from "./inbound-webhook-labels";
 import { UnnichatEntrySetupPanel } from "./unnichat-setup";
+import { RoichatSetupPanel } from "./roichat-setup";
 
 type InboundWebhookAction = (
   formData: FormData,
@@ -53,6 +58,12 @@ export type InboundWebhookConnectionView = {
   overview: InboundWebhookConnectionOverviewDto;
   channels: InboundWebhookChannelDto[];
   detailState?: "real" | "error";
+  /**
+   * GET /channels of this connection failed (porte do #165): `channels` is
+   * empty because it could not be read, never because the connection has no
+   * number.
+   */
+  channelsState?: "real" | "error";
 };
 
 export type InboundWebhookPanelProps = {
@@ -77,6 +88,11 @@ export type InboundWebhookPanelProps = {
   provider?: InboundWebhookProviderDto;
   /** False hides the create form (e.g. connections bridged from Uazapi). */
   allowCreate?: boolean;
+  /**
+   * Fase 6.3b (porte do SaaS #126): atividade de cada conexão WhatsApp
+   * (Uazapi BYO ou WAHA) por id, mostrada nas pontes das regras de frase.
+   */
+  instanceActivities?: WhatsappInstanceActivities;
   /** Whether the create form starts open (default: when nothing exists). */
   defaultCreateOpen?: boolean;
   /** Replaces the scoped heading's helper text. */
@@ -100,6 +116,7 @@ export function inboundWebhookProviderLabel(provider: string): string {
     meta_cloud: "Meta WhatsApp (Cloud API)",
     umbler: "Umbler Talk",
     unnichat: "Unnichat",
+    roichat: "ROI Chat",
     uazapi: "Uazapi",
   };
 
@@ -115,7 +132,30 @@ const inboundPasteInstructions: Record<string, string> = {
   umbler: "Cole esta URL no painel/webhook da Umbler Talk.",
   unnichat:
     "Cole esta URL na chamada HTTP do fluxo do Unnichat que recebe a conversa do anúncio.",
+  roichat:
+    "Cole esta URL no webhook deste número no ROI Chat: ela recebe a entrada do lead que veio do anúncio e a compra.",
 };
+
+/**
+ * Regras que valem para esta conexão: as presas a ela e as de "Todos os
+ * números (todas as conexões)" do mesmo provedor ancoradas em outra conexão
+ * (Unnichat, Umbler e ROI Chat criam uma conexão por número).
+ */
+export function rulesCoveringConnection(
+  rules: readonly ProviderConversionRuleDto[],
+  connection: { id: string; provider: string },
+  connections: readonly { id: string; provider: string }[],
+): ProviderConversionRuleDto[] {
+  const providerOf = new Map(connections.map((item) => [item.id, item.provider]));
+  return rules.filter(
+    (rule) =>
+      rule.connectionId === connection.id ||
+      (rule.crossConnectionScope === true &&
+        rule.scope === "all_numbers" &&
+        rule.connectionId !== null &&
+        providerOf.get(rule.connectionId) === connection.provider),
+  );
+}
 
 export function inboundPasteInstruction(provider: string): string {
   return (
@@ -126,10 +166,14 @@ export function inboundPasteInstruction(provider: string): string {
 
 // Data Crazy nao aceita cadastro manual de numero: o canal nasce do primeiro
 // webhook recebido (a API bloqueia o canal provisorio para esse provider).
-// Unnichat tambem nao: o numero do cliente e informado ao criar a conexao.
+// Unnichat e ROI Chat tambem nao: o numero do cliente e informado ao criar a
+// conexao (uma conexao = um numero = uma URL).
 function allowsManualChannelRegistration(provider: string): boolean {
   return (
-    provider !== "uazapi" && provider !== "data_crazy" && provider !== "unnichat"
+    provider !== "uazapi" &&
+    provider !== "data_crazy" &&
+    provider !== "unnichat" &&
+    provider !== "roichat"
   );
 }
 
@@ -137,6 +181,9 @@ function allowsManualChannelRegistration(provider: string): boolean {
 function createDescription(provider: string, allowCreate: boolean): string {
   if (provider === "unnichat") {
     return "Dê um nome e informe o número de WhatsApp atendido pelo Unnichat. A conexão já nasce presa a esse número; só conversas vindas de anúncio (CTWA) viram lead.";
+  }
+  if (provider === "roichat") {
+    return "Dê um nome e informe o número de WhatsApp atendido pelo ROI Chat. Cada número tem a própria URL, que recebe a entrada do lead que veio do anúncio e a compra.";
   }
 
   return allowCreate
@@ -164,6 +211,7 @@ export function InboundWebhookPanel({
   defaultCreateOpen,
   scopeDescription,
   licenseLocked = false,
+  instanceActivities = {},
 }: InboundWebhookPanelProps) {
   const router = useRouter();
   const connections = scopedProvider
@@ -371,7 +419,7 @@ export function InboundWebhookPanel({
       ) : null}
       {createOpen && canCreate ? (
         <form
-          className={`inbound-webhook-create${selectedCreateProvider === "unnichat" ? " has-phone" : ""}`}
+          className={`inbound-webhook-create${selectedCreateProvider === "unnichat" || selectedCreateProvider === "roichat" ? " has-phone" : ""}`}
           onSubmit={handleCreate}
         >
           {scopedProvider ? (
@@ -427,6 +475,28 @@ export function InboundWebhookPanel({
               </span>
             </label>
           ) : null}
+          {selectedCreateProvider === "roichat" ? (
+            <label>
+              <span className="field-label">Número de WhatsApp do cliente</span>
+              <input
+                name="connectedPhone"
+                type="tel"
+                inputMode="tel"
+                autoComplete="off"
+                minLength={8}
+                maxLength={32}
+                placeholder="Ex.: +55 11 99999-0001"
+                required
+                aria-describedby="roichat-whatsapp-help"
+                disabled={pendingAction === "create"}
+              />
+              <span id="roichat-whatsapp-help" className="field-help muted">
+                É o número atendido pelo ROI Chat (o seu), com DDI e DDD. Nunca
+                o telefone do lead. Um número por conexão: cada número recebe a
+                própria URL.
+              </span>
+            </label>
+          ) : null}
           <button
             className="button primary"
             type="submit"
@@ -454,6 +524,7 @@ export function InboundWebhookPanel({
       {oneTimeSecret?.provider === "unnichat" ? (
         <UnnichatEntrySetupPanel />
       ) : null}
+      {oneTimeSecret?.provider === "roichat" ? <RoichatSetupPanel /> : null}
 
       {notice ? (
         <div
@@ -471,14 +542,31 @@ export function InboundWebhookPanel({
             <div>
               <strong>Nenhum webhook configurado</strong>
               <p className="muted">
-                Crie uma conexão para receber o primeiro payload de teste.
+                Crie uma conexão para começar a receber os eventos.
               </p>
             </div>
           </div>
         ) : (
-          connections.map(({ overview, channels, detailState }) => {
+          connections.map(({ overview, channels, detailState, channelsState }) => {
             const connection = overview.connection;
             const connectionPending = pendingAction?.includes(connection.id);
+            // Fase 6.3b (SaaS #126): a ponte da Uazapi/WAHA só leva as regras
+            // de frase; o lead de anúncio entra direto pela conexão WhatsApp,
+            // então os contadores de entrada desta conexão não são medidos.
+            const isBridged =
+              connection.provider === "uazapi" ||
+              connection.provider === "waha";
+            const bridgedInstanceIds = isBridged
+              ? [
+                  ...new Set(
+                    channels.flatMap((channel) =>
+                      channel.whatsappInstanceId
+                        ? [channel.whatsappInstanceId]
+                        : [],
+                    ),
+                  ),
+                ]
+              : [];
 
             return (
               <details className="inbound-connection" key={connection.id}>
@@ -540,25 +628,47 @@ export function InboundWebhookPanel({
                     />
                     <ObservationCounter
                       label="CTWA pendente"
-                      value={overview.counters.eligibleUnresolved}
+                      value={
+                        isBridged ? null : overview.counters.eligibleUnresolved
+                      }
                       tone="warn"
                     />
                     <ObservationCounter
                       label="Sem CTWA"
-                      value={overview.counters.ignoredNoCtwa}
+                      value={isBridged ? null : overview.counters.ignoredNoCtwa}
                     />
                     <ObservationCounter
                       label="Duplicados"
-                      value={overview.counters.duplicate}
+                      value={isBridged ? null : overview.counters.duplicate}
                     />
                     <ObservationCounter
                       label="Inválidos"
-                      value={overview.counters.invalid}
+                      value={isBridged ? null : overview.counters.invalid}
                       tone="error"
                     />
                   </div>
+                  {isBridged ? (
+                    <p className="muted inbound-counter-note">
+                      O lead de anúncio entra pela conexão WhatsApp; pendentes,
+                      sem CTWA, duplicados e inválidos não são medidos nesta
+                      conexão.
+                    </p>
+                  ) : null}
+                  {bridgedInstanceIds.map((whatsappInstanceId) => (
+                    <section
+                      className="inbound-instance-activity"
+                      aria-label="Atividade do número WhatsApp"
+                      key={whatsappInstanceId}
+                    >
+                      <span className="micro-label">Atividade do número</span>
+                      <WhatsappInstanceActivitySummary
+                        view={instanceActivities[whatsappInstanceId]}
+                        whatsappInstanceId={whatsappInstanceId}
+                      />
+                    </section>
+                  ))}
 
-                  {connection.provider === "meta_cloud" ? <p>Canal habilitado recebe eventos; a conexão precisa de envios automáticos ativos para enviar novos CTWAs. CTWA roteado não significa enviado. Ativar envios automáticos não recupera o histórico.</p> : null}
+                  {connection.provider === "meta_cloud" ? <p>Com a conexão enviando, cada novo CTWA de um canal ativo e com rota válida vai para a Meta. CTWA roteado não significa enviado. O histórico anterior não é reenviado automaticamente.</p> : null}
                   {connection.provider === "meta_cloud" ? (
                     <MetaCloudWabaSubscriptionPanel
                       connectionId={connection.id}
@@ -577,7 +687,7 @@ export function InboundWebhookPanel({
                           onClick={() => {
                             if (
                               window.confirm(
-                                "Ativar o envio automático? Apenas canais habilitados e com rota válida enviarão novos eventos.",
+                                "Ativar o envio desta conexão? Apenas canais ativos e com rota válida enviarão novos eventos.",
                               )
                             ) {
                               void runConnectionAction(
@@ -592,35 +702,11 @@ export function InboundWebhookPanel({
                           }}
                         >
                           <Send size={15} aria-hidden="true" />
-                          Ativar envios automáticos
+                          Ativar envio
                         </button>
                       ) : null}
-                      {connection.status === "production" ? (
-                        <button
-                          className="button"
-                          type="button"
-                          disabled={Boolean(connectionPending)}
-                          onClick={() => {
-                            if (
-                              window.confirm(
-                                "Voltar para observação? Novas mensagens continuarão registradas, mas não gerarão conversões automáticas.",
-                              )
-                            ) {
-                              void runConnectionAction(
-                                `observation-${connection.id}`,
-                                setConnectionStatusAction,
-                                {
-                                  connectionId: connection.id,
-                                  status: "observation",
-                                },
-                              );
-                            }
-                          }}
-                        >
-                          <Pause size={15} aria-hidden="true" />
-                          Voltar para observação
-                        </button>
-                      ) : null}
+                      {/* Fase 6.1c (produção direta): sem "voltar para
+                          observação"; para parar o envio, Pausar conexão. */}
                       <button
                         className="button"
                         type="button"
@@ -631,9 +717,12 @@ export function InboundWebhookPanel({
                             setConnectionStatusAction,
                             {
                               connectionId: connection.id,
+                              // Fase 6.1c: retomar volta a enviar.
                               status:
                                 connection.status === "paused"
-                                  ? "observation"
+                                  ? capabilities.productionEnabled
+                                    ? "production"
+                                    : "observation"
                                   : "paused",
                             },
                           )
@@ -645,30 +734,40 @@ export function InboundWebhookPanel({
                           <Pause size={15} aria-hidden="true" />
                         )}
                         {connection.status === "paused"
-                          ? "Retomar observação"
+                          ? "Retomar conexão"
                           : "Pausar conexão"}
                       </button>
-                      <button
-                        className="button"
-                        type="button"
-                        disabled={Boolean(connectionPending)}
-                        onClick={() => {
-                          if (
-                            window.confirm(
-                              "Gerar uma nova URL inválida a URL atual. Continuar?",
-                            )
-                          ) {
-                            void runConnectionAction(
-                              `rotate-${connection.id}`,
-                              rotateSecretAction,
-                              { connectionId: connection.id },
-                            );
-                          }
-                        }}
-                      >
-                        <RefreshCw size={15} aria-hidden="true" />
-                        Gerar nova URL
-                      </button>
+                      {connection.provider === "uazapi" ||
+                      connection.provider === "waha" ? (
+                        // Porte do #105 do SaaS (com a ponte WAHA): a ponte
+                        // recebe pelo webhook da conexão WhatsApp.
+                        <span className="muted">
+                          Esta conexão recebe pelo webhook da conexão
+                          WhatsApp; gerar URL aqui não se aplica.
+                        </span>
+                      ) : (
+                        <button
+                          className="button"
+                          type="button"
+                          disabled={Boolean(connectionPending)}
+                          onClick={() => {
+                            if (
+                              window.confirm(
+                                "Gerar uma nova URL inválida a URL atual. Continuar?",
+                              )
+                            ) {
+                              void runConnectionAction(
+                                `rotate-${connection.id}`,
+                                rotateSecretAction,
+                                { connectionId: connection.id },
+                              );
+                            }
+                          }}
+                        >
+                          <RefreshCw size={15} aria-hidden="true" />
+                          Gerar nova URL
+                        </button>
+                      )}
                       <button
                         className="button danger"
                         type="button"
@@ -716,13 +815,20 @@ export function InboundWebhookPanel({
                         }
                       />
                     ) : null}
-                    {channels.length === 0 ? (
+                    {channels.length === 0 && channelsState === "error" ? (
+                      <p className="action-note warn inbound-channel-empty">
+                        Não foi possível carregar os números desta conexão
+                        agora. Recarregue a página em instantes.
+                      </p>
+                    ) : channels.length === 0 ? (
                       <p className="muted inbound-channel-empty">
                         {connection.provider === "data_crazy"
-                          ? "O canal aparece sozinho quando o primeiro webhook do Data Crazy chegar. Envie uma mensagem de teste para liberar as regras."
+                          ? "O canal aparece sozinho quando o primeiro webhook do Data Crazy chegar; a partir daí ele já envia e pode receber regras."
                           : connection.provider === "unnichat"
                             ? "Esta conexão ainda não tem o número do cliente. Remova-a e crie de novo informando o número de WhatsApp atendido pelo Unnichat."
-                            : "Nenhum canal cadastrado ainda. Cadastre o número conectado para liberar as regras de conversão antes do primeiro lead chegar."}
+                            : connection.provider === "roichat"
+                              ? "Esta conexão ainda não tem o número do cliente. Remova-a e crie de novo informando o número de WhatsApp atendido pelo ROI Chat."
+                              : "Nenhum canal cadastrado ainda. Cadastre o número conectado para criar as regras de conversão antes do primeiro lead chegar."}
                       </p>
                     ) : (
                       channels.map((channel) => {
@@ -827,7 +933,8 @@ export function InboundWebhookPanel({
                   </div>
 
                   {connection.provider === "umbler" ||
-                  connection.provider === "unnichat" ? (
+                  connection.provider === "unnichat" ||
+                  connection.provider === "roichat" ? (
                     <section className="provider-conversion-summary">
                       <div className="provider-conversion-summary-icon">
                         <Settings2 size={18} aria-hidden="true" />
@@ -836,8 +943,12 @@ export function InboundWebhookPanel({
                         <span className="eyebrow">Gatilhos de conversão</span>
                         <strong>
                           {
-                            providerRules.filter(
-                              (rule) => rule.connectionId === connection.id,
+                            rulesCoveringConnection(
+                              providerRules,
+                              connection,
+                              allConnections.map(
+                                (item) => item.overview.connection,
+                              ),
                             ).length
                           }{" "}
                           regra(s) nesta conexão
@@ -889,7 +1000,11 @@ export function InboundWebhookOneTimeSecretPanel({
   onDismiss: () => void;
 }) {
   const providerLabel = inboundWebhookProviderLabel(secret.provider);
-  const providerPreposition = secret.provider === "data_crazy" || secret.provider === "unnichat" ? "no" : "na";
+  const providerPreposition = secret.provider === "data_crazy" ||
+    secret.provider === "unnichat" ||
+    secret.provider === "roichat"
+      ? "no"
+      : "na";
   const showVerifyToken = secret.provider === "meta_cloud";
 
   return (
@@ -1050,8 +1165,18 @@ function ObservationCounter({
 }: {
   label: string;
   tone?: "" | "success" | "warn" | "error";
-  value: number;
+  /** `null` = the provider does not measure this counter. */
+  value: number | null;
 }) {
+  if (value === null) {
+    return (
+      <div className="inbound-counter unmeasured" data-measured="false">
+        <span>{label}</span>
+        <strong>Não medido</strong>
+      </div>
+    );
+  }
+
   return (
     <div className={`inbound-counter${tone ? ` ${tone}` : ""}`}>
       <span>{label}</span>
@@ -1145,9 +1270,9 @@ function ChannelReadiness({
         </p>
       )}
       <p className="muted">
-        A prontidão da rota não ativa envios: a conexão ainda exige parser
-        certificado e produção habilitada. CTWA anteriores à ativação não são
-        enviados automaticamente.
+        Com a conexão e o canal enviando, cada novo CTWA com rota pronta vai
+        para a Meta. CTWA anteriores à ativação não são enviados
+        automaticamente.
       </p>
 
       {readiness.alreadyMaterializedCtwa > 0 ? (
@@ -1219,6 +1344,10 @@ function readinessBlockerLabel(
     payload_unavailable: `${readiness.payloadUnavailableCtwa} CTWA não possuem mais payload disponível.`,
     payload_expiring_soon:
       "O payload preservado mais próximo expira em menos de 48 horas.",
+    // Porte do #179: "Bloqueado" sempre com motivo.
+    ctwa_send_failed: `${readiness.sendFailedCtwa ?? 0} CTWA falharam ou foram ignorados no envio e não entram em um novo envio automático.`,
+    ctwa_in_progress: `${readiness.inProgressCtwa ?? 0} CTWA estão sendo processados agora. Aguarde alguns minutos e atualize a página.`,
+    ctwa_not_eligible: `${readiness.notEligibleCtwa ?? 0} CTWA foram descartados pela triagem (por exemplo, mensagem enviada pelo próprio número ou lead fora do rastreamento) e não serão enviados à Meta. Nenhuma ação é necessária.`,
   } as const;
 
   return labels[blocker];
@@ -1244,7 +1373,7 @@ function connectionStatusLabel(
   }
 
   if (status === "observation") {
-    return "Observando";
+    return "Envio desligado";
   }
 
   return "Pausada";

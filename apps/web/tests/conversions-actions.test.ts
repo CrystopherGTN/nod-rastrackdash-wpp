@@ -28,6 +28,7 @@ import {
   loadProviderConversionExecutionAuditAction,
   removeProviderConversionRuleAction,
   rotateProviderConversionRuleEndpointAction,
+  removeConversionRulesAction,
   unifyConversionRulesAction,
   updateLegacyRuleAction,
   updateProviderConversionRuleAction,
@@ -80,7 +81,12 @@ afterEach(() => {
 
 describe("conversions actions: create", () => {
   it("creates a rule without connection and accepts its connection-less receipt", async () => {
-    const rule = providerRule({ id: "rule_1", scope: "all_numbers" });
+    // Fase 6.1c (produção direta): a API devolve a regra já enviando.
+    const rule = providerRule({
+      id: "rule_1",
+      scope: "all_numbers",
+      mode: "production",
+    });
     serverApiFetch.mockResolvedValueOnce({
       outcome: "created",
       receipt: { ruleId: "rule_1", connectionId: null, createdAt: rule.createdAt },
@@ -99,7 +105,8 @@ describe("conversions actions: create", () => {
     // No connection is invented for a rule of every number.
     expect(JSON.parse(init.body)).toEqual(globalPayload);
     expect(result).toMatchObject({ ok: true, ruleId: "rule_1" });
-    expect(result.message).toContain("observação");
+    expect(result.message).toContain("Regra criada e enviando");
+    expect(result.message).not.toMatch(/observação/u);
     expect(revalidatePath).toHaveBeenCalledWith("/conversions");
   });
 
@@ -396,8 +403,11 @@ describe("conversions actions: unify", () => {
     );
   });
 
-  it("refuses fewer than two rules and shows the license lock", async () => {
-    expect(await unifyConversionRulesAction(unifyForm(["a"]))).toMatchObject({ ok: false });
+  it("refuses an empty selection and shows the license lock", async () => {
+    // Fase 6.1a (#159): one rule is accepted (Unnichat/Umbler: a
+    // per-connection rule folded into the existing rule for all numbers; the
+    // API asks two for the other origins).
+    expect(await unifyConversionRulesAction(unifyForm([]))).toMatchObject({ ok: false });
     expect(serverApiFetch).not.toHaveBeenCalled();
 
     serverApiFetch.mockRejectedValueOnce(licenseLocked());
@@ -524,7 +534,9 @@ describe("conversions actions: manage, legacy and history", () => {
   });
 
   it("connects a legacy rule to numbers", async () => {
-    serverApiFetch.mockResolvedValueOnce(providerRule({ id: "legacy_1" }));
+    serverApiFetch.mockResolvedValueOnce(
+      providerRule({ id: "legacy_1", mode: "production" }),
+    );
     const payload = {
       connectionId: "conn_1",
       channelIds: ["ch_1"],
@@ -542,7 +554,7 @@ describe("conversions actions: manage, legacy and history", () => {
     );
     expect(result).toEqual({
       ok: true,
-      message: "Regra conectada aos números, em observação.",
+      message: "Regra conectada aos números e enviando para a Meta.",
     });
   });
 
@@ -675,5 +687,64 @@ describe("conversions actions: manage, legacy and history", () => {
       executionAudit: expect.anything(),
     });
     expect(revalidatePath).not.toHaveBeenCalled();
+  });
+});
+
+describe("conversions actions: excluir selecionadas", () => {
+  function bulkForm(ids: string[], targets: string[] = []) {
+    const formData = new FormData();
+    ids.forEach((id) => formData.append("ruleId", id));
+    targets.forEach((id) => formData.append("confirmTargetId", id));
+    return formData;
+  }
+
+  it("sends every id and the confirmed targets, and reports the per-rule result", async () => {
+    serverApiFetch.mockResolvedValueOnce({
+      removedCount: 1,
+      results: [
+        { ruleId: "rule_a", status: "removed", message: null },
+        { ruleId: "rule_b", status: "needs_target_confirmation", message: "Confirme." },
+      ],
+    });
+
+    const result = await removeConversionRulesAction(
+      bulkForm(["rule_a", "rule_b"], ["rule_x"]),
+    );
+
+    expect(serverApiFetch).toHaveBeenCalledWith(
+      "/conversion-rules/providers/bulk-delete",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          ruleIds: ["rule_a", "rule_b"],
+          confirmTargetRuleIds: ["rule_x"],
+        }),
+      },
+    );
+    expect(result.ok).toBe(false);
+    expect(result.message).toBe("1 de 2 excluídas. Veja abaixo o que ficou.");
+    expect(result.bulkRemove?.results[1]?.status).toBe("needs_target_confirmation");
+  });
+
+  it("is ok when everything was removed and refuses an empty selection", async () => {
+    serverApiFetch.mockResolvedValueOnce({
+      removedCount: 2,
+      results: [
+        { ruleId: "rule_a", status: "removed", message: null },
+        { ruleId: "rule_b", status: "removed", message: null },
+      ],
+    });
+    expect(await removeConversionRulesAction(bulkForm(["rule_a", "rule_b"]))).toMatchObject({
+      ok: true,
+      message: "2 regras excluídas. O histórico continua salvo.",
+    });
+    expect(await removeConversionRulesAction(bulkForm([]))).toMatchObject({ ok: false });
+    expect(serverApiFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("says when the outcome is unknown instead of pretending it worked", async () => {
+    serverApiFetch.mockRejectedValueOnce(apiError(500, "boom"));
+    const result = await removeConversionRulesAction(bulkForm(["rule_a"]));
+    expect(result).toMatchObject({ ok: false, outcomeUnknown: true });
   });
 });

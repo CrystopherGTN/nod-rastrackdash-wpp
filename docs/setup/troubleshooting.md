@@ -94,11 +94,11 @@ Cada entrada segue: **sintoma → diagnóstico seguro → causa provável → co
 - **Correção:** recrie/rotacione a conexão, copie **URL de callback** e **Verify token** em campos separados na Meta, e confirme as envs `INBOUND_*`.
 - **Verificação:** a Meta aceita e salva o webhook; a assinatura do campo `messages` fica disponível.
 
-## Meta WhatsApp (Cloud API): parou de receber depois de "Ativar envios automáticos"
+## Meta WhatsApp (Cloud API): parou de receber depois de ativar o envio
 
 - **Diagnóstico:** a Meta passa a registrar falha de entrega; a API responde `404` nos POSTs daquela conexão. O log tinha, antes disso, o aviso `inbound_webhook.meta_cloud_signature_unverified`.
-- **Causa:** sem `META_APP_SECRET` preenchida, a API só aceita POSTs de uma conexão `meta_cloud` enquanto ela está em **observação**. Ao colocar a conexão em produção, as entregas passam a exigir a assinatura `x-hub-signature-256` — que não pode ser validada sem o segredo.
-- **Correção:** preencha `META_APP_SECRET` com o **App Secret do mesmo app Meta** (não é o token permanente do Graph), redeploy a API. Se precisar voltar a receber já, use **Voltar para observação** na conexão enquanto configura.
+- **Causa:** sem `META_APP_SECRET` preenchida, a API só aceita POSTs de uma conexão `meta_cloud` enquanto o envio dela está desligado. Com a conexão enviando, as entregas passam a exigir a assinatura `x-hub-signature-256` — que não pode ser validada sem o segredo. Desde a produção direta (Fase 6.1c), uma conexão nova só nasce enviando com o segredo configurado e a tela não deixa ativar o envio sem ele; isto acontece se o segredo foi removido ou trocado depois.
+- **Correção:** preencha `META_APP_SECRET` com o **App Secret do mesmo app Meta** (não é o token permanente do Graph), redeploy a API.
 - **Verificação:** os POSTs voltam a ser aceitos com `202` e o aviso `meta_cloud_signature_unverified` some do log.
 
 ## Meta WhatsApp (Cloud API): chegam mensagens mas nenhum lead
@@ -218,6 +218,19 @@ Cada entrada segue: **sintoma → diagnóstico seguro → causa provável → co
   - **Eventos que já ficaram Bloqueado:** não voltam sozinhos. Depois do Trocar token, **atualize a instância** (API e web) e, como owner, abra `/events`, escolha um período que cubra desde quando os eventos ficaram bloqueados, clique em **Aplicar** e em **Reenviar bloqueados**. Até 500 por clique; evento já enviado nunca é reenviado. Numa instância ainda não atualizada o botão não existe e os bloqueados não são reenviados. Não crie BM novo, não use **+ Nova conexao** e não recrie leads.
 - **Verificação:** os eventos reenviados passam para **Na fila** e depois **Enviado**, e os **próximos** LeadSubmitted já chegam assim. Se algum voltar para **Bloqueado**, refaça o Trocar token no mesmo card e clique em **Reenviar bloqueados** de novo. Passo a passo completo em [`update.md`](update.md#eventos-que-já-ficaram-bloqueado).
 
+## Evento "Falhou" com "A Meta recusou o evento"
+
+- **Sintoma:** em `/events` (ou nos **Eventos do Pixel/CAPI** do lead), o evento aparece como **Falhou** com "A Meta recusou o evento (código X…)".
+- **Diagnóstico seguro:** abra o evento e veja o **Motivo técnico** no Resumo e a aba **Resposta Meta**. O texto já diz o motivo e o que fazer; o painel guarda só o código, o subcódigo, o tipo e o identificador da Meta (nunca a mensagem da Meta, que pode trazer dados do lead).
+- **Causa e correção pelo código:**
+  - **190 ou 102** (login ou token expirado): reconecte a Meta em **Integrações** (Trocar token no card do BM) e clique em **Reenviar bloqueados**.
+  - **10, 3 ou 200–299** (sem permissão): no Gerenciador de Negócios, dê ao usuário do sistema (ou ao app) acesso ao conjunto de dados do pixel e confira as permissões do token.
+  - **4, 17, 32, 341, 613 ou 80000–80014** (limite de chamadas): aguarde alguns minutos; os próximos eventos passam sozinhos.
+  - **1 ou 2** (erro temporário da Meta): aguarde e acompanhe os próximos eventos.
+  - **100** (parâmetro inválido): confira se o pixel e a página do destino são os do anúncio, se o clique (`ctwa_clid`) veio de um anúncio dessa página e se o evento tem menos de 7 dias.
+  - **Outro código:** o texto mostra o código, o subcódigo e o **Identificador para suporte da Meta**; leve esse identificador ao suporte da Meta (ele expira rápido).
+- **Verificação:** os próximos eventos do mesmo destino passam para **Enviado**. Recusas antigas, de antes desta versão, podem mostrar só "A Meta recusou o evento".
+
 ## Não aparece "Reenviar bloqueados" em `/events`
 
 - **Sintoma:** você tem eventos **Bloqueado** na **Auditoria de conversoes**, mas não vê o botão **Reenviar bloqueados**, ou ele está apagado.
@@ -232,7 +245,7 @@ Cada entrada segue: **sintoma → diagnóstico seguro → causa provável → co
 - **Diagnóstico seguro:** confira (1) se o seu deploy usa o repositório público na `main` ou um fork seu — e, se for fork, se ele foi sincronizado; (2) a data/commit do último deploy da **API** no Dokploy e do último deploy do **web** na Vercel; (3) se o log de boot da API mostrou as migrations aplicadas.
 - **Causa provável:** só um dos lados foi atualizado (API nova com web antigo, ou o contrário), o fork não foi sincronizado, ou o web foi "reiniciado" em vez de ganhar um build novo — telas novas e `NEXT_PUBLIC_*` só entram em build novo.
 - **Correção:** siga [`update.md`](update.md): sincronize o fork (se houver) → redeploy da API no Dokploy (as migrations rodam sozinhas no boot) → novo deploy de produção do web a partir da `main`. **Não reinstale**: banco, administrador, `LICENSE_*` e chaves de criptografia continuam os mesmos. Se o painel **Webhooks de entrada** aparece como indisponível, a causa é outra — confira as envs `INBOUND_*` em [Recebo leads/webhooks mas não aparece Nova regra](#recebo-leadswebhooks-mas-não-aparece-nova-regra).
-- **Verificação:** `/health/ready` retorna `200`, o login segue com o mesmo administrador, e o card **Data Crazy** aparece em `/integrations` (aba **Atendimento e vendas**; a conexão nasce em observação — é esperado).
+- **Verificação:** `/health/ready` retorna `200`, o login segue com o mesmo administrador, e o card **Data Crazy** aparece em `/integrations` (aba **Atendimento e vendas**; a conexão nasce em produção — produção direta).
 
 ## `/backoffice` diz "Não foi possível verificar atualizações"
 

@@ -16,17 +16,25 @@ import {
   lockUnnichatMetaPolicy,
 } from "../inbound-webhooks/inbound-webhook-effective-meta-routing";
 import { resolveCtwaLeadProof } from "../conversion-rules/ctwa-lead-proof";
+import { leadSubmittedRuleOverrideEnabled } from "../conversion-rules/lead-submitted-rule-override";
 import { CTWA_SEND_SKIPPED_ERROR_CODE } from "../conversion-events/conversion-event-retry";
 import { createHash } from "node:crypto";
 import { resolvePurchaseChannels } from "../conversion-rules/provider-purchase-routing";
 import { buildProviderPurchaseIdentity } from "../conversion-rules/provider-purchase-identity";
 import {
-  parsePaytSaleEventV1,
   PAYT_SALE_EVENT_NAMES,
   PAYT_VALUE_CORRECTION_REASON,
   paytLegacyTotalPriceCents,
-  paytProductFilterMatches,
 } from "../inbound-webhooks/providers/payt/payt-automation-v1.parser";
+import {
+  isSalesPlatformProvider,
+  parseSaleEventV1,
+  saleCapiCustomData,
+  saleProductFilterMatches,
+  salesPlatformOf,
+  type SalesPlatformProvider,
+} from "../inbound-webhooks/providers/sales-platform-sale";
+import { YAMPI_CAPI_VALUE_TOLERANCE_CENTS } from "../inbound-webhooks/providers/yampi/yampi-automation-v1.parser";
 import { Prisma } from "@prisma/client";
 import {
   conversionEventCarriesValue,
@@ -37,6 +45,7 @@ import {
   conversionEventRequiresValue,
   normalizeCurrencyCode,
   providerConversionDecisionSchema,
+  type ConversionEventCustomDataDto,
   type ConversionEventNameDto,
   type ProviderConversionDecisionDto,
   type ProviderConversionTechnicalDeliveryStateDto,
@@ -82,10 +91,26 @@ import {
   providerMessageAuthorAllowed,
 } from "../conversion-rules/structured-catalog-message.parser";
 import { ConversionEventsService } from "../conversion-events/conversion-events.service";
+import {
+  findPriorLeadLifetimeConversion,
+  isLeadLifetimeEvent,
+  leadLifetimeMetaEventId,
+  lockLeadConversionIdentity,
+  resolveLeadConversionIdentity,
+} from "../conversion-events/lead-lifetime-conversion-guard";
+import {
+  findManualPurchaseForOrder,
+  findRecentManualSameEvent,
+  LEAD_EVENT_REGISTERED_MANUALLY,
+  manualOrderKey,
+  PURCHASE_REGISTERED_MANUALLY,
+} from "../leads/manual-conversion-purchase";
 import { InboundWebhookMetaRouteReaderService } from "../inbound-webhooks/inbound-webhook-meta-route-reader.service";
 import { InboundWebhookPayloadEncryptionService } from "../inbound-webhooks/inbound-webhook-payload-encryption.service";
 import {
   providerRuleCoversChannel,
+  providerRuleScope,
+  providerRuleSpansProviderConnections,
   resolveProviderRuleScopeChannelIds,
 } from "../conversion-rules/provider-rule-scope";
 import { inboundWebhookParserContext } from "../inbound-webhooks/providers/inbound-webhook-parser";
@@ -102,6 +127,7 @@ import {
   type ParsedUnnichatAutomationV1,
   UNNICHAT_AUTOMATION_V1_PARSER_VERSION,
 } from "../inbound-webhooks/providers/unnichat/unnichat-automation-v1.parser";
+import { ROICHAT_PURCHASE_REPEATED_REASON } from "../inbound-webhooks/providers/roichat/roichat-automation-v1.parser";
 
 /** Automation callbacks re-parsed at production time (Umbler, Unnichat). */
 type ParsedAutomationForProduction =
@@ -111,7 +137,6 @@ type ParsedAutomationForProduction =
       automation: "crm_movement";
       eventName: ConversionEventNameDto;
     });
-
 const PURCHASE_DEDUPE_WINDOW_MS = 24 * 60 * 60 * 1_000;
 const terminalStatuses = new Set(["materialized", "duplicate", "blocked"]);
 const executionInclude = {
@@ -133,7 +158,21 @@ const executionInclude = {
     },
   },
   sourceDelivery: true,
-  channel: { include: { connection: { select: { provider: true } } } },
+  channel: {
+    include: {
+      connection: {
+        select: {
+          provider: true,
+          // Gate of Umbler/Unnichat rules for all numbers (any connection).
+          status: true,
+          removedAt: true,
+          parserRelease: {
+            select: { provider: true, version: true, status: true },
+          },
+        },
+      },
+    },
+  },
   purchaseReview: {
     include: {
       items: { orderBy: { position: "asc" } },
@@ -607,6 +646,14 @@ export class ProviderConversionProductionService
           where: {
             id: { not: execution.id },
             workspaceId: execution.workspaceId,
+            // #84: the dedupe is local to the number (and connection) that
+            // observed the fact; once-per-lead events across numbers are the
+            // lead-lifetime guard's job (#153).
+            channelId: execution.channelId,
+            leadId: lead.id,
+            sourceDelivery: {
+              connectionId: execution.sourceDelivery.connectionId,
+            },
             contactIdentityHash: lead.phoneHash,
             status: "materialized",
             occurredAt: {
@@ -623,13 +670,33 @@ export class ProviderConversionProductionService
           },
           select: { id: true },
         });
+      // Tarefa 21 (decision 1b): the operator already registered this
+      // Purchase manually for the lead within 24h (same lock key as manual).
+      const manualSameEvent = duplicate
+        ? null
+        : await findRecentManualSameEvent(transaction, {
+            workspaceId: execution.workspaceId,
+            leadIds: (
+              await resolveLeadConversionIdentity(
+                transaction,
+                execution.workspaceId,
+                lead.id,
+              )
+            ).leadIds,
+            eventName: "Purchase",
+            occurredAt: execution.occurredAt,
+            conversionDestinationId: route.conversionDestinationId,
+          });
 
-      if (duplicate) {
+      if (duplicate || manualSameEvent) {
+        const reasonCode = duplicate
+          ? "purchase_within_24h"
+          : LEAD_EVENT_REGISTERED_MANUALLY;
         await transaction.providerConversionRuleExecution.update({
           where: { id: execution.id },
           data: {
             status: "duplicate",
-            reasonCode: "purchase_within_24h",
+            reasonCode,
             leadId: lead.id,
             processedAt: new Date(),
           },
@@ -639,7 +706,7 @@ export class ProviderConversionProductionService
             where: { id: execution.purchaseReview.id },
             data: {
               status: "duplicate",
-              reasonCode: "purchase_within_24h",
+              reasonCode,
               leadWorkspaceId: execution.workspaceId,
               leadId: lead.id,
               decidedAt: new Date(),
@@ -771,11 +838,11 @@ export class ProviderConversionProductionService
     }
 
     // CTWA lead with ctwa_clid and no known ad (authorized page/pixel proof),
-    // exactly as in the SaaS: sale callbacks (Payt) may use the proof as the
-    // fallback of an ad lead; Unnichat automations only for a no-ad lead.
-    // Every other provider keeps requiring a known ad.
+    // exactly as in the SaaS: sale callbacks (Payt, Braip) may use the proof
+    // as the fallback of an ad lead; Unnichat automations only for a no-ad
+    // lead. Every other provider keeps requiring a known ad.
     let ctwaProof =
-      occurrence.provider === "payt"
+      isSalesPlatformProvider(occurrence.provider)
         ? (lead.ctwaDestination ?? purchaseContext?.ctwaProof)
         : occurrence.provider === CTWA_DESTINATION_PROVIDER && !lead.adId
           ? lead.ctwaDestination
@@ -826,7 +893,7 @@ export class ProviderConversionProductionService
           throw error;
         // Decisions frozen before the CTWA fallback carry no proof: verify it
         // live for Payt (same rules as the paid-lead resolver).
-        if (!ctwaProof && occurrence.provider === "payt")
+        if (!ctwaProof && isSalesPlatformProvider(occurrence.provider))
           ctwaProof = await this.livePaytCtwaProof(execution, lead);
         if (!ctwaProof) throw error;
         adRoute = {
@@ -844,7 +911,11 @@ export class ProviderConversionProductionService
         Boolean(adRoute.adAccountId) &&
         Boolean(adRoute.businessConnectionId) &&
         Boolean(adRoute.conversionDestinationId);
-      if (!adRouteResolved && !ctwaProof && occurrence.provider === "payt")
+      if (
+        !adRouteResolved &&
+        !ctwaProof &&
+        isSalesPlatformProvider(occurrence.provider)
+      )
         ctwaProof = await this.livePaytCtwaProof(execution, lead);
       if (!adRouteResolved && ctwaProof) {
         ctwaDestination = ctwaProof;
@@ -864,6 +935,7 @@ export class ProviderConversionProductionService
       );
     }
 
+    const conversionDestinationId: string = route.conversionDestinationId;
     const dedupePolicy = occurrence.businessDedupePolicy;
     const lock = this.lockKeys(
       execution.workspaceId,
@@ -926,15 +998,37 @@ export class ProviderConversionProductionService
         ) AS "lockAcquired"
       `;
 
-      if (purchaseKey) {
+      if (purchaseKey || !isLeadLifetimeEvent(eventName)) {
         // Keep the customer/event lock as well as the merchant/order lock:
         // distinct orders count independently while customer history remains serialized.
+        // Tarefa 21: +-24h events take it too, the same key the manual
+        // conversion takes (purchaseCustomerLockKeys), so both serialize.
         const phoneLock = this.lockKeys(
           execution.workspaceId,
           lead.phoneHash,
           eventName,
         );
         await transaction.$queryRaw`SELECT pg_advisory_xact_lock(CAST(${phoneLock.first} AS integer), CAST(${phoneLock.second} AS integer))::text`;
+      }
+      // Once-per-lead events: the business scope lock above is per number;
+      // serialize the same lead identity + event across every number and the
+      // CTWA entry too (lock taken last). Purchases and +-24h events keep
+      // their per-number / per-order dedupe only.
+      const lifetimeIdentity =
+        !purchaseKey && isLeadLifetimeEvent(eventName)
+          ? await resolveLeadConversionIdentity(
+              transaction,
+              execution.workspaceId,
+              lead.id,
+            )
+          : null;
+      if (lifetimeIdentity) {
+        await lockLeadConversionIdentity(
+          transaction,
+          execution.workspaceId,
+          lifetimeIdentity,
+          eventName,
+        );
       }
 
       const current =
@@ -974,12 +1068,33 @@ export class ProviderConversionProductionService
         {
           id: { not: execution.id },
           workspaceId: execution.workspaceId,
+          // #84: per number (and connection), like the decision scope key.
+          channelId: execution.channelId,
+          leadId: lead.id,
+          sourceDelivery: {
+            connectionId: execution.sourceDelivery.connectionId,
+          },
           status: "materialized",
           OR: [
             {
               providerDecision: {
                 is: {
                   businessDedupeScopeKey: dedupePolicy.scopeKey,
+                },
+              },
+            },
+            // nod upgrade bridge: decisions frozen before #84 carry the old
+            // workspace-wide key (event:workspace:lead). The filters above
+            // already restrict it to this number and lead, so a repeat on
+            // the same number across the update is still a duplicate.
+            {
+              providerDecision: {
+                is: {
+                  businessDedupeScopeKey: [
+                    eventName,
+                    execution.workspaceId,
+                    lead.id,
+                  ].join(":"),
                 },
               },
             },
@@ -1018,7 +1133,7 @@ export class ProviderConversionProductionService
             },
           })
         : null;
-      const duplicate = purchaseKey
+      const sameNumberDuplicate = purchaseKey
         ? purchaseClaim
           ? { id: purchaseClaim.winnerExecutionId }
           : null
@@ -1026,13 +1141,105 @@ export class ProviderConversionProductionService
             where: duplicateWhere,
             select: { id: true },
           });
+      // Fase 5.3: an Unnichat automation event may reach two rules (old
+      // per-rule URL + per-event URL routed to another rule). Its Meta
+      // identity comes from the business fact, so both resolve to ONE
+      // conversion (the second one is a dedupe hit, never a second send).
+      const automationIdentity =
+        !purchaseKey &&
+        (AUTOMATION_IDENTITY_PROVIDERS as readonly string[]).includes(
+          occurrence.provider,
+        ) &&
+        decision.rule.triggerType === "provider_automation" &&
+        lead.ctwaClid
+          ? automationConversionIdentity(
+              occurrence.provider as AutomationIdentityProvider,
+              {
+                workspaceId: execution.workspaceId,
+                eventName,
+                dedupeMode: dedupePolicy.mode,
+                leadId: lead.id,
+                ctwaClid: lead.ctwaClid,
+                occurrenceKey: occurrence.occurrenceKey,
+              },
+            )
+          : null;
+      const dedupeKey =
+        purchaseKey ??
+        (automationIdentity
+          ? `provider-automation:${occurrence.provider}:${automationIdentity}`
+          : `provider-conversion:${execution.id}`);
+      // Once-per-lead events only: the same lead identity already converted
+      // for this Meta destination by another number or by the CTWA entry.
+      const otherNumberDuplicate =
+        sameNumberDuplicate || !lifetimeIdentity
+          ? null
+          : await findPriorLeadLifetimeConversion(transaction, {
+              workspaceId: execution.workspaceId,
+              identity: lifetimeIdentity,
+              eventName,
+              conversionDestinationId,
+              channelId: execution.channelId,
+              pipeline: "provider_rule",
+              ownDedupeKey: dedupeKey,
+              includeAutoLead: leadSubmittedRuleOverrideEnabled(this.env),
+            });
+      // Tarefa 21: the same order was already registered manually for this
+      // lead (manual Purchase not canceled). Serialized with the manual
+      // writer by the customer lock above (same workspace+phone+event key).
+      const manualPurchase =
+        purchaseKey && purchaseContext && !sameNumberDuplicate && eventName === "Purchase"
+          ? await findManualPurchaseForOrder(transaction, {
+              workspaceId: execution.workspaceId,
+              leadIds: (
+                await resolveLeadConversionIdentity(
+                  transaction,
+                  execution.workspaceId,
+                  lead.id,
+                )
+              ).leadIds,
+              orderKey: purchaseContext.manualOrderKey,
+            })
+          : null;
+      // Tarefa 21 (decision 1b): the same +-24h event (Purchase,
+      // InitiateCheckout...) registered manually for this lead within 24h for
+      // this destination. Payt/Braip keep only their order-based check above.
+      const manualSameEvent =
+        !purchaseKey && !sameNumberDuplicate && !isLeadLifetimeEvent(eventName)
+          ? await findRecentManualSameEvent(transaction, {
+              workspaceId: execution.workspaceId,
+              leadIds: (
+                await resolveLeadConversionIdentity(
+                  transaction,
+                  execution.workspaceId,
+                  lead.id,
+                )
+              ).leadIds,
+              eventName,
+              occurredAt,
+              conversionDestinationId,
+            })
+          : null;
+      const duplicate =
+        sameNumberDuplicate ??
+        manualPurchase ??
+        manualSameEvent ??
+        otherNumberDuplicate;
 
       if (duplicate) {
         const reasonCode = purchaseKey
-          ? "purchase_duplicate"
-          : dedupePolicy.mode === "rolling_window"
-            ? "purchase_within_24h"
-            : "qualified_lead_already_materialized";
+          ? manualPurchase
+            ? PURCHASE_REGISTERED_MANUALLY
+            : "purchase_duplicate"
+          : manualSameEvent
+            ? LEAD_EVENT_REGISTERED_MANUALLY
+            : otherNumberDuplicate
+            ? otherNumberDuplicate.reasonCode
+            : dedupePolicy.mode === "rolling_window"
+              ? occurrence.provider === "roichat"
+                ? ROICHAT_PURCHASE_REPEATED_REASON
+                : "purchase_within_24h"
+              : "qualified_lead_already_materialized";
         await transaction.providerConversionRuleExecution.update({
           where: { id: execution.id },
           data: {
@@ -1070,35 +1277,18 @@ export class ProviderConversionProductionService
         occurrence.externalMessageId ??
         occurrence.externalEventId ??
         occurrence.occurrenceKey;
-      // Fase 5.3: an Unnichat automation event may reach two rules (old
-      // per-rule URL + per-event URL routed to another rule). Its Meta
-      // identity comes from the business fact, so both resolve to ONE
-      // conversion (the second one is a dedupe hit, never a second send).
-      const automationIdentity =
-        !purchaseKey &&
-        (AUTOMATION_IDENTITY_PROVIDERS as readonly string[]).includes(
-          occurrence.provider,
-        ) &&
-        decision.rule.triggerType === "provider_automation" &&
-        lead.ctwaClid
-          ? automationConversionIdentity(
-              occurrence.provider as AutomationIdentityProvider,
-              {
-                workspaceId: execution.workspaceId,
-                eventName,
-                dedupeMode: dedupePolicy.mode,
-                leadId: lead.id,
-                ctwaClid: lead.ctwaClid,
-                occurrenceKey: occurrence.occurrenceKey,
-              },
-            )
-          : null;
       const conversion = await this.conversions.recordExternalConversion(
         {
           workspaceId: execution.workspaceId,
           externalConnectorId: null,
           sourceEventId,
           sourceTrigger: `inbound_webhook:${occurrence.provider}:${decision.rule.triggerType}`,
+          // Automation callbacks (Payt, Unnichat, Umbler) can be replayed by
+          // the operator long after the sale: past Meta's 7-day window the
+          // event is kept as not_eligible instead of failing at Meta.
+          ...(decision.rule.triggerType === "provider_automation"
+            ? { enforceMetaEventWindow: true }
+            : {}),
           eventName,
           // A sale keeps one Meta identity per seller+order+event.
           eventId: purchaseKey
@@ -1107,12 +1297,14 @@ export class ProviderConversionProductionService
               : `conversion_${conversionEventMetaEventIdPrefix(eventName)}_${purchaseKey.slice(9)}`
             : automationIdentity
               ? `${occurrence.provider}_${conversionEventMetaEventIdPrefix(eventName)}_${automationIdentity}`
-              : this.metaEventId(execution.id, eventName),
-          dedupeKey:
-            purchaseKey ??
-            (automationIdentity
-              ? `provider-automation:${occurrence.provider}:${automationIdentity}`
-              : `provider-conversion:${execution.id}`),
+              : lifetimeIdentity
+                ? this.leadLifetimeMetaEventId(
+                    execution.workspaceId,
+                    lifetimeIdentity.lockIdentity,
+                    eventName,
+                  )
+                : this.metaEventId(execution.id, eventName),
+          dedupeKey,
           leadId: lead.id,
           phoneHash: lead.phoneHash,
           businessSource: "paid",
@@ -1128,6 +1320,12 @@ export class ProviderConversionProductionService
           valueSource: valueCents ? this.decisionValueSource(decision) : null,
           currency,
           contentName: carriesValue ? decision.conversion.contentName : null,
+          // Fase 6.7 (SaaS #188): Yampi carries the real order lines (order
+          // bump included) and its order id. Every other sale keeps the
+          // generic default item.
+          ...(purchaseContext?.capiCustomData
+            ? { customData: purchaseContext.capiCustomData }
+            : {}),
           eventOccurredAt: occurredAt,
           sourcePayload: {
             provider: occurrence.provider,
@@ -1156,6 +1354,10 @@ export class ProviderConversionProductionService
                 }
               : {}),
             processingMode: "frozen_provider_conversion",
+            // Tarefa 21: lets a later manual sale of this order see it.
+            ...(purchaseContext && eventName === "Purchase"
+              ? { manualOrderKey: purchaseContext.manualOrderKey }
+              : {}),
           },
         },
         transaction,
@@ -1191,8 +1393,10 @@ export class ProviderConversionProductionService
               state: queueRequired
                 ? "queued"
                 : // A CTWA page/pixel conversion that did not queue was refused
-                  // by its own checks (e.g. outside Meta's 7-day window).
-                  ctwaDestination && conversion.deliveryStatus !== "sent"
+                  // by its own checks (e.g. outside Meta's 7-day window); an
+                  // automation event past that window is not_eligible too.
+                  (ctwaDestination && conversion.deliveryStatus !== "sent") ||
+                    conversion.deliveryStatus === "not_eligible"
                   ? "blocked_configuration"
                   : "sent",
               retryable: false,
@@ -1307,6 +1511,7 @@ export class ProviderConversionProductionService
     // Events that only make sense once per lead (QualifiedLead, LeadSubmitted)
     // dedupe for a lifetime; the rest keeps the 24h rolling window.
     const rollingWindow = conversionEventDedupeMode(eventName) !== "lifetime";
+    const conversionDestinationId: string = route.conversionDestinationId;
 
     const lock = this.lockKeys(
       execution.workspaceId,
@@ -1322,6 +1527,22 @@ export class ProviderConversionProductionService
           ) AS text
         ) AS "lockAcquired"
       `;
+      // Once-per-lead events only (see lead-lifetime-conversion-guard.ts).
+      const lifetimeIdentity = rollingWindow
+        ? null
+        : await resolveLeadConversionIdentity(
+            transaction,
+            execution.workspaceId,
+            lead.id,
+          );
+      if (lifetimeIdentity) {
+        await lockLeadConversionIdentity(
+          transaction,
+          execution.workspaceId,
+          lifetimeIdentity,
+          eventName,
+        );
+      }
 
       const current =
         await transaction.providerConversionRuleExecution.findFirst({
@@ -1347,11 +1568,19 @@ export class ProviderConversionProductionService
         );
       }
 
-      const duplicate =
+      const sameNumberDuplicate =
         await transaction.providerConversionRuleExecution.findFirst({
           where: {
             id: { not: execution.id },
             workspaceId: execution.workspaceId,
+            // #84: the dedupe is local to the number (and connection) that
+            // observed the fact; once-per-lead events across numbers are the
+            // lead-lifetime guard's job (#153).
+            channelId: execution.channelId,
+            leadId: lead.id,
+            sourceDelivery: {
+              connectionId: execution.sourceDelivery.connectionId,
+            },
             contactIdentityHash: lead.phoneHash,
             status: "materialized",
             ...(rollingWindow
@@ -1375,10 +1604,47 @@ export class ProviderConversionProductionService
           select: { id: true },
         });
 
+      const otherNumberDuplicate =
+        sameNumberDuplicate || !lifetimeIdentity
+          ? null
+          : await findPriorLeadLifetimeConversion(transaction, {
+              workspaceId: execution.workspaceId,
+              identity: lifetimeIdentity,
+              eventName,
+              conversionDestinationId,
+              channelId: execution.channelId,
+              pipeline: "provider_rule",
+              ownDedupeKey: `provider-conversion:${execution.id}`,
+              includeAutoLead: leadSubmittedRuleOverrideEnabled(this.env),
+            });
+      // Tarefa 21: same +-24h event registered manually (see the frozen path).
+      const manualSameEvent =
+        rollingWindow && !sameNumberDuplicate
+          ? await findRecentManualSameEvent(transaction, {
+              workspaceId: execution.workspaceId,
+              leadIds: (
+                await resolveLeadConversionIdentity(
+                  transaction,
+                  execution.workspaceId,
+                  lead.id,
+                )
+              ).leadIds,
+              eventName,
+              occurredAt: execution.occurredAt,
+              conversionDestinationId,
+            })
+          : null;
+      const duplicate =
+        sameNumberDuplicate ?? manualSameEvent ?? otherNumberDuplicate;
+
       if (duplicate) {
-        const reasonCode = rollingWindow
-          ? "purchase_within_24h"
-          : "qualified_lead_already_materialized";
+        const reasonCode = manualSameEvent
+          ? LEAD_EVENT_REGISTERED_MANUALLY
+          : otherNumberDuplicate
+          ? otherNumberDuplicate.reasonCode
+          : rollingWindow
+            ? "purchase_within_24h"
+            : "qualified_lead_already_materialized";
         await transaction.providerConversionRuleExecution.update({
           where: { id: execution.id },
           data: {
@@ -1410,8 +1676,15 @@ export class ProviderConversionProductionService
           externalConnectorId: null,
           sourceEventId: parsed.externalExecutionKey,
           sourceTrigger: "inbound_webhook:umbler:provider_automation",
+          enforceMetaEventWindow: true,
           eventName: parsed.eventName,
-          eventId: this.metaEventId(execution.id, parsed.eventName),
+          eventId: lifetimeIdentity
+            ? this.leadLifetimeMetaEventId(
+                execution.workspaceId,
+                lifetimeIdentity.lockIdentity,
+                eventName,
+              )
+            : this.metaEventId(execution.id, parsed.eventName),
           dedupeKey: `provider-conversion:${execution.id}`,
           leadId: lead.id,
           phoneHash: lead.phoneHash,
@@ -1827,6 +2100,15 @@ export class ProviderConversionProductionService
     const channel = execution.channel;
     const manuallyApproved = this.automationManualReplayApproved(execution);
     const channelScoped = executionChannelInRuleScope(execution);
+    // An Umbler/Unnichat rule for all numbers is gated by the connection of
+    // the number that produced the event; its own connection only stores
+    // the delivery (anchor). Every other rule keeps the historical gate.
+    const spansConnections =
+      providerRuleScope(rule) === "all_numbers" &&
+      providerRuleSpansProviderConnections(rule);
+    const gate = spansConnections
+      ? (channel?.connection ?? null)
+      : (rule.connection ?? null);
 
     if (
       // The Umbler automation always keeps its connection binding.
@@ -1839,9 +2121,11 @@ export class ProviderConversionProductionService
       !rule.productionActivatedAt ||
       !inboundParserProductionEligible(rule.parserRelease) ||
       rule.parserRelease.version !== UMBLER_AUTOMATION_V1_PARSER_VERSION ||
-      rule.connection.removedAt ||
-      rule.connection.status !== "production" ||
-      !inboundParserProductionEligible(rule.connection.parserRelease) ||
+      !gate ||
+      gate.removedAt ||
+      gate.status !== "production" ||
+      !gate.parserRelease ||
+      !inboundParserProductionEligible(gate.parserRelease) ||
       rule.connectionId !== delivery.connectionId ||
       delivery.parserVersion !== UMBLER_AUTOMATION_V1_PARSER_VERSION ||
       delivery.purpose !== "conversion_automation" ||
@@ -1875,8 +2159,16 @@ export class ProviderConversionProductionService
     ctwaProof: AuthorizedCtwaDestination | undefined;
     /** Set only for a decision frozen with the legacy Payt total_price. */
     correctedValueCents: number | null;
+    /**
+     * manualOrderKey of the sale's order (Purchase dedupe vs the manual
+     * conversion on the lead). Payt, Braip (6.5) and Yampi (6.7) derive it
+     * from their own order number; Hotmart (6.6) joins here.
+     */
+    manualOrderKey: string;
+    /** Yampi (6.7): real order lines for the Meta custom_data, else null. */
+    capiCustomData: ConversionEventCustomDataDto | null;
   } | null> {
-    if (decision.occurrence.provider === "payt")
+    if (isSalesPlatformProvider(decision.occurrence.provider))
       return this.assertPaytPurchaseContext(execution, decision);
     if (!decision.occurrence.purchaseKey) return null;
     throw new ProviderConversionProductionFailure(
@@ -1885,7 +2177,7 @@ export class ProviderConversionProductionService
   }
 
   /**
-   * Re-derives a Payt sale from the preserved postback: event of the rule,
+   * Re-derives a sale (Payt, Braip) from the preserved postback: event of the rule,
    * buyer phone of the lead, seller+order identity and value. The origin is
    * the single scoped channel of the paid lead's verified CTWA entry.
    */
@@ -1898,16 +2190,29 @@ export class ProviderConversionProductionService
     ctwaProof: AuthorizedCtwaDestination | undefined;
     /** Set only for a decision frozen with the legacy Payt total_price. */
     correctedValueCents: number | null;
+    /**
+     * manualOrderKey of the sale's order (Purchase dedupe vs the manual
+     * conversion on the lead): the platform's own order number.
+     */
+    manualOrderKey: string;
+    /**
+     * Yampi (6.7, SaaS #188): real order lines for the Meta custom_data
+     * (contents, num_items, order_id, content_name). Null for every other
+     * platform (generic item).
+     */
+    capiCustomData: ConversionEventCustomDataDto | null;
   }> {
     this.assertAutomationProductionContext(execution);
+    const salesPlatform = salesPlatformOf(execution.providerRule.parserRelease);
     if (
+      !salesPlatform ||
+      decision.occurrence.provider !== salesPlatform ||
       execution.channel?.conversionEngineMode !== "canonical" ||
       !(PAYT_SALE_EVENT_NAMES as readonly string[]).includes(
         decision.occurrence.eventName,
       ) ||
       decision.occurrence.eventName !==
-        execution.providerRule.conversionRule.eventName ||
-      execution.providerRule.parserRelease?.provider !== "payt"
+        execution.providerRule.conversionRule.eventName
     ) {
       throw new ProviderConversionProductionFailure(
         "provider_conversion_production_context_invalid",
@@ -1985,7 +2290,7 @@ export class ProviderConversionProductionService
         "provider_purchase_channel_missing_or_ambiguous",
       );
     const payload = this.decryptedPayload(execution);
-    const parsed = parsePaytSaleEventV1(payload);
+    const parsed = parseSaleEventV1(salesPlatform, payload);
     if (!parsed.ok)
       throw new ProviderConversionProductionFailure(
         "provider_purchase_identity_missing",
@@ -1993,13 +2298,14 @@ export class ProviderConversionProductionService
     // Decision frozen before the Payt value fix: it holds the same postback's
     // total_price (with installment interest). Same sale, legacy value.
     const legacyPaytValue =
+      salesPlatform === "payt" &&
       parsed.value.valueCents !== null &&
       decision.conversion.valueCents !== null &&
       decision.conversion.valueCents !== parsed.value.valueCents &&
       decision.conversion.valueCents === paytLegacyTotalPriceCents(payload);
     const purchaseKey = buildProviderPurchaseIdentity({
       workspaceId: execution.workspaceId,
-      provider: "payt",
+      provider: salesPlatform,
       accountRef: parsed.value.accountRef,
       orderRef: parsed.value.orderRef,
       eventName: parsed.value.eventName,
@@ -2008,7 +2314,7 @@ export class ProviderConversionProductionService
       // The preserved postback must still be the event of this rule and,
       // when the rule is limited to some products (Fase 5.3), one of them.
       parsed.value.eventName !== decision.occurrence.eventName ||
-      !paytProductFilterMatches(
+      !saleProductFilterMatches(
         execution.providerRule.productFilterCodes,
         parsed.value.productCodes ?? [],
       ) ||
@@ -2035,7 +2341,53 @@ export class ProviderConversionProductionService
       ctwaOriginOnly,
       ctwaProof,
       correctedValueCents: legacyPaytValue ? parsed.value.valueCents : null,
+      // Tarefa 21: same key a manual sale of this order number carries.
+      manualOrderKey: manualOrderKey(
+        execution.workspaceId,
+        parsed.value.orderRef,
+      ),
+      capiCustomData: this.saleCapiCustomData(
+        salesPlatform,
+        payload,
+        execution,
+        decision.conversion.valueCents,
+      ),
     };
+  }
+
+  /**
+   * Real order lines of the sale for Meta (Yampi only, SaaS #188). The sent
+   * value stays the decision value (value_products): when the lines do not
+   * add up to it by more than the tolerance (e.g. a coupon discount), value
+   * and lines are both kept and a structured warning without personal data
+   * is logged.
+   */
+  private saleCapiCustomData(
+    salesPlatform: SalesPlatformProvider,
+    payload: unknown,
+    execution: ExecutionRecord,
+    valueCents: number | null,
+  ): ConversionEventCustomDataDto | null {
+    const lines = saleCapiCustomData(salesPlatform, payload);
+    if (!lines) return null;
+    if (
+      valueCents !== null &&
+      Math.abs(lines.itemsTotalCents - valueCents) >
+        YAMPI_CAPI_VALUE_TOLERANCE_CENTS
+    ) {
+      this.logger.warn(
+        JSON.stringify({
+          event: "sale_capi_items_value_mismatch",
+          provider: salesPlatform,
+          workspaceId: execution.workspaceId,
+          providerConversionExecutionId: execution.id,
+          valueCents,
+          itemsTotalCents: lines.itemsTotalCents,
+          itemCount: lines.itemCount,
+        }),
+      );
+    }
+    return lines.customData;
   }
 
   /**
@@ -2121,15 +2473,24 @@ export class ProviderConversionProductionService
   }
 
   /**
-   * Automations arrive on the entry connection itself. A sale callback (Payt)
-   * sits on its rule's endpoint, so its origin is the scoped channel, which
-   * must belong to the connection of the verified CTWA entry.
+   * Unnichat automations arrive on the entry connection itself. A sale
+   * callback (Payt, Braip) sits on its rule's endpoint (any WhatsApp connection of the
+   * workspace), so its origin is the scoped channel, which must belong to the
+   * connection of the verified CTWA entry. An Unnichat/Umbler rule for all
+   * numbers stores its callbacks on its anchor connection while the number
+   * may be on another connection of the provider: same channel-based check.
    */
   private ctwaOriginConnectionMatches(
     execution: ExecutionRecord,
     intent: { channelId: string; connectionId: string },
   ): boolean {
-    if (String(execution.providerRule.parserRelease?.provider) === "payt")
+    if (
+      isSalesPlatformProvider(
+        String(execution.providerRule.parserRelease?.provider),
+      ) ||
+      (providerRuleScope(execution.providerRule) === "all_numbers" &&
+        providerRuleSpansProviderConnections(execution.providerRule))
+    )
       return Boolean(
         execution.channel &&
         execution.channel.id === intent.channelId &&
@@ -2360,6 +2721,25 @@ export class ProviderConversionProductionService
     }
   }
 
+  /**
+   * Meta event_id of a once-per-lead (lifetime) event: deterministic per
+   * workspace + lead identity (canonical phone line, so old duplicate Lead
+   * rows of the same line share it) + event, so if two sends ever slipped
+   * past the local dedupe, Meta itself would drop the second on the same
+   * dataset. Neutral prefix: it only applies to NEW conversions (logs keep
+   * the id they were sent with; ids already sent never change).
+   * Rolling-window events (Purchase...) keep the per-execution id: a lead may
+   * legitimately buy again after 24h, inside Meta's 48h dedupe window.
+   */
+  private leadLifetimeMetaEventId(
+    workspaceId: string,
+    leadIdentity: string,
+    eventName: ConversionEventNameDto,
+  ): string {
+    // Moved to the guard module (tarefa 21): the manual conversion reuses it.
+    return leadLifetimeMetaEventId(workspaceId, leadIdentity, eventName);
+  }
+
   private lockKeys(
     workspaceId: string,
     phoneHash: string,
@@ -2388,7 +2768,7 @@ export class ProviderConversionProductionService
   ): "actual" | "configured_average" {
     if (
       decision.rule.triggerType === "structured_catalog" ||
-      decision.occurrence.provider === "payt"
+      isSalesPlatformProvider(decision.occurrence.provider)
     )
       return "actual";
 

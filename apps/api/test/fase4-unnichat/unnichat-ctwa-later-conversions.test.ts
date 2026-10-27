@@ -92,17 +92,82 @@ describe("real later Unnichat production services with no ad", () => {
     "revoked_after_effect",
     "legacy_before_effect",
     "shadow_after_enqueue",
+    // The lead entered by ad on ANOTHER number first (same pixel): this
+    // number's entry is deduped but its receipt still proves the origin.
+    "Purchase_after_entry_deduped",
+    "QualifiedLead_already_converted_on_other_number",
+    // 21/10/2026: ONE rule for all Unnichat numbers whose deliveries are
+    // anchored on ANOTHER Unnichat connection (in observation): the number's
+    // own connection gates it and the CTWA origin is checked per channel.
+    "QualifiedLead_unified_rule_other_anchor",
   ] as const)(
     "materializes and dispatches %s from genuine parser plus typed original receipt",
     async (scenario) => {
-      const eventName = scenario === "Purchase" ? "Purchase" : "QualifiedLead";
+      const eventName = scenario.startsWith("Purchase")
+        ? "Purchase"
+        : "QualifiedLead";
+      const otherNumberFirst =
+        scenario === "Purchase_after_entry_deduped" ||
+        scenario === "QualifiedLead_already_converted_on_other_number";
       const h = offline();
       h.channel.conversionEngineMode = "canonical";
+      if (otherNumberFirst) {
+        const intent = await resolveCtwaDestination(h.prisma, h.channel);
+        if (intent.kind !== "authorized_ctwa_destination") throw new Error("intent");
+        const otherNumberLog = (eventName: string, id: string) => ({
+          id,
+          workspaceId: "w",
+          leadId: "lead",
+          eventName,
+          sourceTrigger:
+            eventName === "LeadSubmitted"
+              ? "inbound_webhook:unnichat"
+              : "inbound_webhook:unnichat:provider_automation",
+          status: "sent",
+          dedupeKey: `other_number:${id}`,
+          metaConversionDestinationId: intent.destinationId,
+          sourcePayload: { provider: "unnichat", channelId: "ch_other" },
+        });
+        h.logs.push(otherNumberLog("LeadSubmitted", "log_other_entry"));
+        if (eventName === "QualifiedLead")
+          h.logs.push(otherNumberLog("QualifiedLead", "log_other_qualified"));
+      }
+      const seeded = h.logs.length;
       await h.production.processItem({
         workspaceId: "w",
         productionItemId: "item",
       });
-      await h.processor.process(h.jobs[0]);
+      if (otherNumberFirst) {
+        // This number's entry: receipt written with its own attribution and
+        // CTWA destination, never queued nor sent; the item points to it.
+        const entry = h.logs[seeded];
+        expect(entry).toMatchObject({
+          eventName: "LeadSubmitted",
+          status: "not_eligible",
+          errorCode: "lead_already_converted_other_number",
+          ctwaClid: expect.any(String),
+          sourcePayload: expect.objectContaining({
+            channelId: "ch",
+            connectionId: "c",
+            ctwaDestination: expect.objectContaining({ channelId: "ch" }),
+          }),
+        });
+        expect(h.item).toMatchObject({
+          status: "duplicate",
+          conversionEventLogId: entry.id,
+        });
+        expect(h.jobs).toHaveLength(0);
+        // Redelivery of the same entry stays idempotent.
+        h.item.status = "queued";
+        await h.production.processItem({
+          workspaceId: "w",
+          productionItemId: "item",
+        });
+        expect(h.logs).toHaveLength(seeded + 1);
+        expect(h.jobs).toHaveLength(0);
+      } else {
+        await h.processor.process(h.jobs[0]);
+      }
       // These adapters implement only data storage. Production parser, engine,
       // recorder, queue, processor and Meta adapter remain actual application code.
       h.prisma.inboundWebhookEvent.findFirst = vi.fn(async () => ({
@@ -219,10 +284,24 @@ describe("real later Unnichat production services with no ad", () => {
         purchaseReview: null,
         normalizedResult: null,
       };
+      if (scenario === "QualifiedLead_unified_rule_other_anchor") {
+        execution.providerRule.scope = "all_numbers";
+        execution.providerRule.crossConnectionScope = true;
+        execution.providerRule.channels = [];
+        execution.providerRule.connectionId = "c_anchor";
+        execution.providerRule.connection = {
+          ...h.channel.connection,
+          id: "c_anchor",
+          status: "observation",
+        };
+        execution.sourceDelivery.connectionId = "c_anchor";
+      }
       h.prisma.providerConversionRuleExecution = {
         findFirst: vi.fn(async ({ where }: any) =>
           typeof where.id === "string" ? execution : null,
         ),
+        // Cross-number dedupe: no other number converted this lead.
+        findMany: vi.fn(async () => []),
         update: vi.fn(async ({ data }: any) => Object.assign(execution, data)),
         updateMany: vi.fn(async () => ({ count: 1 })),
       };
@@ -274,6 +353,25 @@ describe("real later Unnichat production services with no ad", () => {
         expect(h.calls).toHaveLength(1);
         return;
       }
+      if (scenario === "QualifiedLead_already_converted_on_other_number") {
+        // Once per lead and pixel: the lead already qualified on the other
+        // number, so nothing new is recorded or sent from this one.
+        const before = h.logs.length;
+        await expect(
+          service.processExecution({
+            workspaceId: "w",
+            providerConversionExecutionId: "execution",
+          }),
+        ).resolves.toEqual({ status: "duplicate" });
+        expect(execution).toMatchObject({
+          status: "duplicate",
+          reasonCode: "lead_already_converted_other_number",
+        });
+        expect(h.logs).toHaveLength(before);
+        expect(h.jobs).toHaveLength(0);
+        expect(h.calls).toHaveLength(0);
+        return;
+      }
       expect(
         await service
           .processExecution({
@@ -284,6 +382,24 @@ describe("real later Unnichat production services with no ad", () => {
             throw new Error(e.code);
           }),
       ).toMatchObject({ status: "materialized" });
+      if (scenario === "Purchase_after_entry_deduped") {
+        // Purchases are never deduped across numbers and travel with THIS
+        // number's proof of origin (its own not_eligible entry receipt).
+        expect(h.logs[seeded + 1]).toMatchObject({
+          eventName: "Purchase",
+          status: "ready_to_send",
+          metaConversionDestinationId: expect.any(String),
+          sourcePayload: expect.objectContaining({
+            channelId: "ch",
+            ctwaDestination: expect.objectContaining({ channelId: "ch" }),
+          }),
+        });
+        expect(await h.processor.process(h.jobs[0])).toMatchObject({
+          status: "sent",
+        });
+        expect(h.calls).toHaveLength(1);
+        return;
+      }
       expect(h.logs[1]).toMatchObject({
         eventName,
         adId: null,

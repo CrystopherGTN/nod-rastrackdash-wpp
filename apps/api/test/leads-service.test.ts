@@ -110,6 +110,9 @@ function createHarness() {
     },
     conversionEventLog: {
       findMany: vi.fn(async () => db.conversionLogs),
+      // Report mode lookup ("Lead recebido pela regra", on by default in
+      // the nod): no deferred receipt, so every list behaves as before.
+      findFirst: vi.fn(async () => null),
     },
     webhookLog: {
       findMany: vi.fn(async () => db.webhookLogs),
@@ -544,6 +547,53 @@ describe("leads service", () => {
     });
   });
 
+  it("explains a Meta CAPI refusal in the lead's Pixel/CAPI events by the stored code", async () => {
+    const { db, service } = createHarness();
+    const rejected = (
+      id: string,
+      providerResponseSummary: unknown,
+      overrides: Record<string, unknown> = {},
+    ) => ({
+      ...db.conversionLogs[0]!,
+      id,
+      status: "error",
+      sentAt: null,
+      errorCode: "MetaCapiRejected",
+      errorMessage: "Meta CAPI request failed",
+      providerResponseSummary,
+      ...overrides,
+    });
+    db.conversionLogs = [
+      rejected("param", {
+        httpStatus: 400,
+        error: { code: 100, error_subcode: 2804019, fbtrace_id: "AbC" },
+      }),
+      rejected("login", { httpStatus: 400, error: { code: 190 } }),
+      rejected("old", { httpStatus: 400 }),
+      rejected("network", null, {
+        errorCode: "MetaCapiNetworkError",
+        errorMessage: "Meta CAPI network request failed",
+      }),
+    ] as never;
+
+    const detail = await service.getLeadDetail("workspace_1", "lead_1");
+    const messages = new Map(
+      detail.conversionEvents.map((event) => [event.id, event.errorMessage]),
+    );
+
+    expect(messages.get("param")).toContain(
+      "A Meta recusou o evento (código 100, subcódigo 2804019): a Meta considerou um parâmetro do evento inválido.",
+    );
+    expect(messages.get("param")).toContain(
+      "Identificador para suporte da Meta: AbC",
+    );
+    expect(messages.get("login")).toBe(
+      "A Meta recusou por falha de login da conexão; reconecte a Meta e reenvie",
+    );
+    expect(messages.get("old")).toBe("A Meta recusou o evento");
+    expect(messages.get("network")).toBe("Meta CAPI network request failed");
+  });
+
   it("does not expose non-http creative URLs in lead detail", async () => {
     const { db, service } = createHarness();
     db.leads[0]!.ctwaSourceUrl = "javascript:alert(1)";
@@ -554,7 +604,52 @@ describe("leads service", () => {
     expect(detail.attribution.creative).toEqual({
       thumbnailUrl: null,
       destinationUrl: null,
+      thumbnailVersion: null,
     });
+  });
+
+  it("returns the persisted creative thumbnail version for the attributed ad", async () => {
+    const { db, prisma, service } = createHarness();
+    db.ads[0] = { ...db.ads[0]!, creativeId: "120200000001" } as never;
+    const findFirst = vi.fn(async () => ({ version: "abcdef0123456789" }));
+    Object.assign(prisma, { metaCreativeThumbnail: { findFirst } });
+
+    const detail = await service.getLeadDetail("workspace_1", "lead_1");
+
+    expect(prisma.metaAd.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        select: expect.objectContaining({ creativeId: true }),
+      }),
+    );
+    expect(findFirst).toHaveBeenCalledWith({
+      where: {
+        workspaceId: "workspace_1",
+        creativeId: "120200000001",
+        status: "ready",
+      },
+      select: { version: true },
+    });
+    expect(detail.attribution.creative.thumbnailVersion).toBe(
+      "abcdef0123456789",
+    );
+  });
+
+  it("drops expired signed Meta CDN thumbnails and falls back to the ad thumbnail", async () => {
+    const { db, service } = createHarness();
+    const expiredOe = Math.floor(Date.UTC(2020, 0, 1) / 1000).toString(16);
+    const liveOe = Math.floor(Date.UTC(2099, 0, 1) / 1000).toString(16);
+    db.leads[0]!.ctwaThumbnailUrl = `https://scontent.xx.fbcdn.net/v/t45/a.jpg?oe=${expiredOe}`;
+    db.ads[0] = {
+      ...db.ads[0]!,
+      thumbnailUrl: `https://scontent.xx.fbcdn.net/v/t45/b.jpg?oe=${liveOe}`,
+    } as never;
+
+    const detail = await service.getLeadDetail("workspace_1", "lead_1");
+
+    expect(detail.attribution.creative.thumbnailUrl).toBe(
+      `https://scontent.xx.fbcdn.net/v/t45/b.jpg?oe=${liveOe}`,
+    );
+    expect(detail.attribution.creative.thumbnailVersion).toBeNull();
   });
 });
 
@@ -647,6 +742,7 @@ describe("leads service base (novos x voltaram)", () => {
         eventName: "LeadSubmitted",
         status: { not: "skipped" },
         businessSource: { not: "organic" },
+        NOT: { sourceTrigger: { equals: "manual_conversion" } },
         eventOccurredAt: periodRange,
       },
       select: { leadId: true, phoneHash: true },
@@ -797,6 +893,8 @@ describe("leads service base repeat (conversaram mais de uma vez)", () => {
         eventName: "LeadSubmitted",
         status: { not: "skipped" },
         businessSource: { not: "organic" },
+        // Tarefa 21: a manual LeadSubmitted is never a conversation.
+        NOT: { sourceTrigger: { equals: "manual_conversion" } },
         eventOccurredAt: periodRange,
       },
       select: { leadId: true, phoneHash: true },

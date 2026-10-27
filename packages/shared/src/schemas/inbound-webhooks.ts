@@ -18,6 +18,16 @@ export const inboundWebhookProviders = [
   // certificada por migration) usada pelo receptor da conexao de WhatsApp
   // (POST /webhooks/whatsapp/:id). Nao tem conexao de webhook generica.
   "waha",
+  // Fase 6.5: plataforma de venda (como a Payt): so existe como release de
+  // parser (braip automation-v1, certificada por migration) das regras de
+  // venda recebidas pela URL unica. Sem conexao propria.
+  "braip",
+  // Fase 6.8: ROI Chat (WhatsApp API Oficial). Uma conexao = um numero = uma
+  // URL; a mesma URL recebe a entrada (CTWA) e a compra do lead.
+  "roichat",
+  // Fase 6.7: Yampi, plataforma de venda como a Braip (yampi automation-v1,
+  // certificada por migration). Liberada para todos os workspaces.
+  "yampi",
 ] as const;
 export const inboundWebhookParserReleaseStatuses = [
   "observation_only",
@@ -109,6 +119,12 @@ export const inboundWebhookChannelReadinessBlockers = [
   "ctwa_ad_unavailable",
   "payload_unavailable",
   "payload_expiring_soon",
+  /** CTWA already queued/processing in a replay or production run. */
+  "ctwa_in_progress",
+  /** CTWA whose replay/production attempt failed or was skipped. */
+  "ctwa_send_failed",
+  /** CTWA ignored by triage (not eligible): nothing is sent to Meta. */
+  "ctwa_not_eligible",
 ] as const;
 
 export const inboundWebhookProviderSchema = z.enum(inboundWebhookProviders);
@@ -196,19 +212,24 @@ export const inboundWebhookConnectionCreateInputSchema = z
   .object({
     provider: inboundWebhookProviderSchema,
     displayName: inboundWebhookDisplayNameSchema,
-    // Fase 4b: obrigatorio so para Unnichat, cujo webhook de entrada e por
-    // conexao/numero e nao traz id de canal.
+    // Fase 4b: obrigatorio so para Unnichat e (Fase 6.8) ROI Chat, cujo
+    // webhook de entrada e por conexao/numero e nao traz id de canal.
     connectedPhone: inboundWebhookConnectedPhoneSchema.optional(),
   })
   .superRefine((input, context) => {
-    if (input.provider === "unnichat" && !input.connectedPhone) {
+    const bindsPhone =
+      input.provider === "unnichat" || input.provider === "roichat";
+    if (bindsPhone && !input.connectedPhone) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
         path: ["connectedPhone"],
-        message: "Informe o número de WhatsApp conectado ao Unnichat",
+        message:
+          input.provider === "roichat"
+            ? "Informe o número de WhatsApp conectado ao ROI Chat"
+            : "Informe o número de WhatsApp conectado ao Unnichat",
       });
     }
-    if (input.provider !== "unnichat" && input.connectedPhone !== undefined) {
+    if (!bindsPhone && input.connectedPhone !== undefined) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
         path: ["connectedPhone"],
@@ -787,6 +808,9 @@ export const inboundWebhookChannelReadinessSchema = z.object({
   unresolvedCtwa: z.number().int().nonnegative(),
   retainedCtwa: z.number().int().nonnegative(),
   retainedRoutedCtwa: z.number().int().nonnegative(),
+  inProgressCtwa: z.number().int().nonnegative().optional(),
+  sendFailedCtwa: z.number().int().nonnegative().optional(),
+  notEligibleCtwa: z.number().int().nonnegative().optional(),
   payloadUnavailableCtwa: z.number().int().nonnegative(),
   alreadyMaterializedCtwa: z.number().int().nonnegative(),
   nextPayloadExpiresAt: dateTimeSchema.nullable(),

@@ -364,6 +364,24 @@ function parseInboundWebhookEncryptionKey(env: Environment): Buffer {
   return key;
 }
 
+/**
+ * Interruptor do servidor (Fase 6.1c): INBOUND_CONVERSION_PRODUCTION_ENABLED
+ * com "false" explícito desliga o envio de TODAS as regras de conversão,
+ * inclusive as do Kommo e do Pipedrive (que não dependem dos webhooks de
+ * entrada). Sem valor, nada é desligado. Lido a cada chamada.
+ */
+export function conversionSendingSwitchedOff(
+  env: Environment = process.env,
+): boolean {
+  return (
+    env.INBOUND_CONVERSION_PRODUCTION_ENABLED?.trim().toLowerCase() === "false"
+  );
+}
+
+/** errorCode de uma conversão de regra não enviada por causa do interruptor. */
+export const CONVERSION_PRODUCTION_DISABLED_CODE =
+  "conversion_production_disabled";
+
 export function parseInboundWebhooksConfig(
   env: Environment,
 ): InboundWebhooksConfig {
@@ -391,10 +409,14 @@ export function parseInboundWebhooksConfig(
     env.INBOUND_CONVERSION_RULES_ENABLED,
     false,
   );
+  // Fase 6.1c (produção direta): sem valor definido, o envio das regras
+  // acompanha INBOUND_CONVERSION_RULES_ENABLED. O que foi validado no SaaS
+  // chega em produção; "false" explícito continua desligando o envio de
+  // todas as regras (interruptor do servidor).
   const conversionProductionEnabled = parseBoolean(
     "INBOUND_CONVERSION_PRODUCTION_ENABLED",
     env.INBOUND_CONVERSION_PRODUCTION_ENABLED,
-    false,
+    conversionRulesEnabled,
   );
 
   if (conversionProductionEnabled && !conversionRulesEnabled) {

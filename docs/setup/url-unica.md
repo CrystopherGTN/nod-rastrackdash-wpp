@@ -12,7 +12,11 @@ A Fase 5.3 traz um endereço do **workspace**:
 | Unnichat | **Uma URL por evento** (ex.: Lead qualificado, Compra), válida para todos os números | Da URL |
 | Umbler | **Uma URL por evento** (Lead qualificado ou Compra), válida para todos os números | Da URL |
 
-Braip e Guimoo não entram nesta fase.
+A **Braip** entrou na Fase 6.5 com a mesma base da Payt (uma URL única; o evento vem do status de
+cada postback; filtro de produto pelo produto principal): veja [`braip.md`](braip.md). A **Yampi**
+entrou na Fase 6.7 com a mesma base (uma URL única cadastrada no webhook da loja; o evento vem do
+campo `event` de cada aviso; filtro por produto ou SKU de qualquer item do pedido; liberada para
+todos os workspaces): veja [`yampi.md`](yampi.md). Guimoo não faz parte da edição do aluno.
 
 ## Como o destino é escolhido
 
@@ -84,7 +88,7 @@ A URL antiga de cada regra **continua funcionando**. Não há corte automático.
   lead de outro número, bloqueio), ele aparece em **Vendas/Eventos sem atribuição** com o motivo
   "A regra do número não converteu...", e os detalhes ficam em **Eventos recebidos** da regra.
 - **Tentar de novo** avalia a venda na data em que ela chegou: venda de antes de a regra entrar em
-  produção fica em observação (para enviar, use **Reprocessar** na própria regra).
+  produção fica sem envio (para enviar, use **Reprocessar** na própria regra).
 - Para desativar a URL antiga, a URL nova da plataforma (ou do evento) precisa existir; sem ela, a
   desativação é recusada.
 - Quando a plataforma já estiver postando no endereço novo, **desative a URL antiga** regra por regra

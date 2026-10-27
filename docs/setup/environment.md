@@ -72,8 +72,9 @@ conversão, estas variáveis são **obrigatórias**, não opcionais:
 | `INBOUND_WEBHOOK_ENCRYPTION_KEY` | **Sim** | Você gera (comando abaixo) — Base64 de 32 bytes, string de 44 caracteres terminando em `=` | `.env` da API / env do serviço | **Sim** |
 | `INBOUND_CONVERSION_RULES_ENABLED` | **Sim** — defina `true` | Fixo | `.env` da API / env do serviço | Não |
 | `INBOUND_WEBHOOK_PRODUCTION_ENABLED` | **Sim em produção** (Dokploy/deploy do aluno) | Fixo | `.env` da API / env do serviço | Não |
-| `INBOUND_CONVERSION_PRODUCTION_ENABLED` | Não — mantenha `false` a menos que você queira intencionalmente habilitar envio em produção | Fixo | `.env` da API | Não |
+| `INBOUND_CONVERSION_PRODUCTION_ENABLED` | Não — deixe **sem valor** (produção direta, Fase 6.1c): sem valor, o envio das regras acompanha `INBOUND_CONVERSION_RULES_ENABLED`. `false` explícito desliga o envio de todas as regras (interruptor do servidor), inclusive as da Kommo e do Pipedrive, e a tela Conversões mostra "Envio desligado no servidor". Se a sua API tem `false` copiado do `.env.example` antigo, troque para `true` ou apague a variável | Fixo | `.env` da API | Não |
 | `INBOUND_WEBHOOK_REPLAY_ENABLED` | Não — mantenha `false` a menos que precise reprocessar webhooks | Fixo | `.env` da API | Não |
+| `LEAD_SUBMITTED_RULE_OVERRIDE_ENABLED` | Não — deixe **sem valor** (padrão **ligado**, Fase 6.2a, produção direta). Ligada: uma regra de conversão "Lead recebido" ativa e enviando (frase, catálogo ou automação) passa a enviar o Lead recebido dos números que ela cobre quando for acionada, e a entrada da conversa só registra a origem (nunca os dois; uma vez por lead e pixel). Sem regra assim, nada muda: o Lead recebido sai na entrada, como antes. `false` (ou `0`, `off`, `no`) explícito desliga: o Lead recebido volta a sair sempre na entrada. Só a API lê; mudar exige reiniciar a API | Fixo | `.env` da API / env do serviço (Dokploy: variáveis do serviço da API) | Não |
 
 Gere a chave de criptografia (Base64 de 32 bytes) com Node — mesmo comando em
 qualquer sistema operacional com Node instalado:
@@ -250,9 +251,19 @@ EMAIL_FROM_ADDRESS=no-reply@exemplo.com
 | `META_TOKEN_ENCRYPTION_KEY` | Sim, antes de conectar qualquer token Meta | Você gera | `.env` local / env do serviço | **Sim** |
 | `KOMMO_CRM_ENCRYPTION_KEY` | Sim, antes de criar uma conexão Kommo | Base64 canônico de 32 bytes, gerado pelo aluno | env efetiva do container da API | **Sim** |
 | `PIPEDRIVE_CRM_ENCRYPTION_KEY` | Sim, antes de criar uma conexão Pipedrive | Base64 canônico de 32 bytes, gerado pelo aluno (`openssl rand -base64 32`); **diferente** da chave do Kommo | env efetiva do container da API | **Sim** |
-| `META_WEBHOOK_VERIFY_TOKEN` | Só para o webhook de **Meta Ads** (`/webhooks/meta`) | Você define | `.env` local / env do serviço | **Sim** |
+| `META_WEBHOOK_VERIFY_TOKEN` | Só para o webhook de **Meta Ads** (`/webhooks/meta`), que também recebe os **Formulários Meta** (Lead Ads, Fase 6.9) | Você define | `.env` local / env do serviço | **Sim** |
 | `WPPTRACK_META_AUTO_SYNC_*` | Não (têm padrão) | Tuning do sync automático | `.env` da API | Não |
 | `META_VIDEO_THUMBNAILS_ENABLED` | Não (padrão desligado) | Só `true` liga a busca extra de miniaturas de vídeo (`/{video}/thumbnails`). Deixe desligado ao usar o login social PalmUP: o limite de chamadas do app Meta é compartilhado | `.env` da API | Não |
+| `WPPTRACK_META_USAGE_PAUSE_PERCENT` | Não (padrão `75`) | Uso do app Meta (%) a partir do qual a sincronização de relatórios em segundo plano cede a vez e é retomada sozinha depois. O limite vale **por app**: o app da PalmUP (botão **Conectar Meta (PalmUP)**) e o seu app próprio são contados separados — veja [Limite de uso da Meta](#limite-de-uso-da-meta-fase-64-opcional) | `.env` da API / env do serviço da API | Não |
+| `WPPTRACK_META_SYNC_DEDUPE_WINDOW_MINUTES` | Não (padrão `15`) | Janela (minutos) em que pedidos iguais de sincronização da mesma conta e período viram um só | `.env` da API / env do serviço da API | Não |
+| `WPPTRACK_META_SYNC_MAX_DEFERRALS` | Não (padrão `12`) | Quantas vezes uma sincronização adia por limite da Meta antes de desistir (o próximo ciclo automático cobre o período) | `.env` da API / env do serviço da API | Não |
+| `WPPTRACK_META_AUTO_SYNC_INCREMENTAL_DAYS` | Não (padrão `3`, **ligado**; `0` desliga) | Sync automático incremental: uma leitura completa por dia e, nas outras rodadas, só os últimos N dias. Se os dias guardados não fecharem com o total da Meta, lê a janela inteira. Precisa do Redis (sem ele toda rodada é completa) | `.env` da API / env do serviço da API | Não |
+| `META_INSIGHTS_LEVEL_MODE` | Não (padrão `legacy`) | `legacy` (como antes), `shadow` (lê também por anúncio e só registra no log se os totais batem: `META_INSIGHTS_AD_LEVEL_PARITY ... mismatched=0`) ou `ad_level` (lê só no nível de anúncio e soma campanhas/conjuntos localmente: menos chamadas). Use `shadow` antes de `ad_level` | `.env` da API / env do serviço da API | Não |
+| `META_INSIGHTS_PAGE_LIMIT` | Não (padrão `500`) | Linhas por página dos Insights; volta sozinho para 100 se a Meta pedir menos dados. `100` = comportamento anterior | `.env` da API / env do serviço da API | Não |
+| `META_INSIGHTS_ASYNC_ENABLED` | Não (padrão **desligado**) | `true` usa o relatório assíncrono da Meta em períodos longos (com volta automática ao modo normal). Ajustes: `META_INSIGHTS_ASYNC_MIN_DAYS` (padrão `31`), `META_INSIGHTS_ASYNC_POLL_MS` (padrão `3000`), `META_INSIGHTS_ASYNC_MAX_POLLS` (padrão `40`) | `.env` da API / env do serviço da API | Não |
+| `META_CAPI_BATCH_ENABLED` | Não (padrão **desligado**) | `true` junta eventos de conversão simultâneos do mesmo pixel em um envio à Meta (status por evento; se a Meta recusar o lote por um evento inválido, reenvia um a um; se recusar por token inválido ou limite, todos ficam com a mesma recusa, sem reenvio). Só entram no lote os envios simples: Kommo, Pipedrive, as regras de entrada e o caminho CTWA página/pixel (que têm prazo e garantia de envio único) nunca entram. Ajustes: `META_CAPI_BATCH_WINDOW_MS` (padrão `250`), `META_CAPI_BATCH_MAX_EVENTS` (padrão `1000`) | `.env` da API / env do serviço da API | Não |
+| `WPPTRACK_CONVERSION_WORKER_CONCURRENCY` | Não (padrão `1`, máximo `50`) | Quantos eventos de conversão a API processa ao mesmo tempo. O envio em lote da CAPI só junta eventos com valor maior que 1 (sugestão do SaaS: 4 a 10) | `.env` da API / env do serviço da API | Não |
+| `META_CAPI_SEND_FIRST_NAME` | Não (padrão **desligado**) | Só `true` (ou `1`, `on`, `yes`) envia o primeiro nome do lead (`fn`) na Conversions API, normalizado e com hash SHA-256. Fica desligado porque o nome do perfil do WhatsApp nem sempre é o nome real (apelidos, frases). Nomes vazios, genéricos, só emoji ou com cara de telefone nunca são enviados | `.env` da API | Não |
 | `WPPTRACK_REPORT_TIMEZONE` | Não (tem padrão `America/Sao_Paulo`) | Seu fuso horário de relatório | `.env` da API | Não |
 | `PTAX_SYNC_ENABLED` | Não (padrão **desligado**) | Só ligue (`true`) se anuncia ou vende em USD/EUR: busca a cotação PTAX do Banco Central para os relatórios por moeda — veja [Cotação PTAX](#cotação-ptax-relatórios-por-moeda-opcional) | `.env` da API | Não |
 | `PALMUP_META_BROKER_URL` | Só para o botão **Conectar Meta (PalmUP)** — sem ela, fica só o token permanente | Fornecido pela PalmUP (já vem preenchido no `.env.example`: `https://wpptrack-api.rastrack.app`) | `.env` da API / env do serviço da API. O web **não** precisa dela | **Não** — é uma URL pública, não é App Secret |
@@ -320,6 +331,25 @@ em [`pipedrive.md`](pipedrive.md).
 
 Defina `META_CONNECTION_MODES=manual` **antes** de configurar Meta e redeploy a API depois de alterar a env. No MVP do aluno não há o OAuth antigo (app Meta próprio) como caminho alternativo. A credencial Meta entra por workspace na UI de **Integrações**, nunca em variável pública: pelo botão **Conectar Meta (PalmUP)** (exige `PALMUP_META_BROKER_URL`, veja acima) ou colando o token do usuário do sistema — veja [`meta-manual.md`](meta-manual.md).
 
+### Formulários Meta (Lead Ads) e importação do Dashboard Leads (Fase 6.9)
+
+Nenhuma variável nova no `.env` da API ou da web. Os **Formulários Meta** ([guia](meta-lead-forms.md)) usam variáveis que já existem:
+
+| Variável | Para que serve nos Formulários Meta | Obrigatória | Sem valor |
+|---|---|---|---|
+| `META_APP_SECRET` | Confere a assinatura `X-Hub-Signature-256` do webhook `leadgen` em `/webhooks/meta` e gera o `appsecret_proof` da leitura do lead na Graph API | **Sim** para receber leads de formulário | Toda entrega do webhook da Meta é recusada (401) e nenhum lead de formulário entra |
+| `META_WEBHOOK_VERIFY_TOKEN` | Token de verificação ao salvar a URL de callback (objeto Page, campo `leadgen`) no app Meta | **Sim** para salvar o webhook no app Meta | A Meta não aceita a URL de callback |
+| `META_TOKEN_ENCRYPTION_KEY` | Cifra o token Graph e o token do dataset de cada conexão | **Sim** (já é obrigatória para a Meta) | Não dá para salvar a conexão |
+| `API_PUBLIC_URL` | Monta a URL do webhook mostrada no painel (`{API_PUBLIC_URL}/webhooks/meta`) | Já obrigatória | O painel mostra `<API_PUBLIC_URL>/webhooks/meta` no lugar da URL |
+| `META_GRAPH_API_VERSION` | Versão da Graph API da leitura do lead e do envio ao dataset do CRM | Não (padrão `v21.0` no código; o `.env.example` traz `v25.0`) | Usa o padrão |
+
+O comando **opcional** de importação do Dashboard Leads ([guia](dashboard-leads-import.md)) lê duas variáveis **só na linha de comando** de quem roda a importação. Elas **não** vão no `.env`, no Dokploy, na Vercel nem em arquivo do repositório, e a API não as usa:
+
+| Variável | Para que serve | Obrigatória | Valor | Onde definir | Sem valor |
+|---|---|---|---|---|---|
+| `SUPABASE_URL` | Endereço do projeto Supabase do Dashboard Leads, lido pela importação | Só para rodar `dashboard-leads:import` | `https://<projeto>.supabase.co` | Na mesma linha do comando, no terminal de quem importa | O comando para com "Defina SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY no ambiente." e não grava nada |
+| `SUPABASE_SERVICE_ROLE_KEY` | Chave de serviço do Supabase (segredo) para ler projetos e leads pela REST | Só para rodar `dashboard-leads:import` | A chave do painel do Supabase | Na mesma linha do comando; nunca em chat, `.env` ou arquivo versionado | Igual à linha acima |
+
 ### `META_APP_SECRET` e o webhook do Meta WhatsApp (Cloud API)
 
 O webhook de mensagens do Meta WhatsApp (Cloud API) **não** usa
@@ -378,6 +408,58 @@ de uma venda feita em outra moeda.
 - Não confunda com `WPPTRACK_PTAX_SYNC_ENABLED` (nome usado no SaaS): aqui ela
   não tem efeito. Reinicie a API depois de mudar a variável.
 
+### Limite de uso da Meta (Fase 6.4, opcional)
+
+Todas as variáveis desta parte são **opcionais**: sem valor, vale o padrão da
+tabela acima. Nenhuma é segredo e nenhuma é pedida pelo `pnpm setup` nem pelo
+checklist de `/onboarding/status`. Preencha só no env do serviço da **API**
+(Dokploy, VPS ou `.env` local); o web não usa nenhuma delas. Reinicie a API
+depois de mudar.
+
+- **Ligado por padrão (sem configurar nada):**
+  - disjuntor só dos relatórios: se a Meta disser que o token ou a permissão
+    da conta de anúncios não vale mais (erros 190/102 ou 10/200), a
+    sincronização **daquela conta** pausa e Relatórios mostra "Reconecte a
+    conta Meta". Com 190/102 confirmado por uma leitura barata de `/me`,
+    pausam também as outras contas do mesmo token. O envio de conversões
+    (CAPI) continua normal. O bloqueio sai sozinho, sem passo manual, quando
+    o aluno reconecta (OAuth, troca do token, nova conexão de negócio) ou usa
+    "Testar" a conexão em Integrações; a sincronização volta na rodada
+    seguinte;
+  - pausa por uso: com o uso do app Meta acima de
+    `WPPTRACK_META_USAGE_PAUSE_PERCENT` (ou com erro de limite da Meta), a
+    sincronização em segundo plano espera e retoma sozinha. O login e o
+    botão **Conectar Meta (PalmUP)** nunca são bloqueados por isso;
+  - pedidos repetidos de sincronização dentro da janela viram um só;
+  - miniaturas dos criativos guardadas no banco (tabela
+    `MetaCreativeThumbnail`): cada criativo novo é buscado uma vez (até 150
+    por sincronização, ~30 s no máximo, pausa de 15 min após erro de limite);
+  - sync automático incremental (`WPPTRACK_META_AUTO_SYNC_INCREMENTAL_DAYS=3`)
+    e páginas de 500 linhas nos Insights.
+- **Desligado por padrão:** `META_INSIGHTS_LEVEL_MODE` (fica `legacy`),
+  `META_INSIGHTS_ASYNC_ENABLED` e `META_CAPI_BATCH_ENABLED`.
+- **Limite por app:** o app Meta usado pode ser o da PalmUP (botão
+  **Conectar Meta (PalmUP)**, compartilhado entre as instalações) ou o seu
+  app próprio (token do usuário do sistema). A pausa por uso do app é contada
+  separada para cada um, então o uso alto do app da PalmUP não pausa a
+  sincronização das contas conectadas pelo seu app, e vice-versa. O limite
+  por conta de anúncios vale para qualquer app. A API reconhece o app da
+  PalmUP pelo nome que o botão dá à credencial ("Login social PalmUP"); não
+  use esse nome num token do seu app.
+- `META_VIDEO_THUMBNAILS_ENABLED` continua igual: desligada, nenhuma chamada
+  extra a `/{video}/thumbnails`; a miniatura do vídeo vem do próprio criativo.
+- Ajustes finos das miniaturas (raramente necessários):
+  `META_CREATIVE_THUMBNAIL_MAX_PER_SYNC` (150),
+  `META_CREATIVE_THUMBNAIL_STAGE_BUDGET_MS` (30000),
+  `META_CREATIVE_THUMBNAIL_RATE_LIMIT_PAUSE_MS` (900000),
+  `META_CREATIVE_THUMBNAIL_DOWNLOAD_TIMEOUT_MS` (3000),
+  `META_CREATIVE_THUMBNAIL_DOWNLOAD_CONCURRENCY` (4) e
+  `META_CREATIVE_THUMBNAIL_MAX_BYTES` (102400).
+- Para voltar ao comportamento anterior de leitura:
+  `WPPTRACK_META_AUTO_SYNC_INCREMENTAL_DAYS=0`,
+  `META_INSIGHTS_PAGE_LIMIT=100`, `META_INSIGHTS_LEVEL_MODE=legacy` e
+  `META_CAPI_BATCH_ENABLED=false`.
+
 ## URLs, cookie e primeiro administrador
 
 Use estes valores de formato (exemplos sem segredos):
@@ -427,6 +509,25 @@ e o que ainda não, está em
 | `API_PUBLIC_URL` | **Sim, para gerar receiver** | URL pública da sua API (já obrigatória na seção Core) | `.env` da API / env do serviço | Não |
 | `DISCONNECT_ALERTS_ENABLED`, `DISCONNECT_ALERT_STREAK`, `DISCONNECT_ALERT_INTERVAL_MS` | Não (opcional) | Decisão sua | `.env` da API | Não |
 | `OPS_ALERT_WEBHOOK_URL` | Só se `DISCONNECT_ALERTS_ENABLED=true` | Webhook do seu Slack/Discord/etc. | `.env` local / env do serviço | **Sim** (trate a URL como sensível — permite postar no seu canal) |
+| `OPS_ALERT_UAZAPI_BASE_URL`, `OPS_ALERT_UAZAPI_TOKEN` (novas na Fase 6.1c) | Não (opcional) — só para a mensagem dos Alertas WhatsApp sair por WhatsApp. Sem elas o aviso de desconexão aparece só em Integrações | URL do servidor e token de uma instância Uazapi sua que envia o aviso | `.env` da API / env do serviço | `OPS_ALERT_UAZAPI_TOKEN` **sim** |
+| `OPS_ALERT_SCAN_INTERVAL_MS` (nova na Fase 6.1c) | Não (padrão 15 minutos; mínimo 60000): intervalo em que a API confere cada conexão Uazapi BYO e WAHA para o aviso de WhatsApp desconectado | Decisão sua | `.env` da API | Não |
+| `WPPTRACK_WEB_PROVIDER_STATUS_TIMEOUT_MS` | Não (padrão 2000) | Decisão sua: tempo máximo, em milissegundos, de cada leitura de status ou de atividade das conexões em Integrações | env do serviço da **WEB** | Não |
+
+**Alerta de desconexão por conexão (Fase 6.1c):** a API confere cada conexão
+Uazapi BYO e WAHA ativa pela API de status do próprio provedor (a mesma URL do
+servidor + token salvos na conexão). O aviso "WhatsApp desconectado" aparece em
+Integrações só depois de **2 leituras seguidas** de desconectado; estados
+passageiros (subindo, hibernada, offline) e erros de leitura nunca alertam, e
+uma leitura conectada tira o aviso. A mensagem por WhatsApp sai uma vez (com o
+intervalo de repetição de Configurações > Alertas WhatsApp) quando os alertas
+estão ligados no workspace, há telefone cadastrado e a licença está utilizável.
+
+**Atividade do número (Fase 6.3b):** cada conexão Uazapi BYO e WAHA mostra em
+Integrações os leads de anúncio (CTWA) de 24 horas, 7 dias e total, o último
+lead e o último webhook, com o atalho para os leads desse número. É só
+leitura, não tem variável nova e continua aberta com a licença bloqueada. Se a
+leitura passar de `WPPTRACK_WEB_PROVIDER_STATUS_TIMEOUT_MS`, a tela mostra
+"Atividade indisponível" (nunca zeros inventados).
 
 O receiver de cada conexão é gerado na UI (botão **Gerar receiver**) na
 forma `{API_PUBLIC_URL}/webhooks/whatsapp/{ID_DA_CONEXAO}?token=...`. Sem

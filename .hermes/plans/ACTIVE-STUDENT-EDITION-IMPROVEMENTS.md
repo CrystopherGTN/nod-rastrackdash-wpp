@@ -63,6 +63,94 @@ O arquivo histórico `docs/superpowers/plans/2026-08-19-rastrackdash-student-edi
 | Fase 2 | backoffice real multi-cliente, responsáveis, suporte escopado, anti-IDOR, ativação automática de licença e SMTP opcional | público | **CONCLUÍDA — HOMOLOGADA EM INSTALAÇÃO INDIVIDUAL (2026-08-27)** | base `374cc48`; hardening `525886a`/`5d743d5`/`51781b1`; publicado até `454725c`; homologação confirmada pelo Samuel: deploy no commit, licença autoativada no boot, workspace sem SMTP, link manual one-time, bootstrap password removida |
 | Fase 3 | conectores externos MySQL/PostgreSQL com egress/SSRF seguro | público | **FASE 3A MERGEADA — SMOKE REAL PAUSADO** | PR #43 merge `a48e93d`; API deployada; listagem autenticada OK no workspace `cmtbvwoop0000qa2swt9x8amu`; create/test MySQL real pausado até MySQL público fictício no Dokploy; PostgreSQL ainda não suportado |
 | Fase 4 | UAZAPI por conexão/workspace, webhook e gatilhos | público | **IMPLEMENTADA E PARCIALMENTE HOMOLOGADA** | PRs #28–#41; UAZAPI e WAHA validados em produção; GupShup/Umbler existem como inbound webhook no código, mas a UX/aluno e a paridade com o app de referência ainda precisam de fechamento |
+| Fase 6 | paridade com o SaaS (dash-com-ia até #187), subfases 6.0 → 6.9, um PR por subfase | público | **6.0, 6.1a, 6.1b e 6.1c NA BRANCH DE INTEGRAÇÃO (PR #105, #106, #107, #108); 6.2a IMPLEMENTAÇÃO CONCLUÍDA — AGUARDANDO REVISÃO** (Gate 1 aprovado em 26/10/2026; regra fixa "produção direta" desde a 6.1c) | plano: `.hermes/plans/PORTE-SAAS-PARIDADE-FASE-6.md`; status da subfase em "Fase 6 — status das subfases" abaixo |
+
+### Fase 6 — status das subfases
+
+Plano da fase: `.hermes/plans/PORTE-SAAS-PARIDADE-FASE-6.md` (Gate 1 aprovado pelo Samuel em 26/10/2026). Ordem (atualizada em 26/10, depois da auditoria): 6.0 → 6.1a → 6.1b → 6.1c → 6.2a → 6.2b → 6.3a → 6.3b → 6.4 → 6.5 → 6.6 → 6.7 → 6.8 → 6.8b (GoHighLevel, reservada) → 6.9. Base das subfases: branch `integracao/fase-6`.
+
+#### 6.0 — Envio para a Meta: correções críticas
+
+```text
+Status: IMPLEMENTANDO
+Branch: feat/fase-6.0-correcoes-envio-meta
+Executor: Claude Code
+Modelo/reasoning: Claude Opus 5.5
+Task file: .hermes/plans/PORTE-SAAS-PARIDADE-FASE-6.md §6.0
+Escopo: #153 (uma conversão por lead por pixel, entre números, com WAHA e Meta Cloud), #181 (+ parte do ready_to_send parado do 7ac17df7), #173 (Payt em hora de Brasília); nada além
+Migrations: nenhuma
+Testes: lista da §6.0 + licensing-client + brand-footer/app-layout/navigation
+```
+
+```text
+Status: IMPLEMENTAÇÃO CONCLUÍDA — AGUARDANDO REVISÃO
+Arquivos: lead-lifetime-conversion-guard.ts (novo), conversion-events.service, provider-conversion-production.service, inbound-webhook-production.service, inbound-webhook-replay.service, ctwa-entry-materialization, provider-rule-blocked-reprocess(+service), provider-conversion-rules.service, conversion-event-retry, meta-capi.adapter, diagnostics.service, meta-reporting.service, reporting.controller, sao-paulo-timestamp.ts (novo), payt-automation-v1.parser, inbound-conversion-automation-ingestion.service, integration-endpoints.service; web conversions/events/settings; shared conversion-rules e reporting
+Testes: typecheck api/web/shared OK; API 2695 ok / 48 skipped (main: 2633 ok); web 1298 ok / 3 falhas iguais ao main; shared 187 ok / 18 falhas iguais ao main; licensing-client 72 ok; brand-footer e navigation ok; app-layout com 1 falha que já existe no main
+Migrations: nenhuma
+Limitações: escopo por número do SaaS (#84, parte de dedupe) portado na mesma 6.0 por decisão do Samuel; auto_lead fora do guard até a 6.2a (ok, fases vão juntas na branch de integração); recusas da Meta gravadas antes desta versão não têm o código 190/102; sem validação em instalação real
+```
+
+#### 6.1a — Regra única por provedor
+
+```text
+Status: IMPLEMENTAÇÃO CONCLUÍDA — AGUARDANDO REVISÃO
+Branch: feat/fase-6.1a-regra-unica-provedor (a partir de origin/integracao/fase-6)
+Executor: Claude Code
+Modelo/reasoning: Claude Opus 5.5
+Task file: .hermes/plans/PORTE-SAAS-PARIDADE-FASE-6.md §6.1a
+Escopo: #66/#85/#86 (ativação não trava com número órfão/duplicado, com a ponte WAHA), #159 (regra única por evento Unnichat/Umbler, todas as conexões, número removido), #160 (seção da URL antiga), #161 (exclusão em lote); atualização do plano com a auditoria de 26/10
+Migrations: 20261027120000_provider_rule_cross_connection_scope (aditiva, ADD COLUMN nullable)
+Testes: lista da §6.1a + licensing-client + brand-footer/app-layout/navigation
+Resultado: typecheck api/web/shared OK; API 2741 ok / 48 skipped (integração: 2696 ok); web 1331 ok / 3 falhas iguais à integração; shared 187 ok / 18 falhas iguais à integração; licensing-client 72 ok; brand-footer e navigation ok; app-layout com 1 falha que já existe na integração; revisão independente feita (achados corrigidos em 86a2cf12)
+Limitações: entregas recebidas antes de uma reancoragem ficam na âncora antiga e não são reenviadas (igual ao SaaS); sem validação em instalação real
+```
+
+#### 6.1b — Motivos e prontidão dos números
+
+```text
+Status: IMPLEMENTAÇÃO CONCLUÍDA — AGUARDANDO REVISÃO
+Branch: feat/fase-6.1b-motivos-e-leitura (a partir de origin/integracao/fase-6)
+Executor: Claude Code
+Modelo/reasoning: Claude Opus 5.5
+Task file: .hermes/plans/PORTE-SAAS-PARIDADE-FASE-6.md §6.1b
+Escopo: #171 (motivo de "em observação", número do lead na própria conexão), #165 (prontidão por SQL agregado), #179 (Bloqueado com motivo; fn da CAPI) + #180 (fn desligado por padrão), #103/#105 adaptados com a ponte WAHA, d4d70274 (já no nod: só testes), 75f6f4b3 parcial (janela de 7 dias nas automações); b65753b7 não portado (parte Unnichat já no nod; o reenfileiramento vive num serviço de backoffice que o nod não tem). 6.1c fora.
+Migrations: nenhuma
+Env nova: META_CAPI_SEND_FIRST_NAME (opcional, desligada por padrão)
+Testes: lista da §6.1b + licensing-client + brand-footer/app-layout/navigation
+Resultado: typecheck api/web/shared OK; API 2809 ok / 48 skipped (integração: 2741 ok / 48 skipped); web 1349 ok / 3 falhas iguais à integração; shared 187 ok / 18 falhas iguais à integração; licensing-client 72 ok; brand-footer e navigation ok; app-layout com 1 falha que já existe na integração; pnpm setup --dry-run e scripts/setup.test.mjs ok; revisão independente feita (achados corrigidos em 3dd4975c)
+Limitações: SQL agregado validado só com mocks (sem PostgreSQL real); reenvio de itens de replay com falha fica para a 6.1c; sem validação em instalação real
+```
+
+#### 6.1c — Produção direta, alerta de desconexão e reenvio de replay
+
+```text
+Status: IMPLEMENTAÇÃO CONCLUÍDA — AGUARDANDO REVISÃO
+Branch: feat/fase-6.1c-producao-direta (a partir de origin/integracao/fase-6)
+Executor: Claude Code
+Modelo/reasoning: Claude Opus 5.5
+Task file: .hermes/plans/PORTE-SAAS-PARIDADE-FASE-6.md §6.1c (+ regra fixa "produção direta" na §0)
+Escopo: produção direta (conexões, números e regras de integrações validadas nascem em produção; promoção uma vez dos dados em observação; textos sem observação/teste/certificar), alerta de desconexão por conexão Uazapi BYO/WAHA com 2 leituras (SaaS #63), "Reenviar os que falharam" na recuperação do aluno (SaaS #91), plano atualizado (regra fixa; no nod não existe QR)
+Migrations: 20261027125000_production_direct_validated_integrations (só dados: UPDATE + auditoria; nenhuma DDL)
+Env: INBOUND_CONVERSION_PRODUCTION_ENABLED sem valor passa a acompanhar INBOUND_CONVERSION_RULES_ENABLED; nenhuma variável obrigatória nova
+Resultado: typecheck api/web/shared OK; API 2897 ok / 48 skipped (integração: 2809 ok / 48 skipped); web 1353 ok / 3 falhas iguais à integração (+ suíte kommo-responsive-layout que já falha); shared 187 ok / 18 falhas iguais à integração; licensing-client 72 ok; brand-footer e navigation ok; app-layout com 1 falha que já existe na integração; pnpm setup --dry-run e scripts/setup.test.mjs ok; revisão independente feita (achados corrigidos antes do commit)
+Limitações: migration conferida só pelo texto (sem PostgreSQL); alerta validado com leituras simuladas; conexões Meta Cloud em observação não são promovidas pela migration (dependem de META_APP_SECRET; ativar em Integrações); sem validação em instalação real
+```
+
+#### 6.2a — Lead recebido pela regra e conversão manual no lead
+
+```text
+Status: IMPLEMENTAÇÃO CONCLUÍDA — AGUARDANDO REVISÃO
+Branch: feat/fase-6.2a-lead-regra-conversao-manual (a partir de origin/integracao/fase-6)
+Executor: Claude Code
+Modelo/reasoning: Claude Opus 5.5
+Task file: .hermes/plans/PORTE-SAAS-PARIDADE-FASE-6.md §6.2a (+ regra fixa "produção direta" na §0)
+Escopo: #155 (4d74d303, Lead recebido pela regra), #156 (2e328e97, CSS da lista), #158 (be599f49, conversão manual no lead) e o hunk do #159 em lead-submitted-rule-override.ts (42ccbc7c); adaptações: flag ligada por padrão com um único leitor, licença + conexão WhatsApp ativa no lugar da vaga, ponte WAHA e caminho Meta Cloud perguntam o adiamento, ponto de extensão para Braip/Hotmart/Yampi (6.5 a 6.7). PR #90 do nod substituído (não será publicado; fechar no GitHub é decisão do Samuel)
+Migrations: nenhuma (auditoria de status do #90 não aprovada, não incluída)
+Env: LEAD_SUBMITTED_RULE_OVERRIDE_ENABLED nova, ligada por padrão (sem valor = ligada; false/0/off/no desliga)
+Testes: lista da §6.2a + novos do nod (frase QualifiedLead + conversão manual = 1 evento, mesmo event_id; ponte WAHA/Uazapi com o resolvedor real; 423 na conversão manual; conexão desativada) + licensing-client + brand-footer/app-layout/navigation
+Resultado: typecheck api/web/shared OK; API 2997 ok / 48 skipped (integração: 2897 ok / 48 skipped); web 1379 ok / 3 falhas iguais à integração (+ suíte kommo-responsive-layout que já falha); shared 195 ok / 18 falhas iguais à integração; licensing-client 72 ok; brand-footer e navigation ok; app-layout com 1 falha que já existe na integração; pnpm setup --dry-run e scripts/setup.test.mjs ok; revisão independente feita (achados corrigidos antes do commit)
+Limitações: sem validação em instalação real com a Meta; regras de Lead recebido só existem em Uazapi BYO, WAHA, Umbler e Unnichat (Meta Cloud, Gupshup e Data Crazy seguem enviando na entrada); janela rara de dois Lead recebido quando a entrada da ponte ainda está na fila sem pixel (igual ao SaaS)
+```
 
 ### Checkpoint MySQL — pausado em 2026-09-04
 

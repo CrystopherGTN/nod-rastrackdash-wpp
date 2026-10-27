@@ -18,7 +18,10 @@ export const diagnosticSources = [
   "zapi",
   "data_crazy",
   "payt",
-  "unnichat"
+  "unnichat",
+  "braip",
+  "roichat",
+  "yampi"
 ] as const;
 export const diagnosticSeverities = [
   "info",

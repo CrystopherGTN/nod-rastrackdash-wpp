@@ -1,4 +1,7 @@
-import { conversionEventBuilderLabel } from "@wpptrack/shared";
+import {
+  conversionEventBuilderLabel,
+  conversionEventDisplayLabel,
+} from "@wpptrack/shared";
 
 /**
  * O catálogo de eventos do pacote shared é ASCII de propósito (teste de
@@ -37,6 +40,14 @@ export function ruleEventLabel(eventName: string): string {
 }
 
 /**
+ * Rótulo curto do evento (funil) com acentos, para as telas de CRM (Kommo,
+ * Pipedrive). Fase 6.1a, porte do #160.
+ */
+export function accentedEventDisplayLabel(eventName: string): string {
+  return accentEventCopy(conversionEventDisplayLabel(eventName));
+}
+
+/**
  * Eventos de venda da Payt: o evento vem do status de cada venda, então o
  * rótulo fala da venda (Pix/boleto gerado, e não “Iniciar checkout”).
  */
@@ -60,14 +71,73 @@ export function paytEventLabel(eventName: string): string {
   return paytEventLabels[eventName] ?? ruleEventLabel(eventName);
 }
 
-/** Rótulo do evento de uma regra, conforme a origem (Payt tem rótulos próprios). */
+/**
+ * Fase 6.5: eventos de venda da Braip (mesma base da Payt). O evento vem do
+ * status de cada postback da Braip.
+ */
+export const braipEventLabels: Readonly<Record<string, string>> = {
+  Purchase: "Compra aprovada",
+  InitiateCheckout: "Boleto/Pix gerado",
+  CartAbandoned: "Checkout abandonado",
+};
+
+export const braipEventExplanations: Readonly<Record<string, string>> = {
+  Purchase: "Status “Pagamento Aprovado”.",
+  InitiateCheckout:
+    "Status “Aguardando Pagamento” (boleto ou Pix gerado). Cartão aprovado na hora vai direto para compra aprovada.",
+  CartAbandoned:
+    "Checkout abandonado (beta): só é enviado se a Braip mandar o aviso de abandono com a transação.",
+};
+
+export function braipEventLabel(eventName: string): string {
+  return braipEventLabels[eventName] ?? ruleEventLabel(eventName);
+}
+
+/**
+ * Fase 6.7 (porte do SaaS #186): eventos de venda da Yampi (mesma base da
+ * Braip). O evento vem do campo `event` de cada aviso da Yampi.
+ */
+export const yampiEventLabels: Readonly<Record<string, string>> = {
+  Purchase: "Pedido pago",
+  InitiateCheckout: "Pedido aguardando pagamento (boleto/Pix)",
+  CartAbandoned: "Carrinho abandonado",
+};
+
+export const yampiEventExplanations: Readonly<Record<string, string>> = {
+  Purchase:
+    "Evento “Pedido pago” (order.paid). A mudança de status para pago é a mesma venda: nunca vira duas compras. O valor é só o dos produtos, sem frete e sem juros.",
+  InitiateCheckout:
+    "Evento “Pedido criado” (order.created) ainda aguardando pagamento (boleto ou Pix gerado). Pedido criado já pago vai direto para pedido pago.",
+  CartAbandoned:
+    "Evento “Carrinho abandonado” (cart.reminder), em beta, com o subtotal dos produtos.",
+};
+
+export function yampiEventLabel(eventName: string): string {
+  return yampiEventLabels[eventName] ?? ruleEventLabel(eventName);
+}
+
+/** Rótulos de venda de uma origem de plataforma de venda (Payt, Braip, Yampi). */
+export function saleEventLabelsForOrigin(
+  origin: string,
+): Readonly<Record<string, string>> | null {
+  if (origin === "automation_payt") return paytEventLabels;
+  if (origin === "automation_braip") return braipEventLabels;
+  if (origin === "automation_yampi") return yampiEventLabels;
+  return null;
+}
+
+/** Rótulo do evento de uma regra, conforme a origem (Payt/Braip/Yampi têm rótulos próprios). */
 export function ruleEventLabelForOrigin(
   origin: string,
   eventName: string,
 ): string {
   return origin === "automation_payt"
     ? paytEventLabel(eventName)
-    : ruleEventLabel(eventName);
+    : origin === "automation_braip"
+      ? braipEventLabel(eventName)
+      : origin === "automation_yampi"
+        ? yampiEventLabel(eventName)
+        : ruleEventLabel(eventName);
 }
 
 /**

@@ -32,7 +32,7 @@ function env(production = false) {
   };
 }
 
-export type Provider = "payt" | "unnichat" | "umbler";
+export type Provider = "payt" | "braip" | "yampi" | "unnichat" | "umbler";
 export type Channel = {
   id: string;
   connectionId: string;
@@ -50,6 +50,11 @@ export type Rule = {
   createdAt?: Date;
   mode?: "observation" | "production";
   publicUrlDisabledAt?: Date | null;
+  /** false: paused (e.g. by "Unificar"). Fase 6.1a (#159). */
+  active?: boolean;
+  /** "Todos os números da Unnichat (todas as conexões)". Fase 6.1a (#159). */
+  crossConnectionScope?: boolean;
+  unifiedIntoProviderRuleId?: string | null;
 };
 export type Lead = {
   phone: string;
@@ -127,6 +132,8 @@ export function world(options: {
   production?: boolean;
   /** Last inbound message (Umbler) per phone -> channel. */
   lastMessages?: Array<{ phone: string; channelId: string }>;
+  /** Connections removed by the operator (number deleted). Fase 6.1a. */
+  removedConnectionIds?: string[];
 }) {
   const runtime = env(options.production);
   const encryption = new InboundWebhookPayloadEncryptionService(runtime);
@@ -143,7 +150,9 @@ export function world(options: {
       workspaceId: W,
       provider: channel.provider,
       status: options.production ? "production" : "observation",
-      removedAt: null,
+      removedAt: options.removedConnectionIds?.includes(channel.connectionId)
+        ? new Date(at.getTime() - 3 * 86_400_000)
+        : null,
       parserReleaseId: `parser_${channel.provider}_v1`,
       parserRelease: {
         id: "x",
@@ -169,6 +178,8 @@ export function world(options: {
         ? new Date(at.getTime() - 86_400_000)
         : null,
       removedAt: null,
+      unifiedIntoProviderRuleId: rule.unifiedIntoProviderRuleId ?? null,
+      crossConnectionScope: rule.crossConnectionScope ?? null,
       createdAt,
       productFilterCodes: rule.productFilterCodes ?? [],
       conversionRule: {
@@ -176,7 +187,7 @@ export function world(options: {
         name: `Regra ${rule.id}`,
         triggerType: "provider_automation",
         eventName: rule.eventName,
-        active: true,
+        active: rule.active ?? true,
         defaultValueCents: null,
         defaultCurrency: null,
       },
@@ -339,7 +350,28 @@ export function world(options: {
               statusMatches(where, r.status),
           ).length,
       ),
-      groupBy: vi.fn(async () => []),
+      // Receipts by endpoint + status (counters of the URL box; SaaS #164).
+      groupBy: vi.fn(async ({ where }: any) => {
+        const ids: string[] | null =
+          where.integrationEndpointId?.in ??
+          (typeof where.integrationEndpointId === "string"
+            ? [where.integrationEndpointId]
+            : null);
+        const groups = new Map<string, any>();
+        for (const r of receipts.values()) {
+          if (r.workspaceId !== where.workspaceId) continue;
+          if (ids && !ids.includes(r.integrationEndpointId)) continue;
+          const key = `${r.integrationEndpointId}:${r.status}`;
+          const group = groups.get(key) ?? {
+            integrationEndpointId: r.integrationEndpointId,
+            status: r.status,
+            _count: { _all: 0 },
+          };
+          group._count._all += 1;
+          groups.set(key, group);
+        }
+        return [...groups.values()];
+      }),
     },
     providerConversionRuleConfig: {
       findMany: vi.fn(async ({ where }: any) => {
@@ -349,6 +381,10 @@ export function world(options: {
           (rule) =>
             !rule.removedAt &&
             rule.conversionRule.active &&
+            // Fase 6.1a (#159): a rule whose anchor connection was removed
+            // never wins the routing.
+            (where.connection?.is?.removedAt !== null ||
+              !rule.connection?.removedAt) &&
             (!provider ||
               (typeof provider === "string"
                 ? rule.parserRelease.provider === provider
@@ -445,8 +481,14 @@ export function world(options: {
       findUnique: vi.fn(async () => null),
     },
     inboundWebhookChannel: {
+      // Channels of removed connections never take part in a scope.
       findMany: vi.fn(async () =>
-        options.channels.map((channel, index) => ({
+        options.channels
+          .filter(
+            (channel) =>
+              !options.removedConnectionIds?.includes(channel.connectionId),
+          )
+          .map((channel, index) => ({
           id: channel.id,
           connectionId: channel.connectionId,
           status: "active",
@@ -603,6 +645,22 @@ export function world(options: {
     });
   }
 
+  /** Raw body with any Content-Type (Braip form postback; refused bodies). */
+  function postRaw(
+    endpointId: string,
+    token: string,
+    contentType: string,
+    body: string,
+  ) {
+    return service.ingest({
+      endpointId,
+      token,
+      contentType,
+      providerAttempt: undefined,
+      rawBody: Buffer.from(body),
+    });
+  }
+
   function postOldUrl(ruleId: string, body: unknown) {
     return ingestion.ingest({
       endpointId: `endpoint_${ruleId}`,
@@ -619,6 +677,7 @@ export function world(options: {
     prisma,
     connect,
     post,
+    postRaw,
     postOldUrl,
     addRule,
     rules,

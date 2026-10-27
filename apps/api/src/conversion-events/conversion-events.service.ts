@@ -1,3 +1,4 @@
+import { salesPlatformOf } from "../inbound-webhooks/providers/sales-platform-sale";
 import {
   Inject,
   Injectable,
@@ -24,6 +25,19 @@ import {
 } from "../pipedrive/pipedrive-production-policy";
 import { isCrmCtwaContext } from "../crm-channels/crm-ctwa-context";
 import {
+  LEAD_SUBMITTED_DEFERRED_TO_RULE,
+  LEAD_SUBMITTED_DEFERRED_TO_RULE_MESSAGE,
+  leadSubmittedRuleOverrideEnabled,
+  type LeadSubmittedRuleOverride,
+} from "../conversion-rules/lead-submitted-rule-override";
+import {
+  guardLeadLifetimeConversion,
+  isLeadLifetimeEvent,
+  LEAD_CONVERTED_BY_ANOTHER_SOURCE,
+  LEAD_CONVERTED_ON_ANOTHER_NUMBER,
+  type LeadConversionPipeline,
+} from "./lead-lifetime-conversion-guard";
+import {
   settleKommoSenderOutcome,
   KOMMO_DELIVERY_UNKNOWN,
   KOMMO_DELIVERY_UNKNOWN_MESSAGE,
@@ -43,9 +57,23 @@ import {
 } from "../inbound-webhooks/authorized-ctwa-destination";
 import { lockUnnichatMetaPolicy } from "../inbound-webhooks/inbound-webhook-effective-meta-routing";
 import { ConversionRecordError } from "./conversion-record.error";
+import {
+  MANUAL_CTWA_CONTEXT_INVALID,
+  manualCtwaConversionAuthorized,
+} from "../leads/manual-conversion-ctwa-policy";
+import {
+  MANUAL_CONVERSION_PROCESSING_MODE,
+  MANUAL_EXPIRED_MESSAGE,
+  MANUAL_META_WINDOW_MS,
+  manualDispatchingSince,
+} from "../leads/manual-conversion-payload";
 import { CTWA_SEND_SKIPPED_ERROR_CODE } from "./conversion-event-retry";
 import { providerAutomationManualReplayApproved } from "../conversion-rules/provider-manual-replay-approval";
-import { providerRuleCoversChannel } from "../conversion-rules/provider-rule-scope";
+import {
+  providerRuleCoversChannel,
+  providerRuleScope,
+  providerRuleSpansProviderConnections,
+} from "../conversion-rules/provider-rule-scope";
 import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { Prisma } from "@prisma/client";
@@ -71,6 +99,15 @@ import type {
 import { PrismaService } from "../common/prisma/prisma.service";
 import { loadWorkspaceConversionCurrency } from "../currency/workspace-currency";
 import { MetaTokenEncryptionService } from "../integrations/meta/meta-token-encryption.service";
+import { META_LEAD_FORM_CRM_TRIGGER } from "../meta-lead-forms/meta-crm-capi";
+import {
+  findLatestLeadFormSubmission,
+  previewLeadFormCrmStage,
+  recordLeadFormCrmConversion,
+  sendLeadFormCrmEvent,
+  type LeadFormCrmPreview,
+  type RecordLeadFormCrmResult,
+} from "../meta-lead-forms/meta-lead-form-crm-events";
 import {
   MetaConnectionResolverService,
   type ResolvedMetaCapiRoute,
@@ -80,6 +117,7 @@ import {
   preflightMetaCapiEvent,
   type MetaCapiSendEventErrorCode,
 } from "./meta-capi.adapter";
+import { metaCapiFirstNameEnabled } from "./meta-capi-first-name";
 import { LicenseClientService } from "../licensing-client/license-client.service";
 import { RUNTIME_ENV, type RuntimeEnv } from "../common/runtime/runtime.module";
 import { parseInboundWebhooksConfig } from "../config/deployment-config";
@@ -161,6 +199,13 @@ type ConversionEventPrismaClient = Pick<
 export type RecordExternalConversionInput = {
   /** CTWA lead with ctwa_clid and no known ad: the authorized page/pixel. */
   ctwaDestination?: AuthorizedCtwaDestination;
+  /**
+   * Apply Meta's seven-day event_time window to ad-attributed events too
+   * (CTWA destinations always apply it). Used by provider automations, whose
+   * callbacks may be replayed manually long after the original sale (porte
+   * do 75f6f4b3 do SaaS).
+   */
+  enforceMetaEventWindow?: boolean;
   workspaceId: string;
   externalConnectorId?: string | null;
   sourceEventId: string;
@@ -184,15 +229,51 @@ export type RecordExternalConversionInput = {
   valueSource?: ConversionValueSourceDto | null;
   currency?: string | null;
   contentName?: string | null;
+  /**
+   * Meta custom_data stored on the log (contents, num_items, order_id...).
+   * Only the Yampi sale passes it (real order lines, fase 6.7 / SaaS #188);
+   * every other writer keeps null and the payload builder adds the generic
+   * default item.
+   */
+  customData?: ConversionEventCustomDataDto | null;
   eventOccurredAt: Date;
   sourcePayload?: Record<string, unknown> | null;
   deliveryStatus?: "imported" | "not_eligible" | "shadow_observed";
+  /**
+   * With deliveryStatus "not_eligible": the reason recorded on the log (e.g.
+   * a manual conversion kept only in the panel). Never sent to Meta.
+   */
+  notEligibleReason?: { errorCode: string; errorMessage: string } | null;
+  /**
+   * Once-per-lead guard for writers outside the provider production job
+   * (CTWA entry LeadSubmitted, live and replay): see
+   * lead-lifetime-conversion-guard.ts. Ignored for other events.
+   */
+  leadLifetimeGuard?: {
+    channelId: string | null;
+    pipeline: LeadConversionPipeline;
+    /**
+     * The `client` passed is already an interactive transaction. When false
+     * the record (lock + check + write) runs in its own transaction, since
+     * the advisory lock only holds inside one.
+     */
+    inTransaction: boolean;
+  };
+  /**
+   * CTWA entry LeadSubmitted only: an active production provider rule with
+   * event LeadSubmitted covers this number (resolveLeadSubmittedRuleOverride),
+   * so the entry writes its receipt not_eligible (never sent) and the rule
+   * sends the LeadSubmitted when it triggers.
+   */
+  deferToProviderRule?: Pick<LeadSubmittedRuleOverride, "ruleIds"> | null;
 };
 
 export type RecordExternalConversionResult = {
   conversionEventLogId: string;
   status: "created" | "duplicate";
   deliveryStatus: string;
+  /** Set when the once-per-lead guard refused a new conversion. */
+  duplicateReasonCode?: string;
 };
 
 type InitialStatus = {
@@ -210,6 +291,11 @@ type InitialStatus = {
     | "EventValueMissing"
     | "UnsupportedConversionEventName"
     | "MetaEventTimeExpired"
+    | typeof LEAD_CONVERTED_ON_ANOTHER_NUMBER
+    | typeof LEAD_CONVERTED_BY_ANOTHER_SOURCE
+    | typeof LEAD_SUBMITTED_DEFERRED_TO_RULE
+    // Caller-provided not_eligible reason (notEligibleReason).
+    | (string & {})
     | null;
   errorMessage: string | null;
 };
@@ -223,6 +309,17 @@ type RecordAutomaticLeadSubmittedInput = {
   adId?: string;
   ctwaClid?: string;
   eventOccurredAt?: Date | string | null;
+  /**
+   * Uazapi BYO / WAHA bridge entry ("auto_lead") covered by an active production LeadSubmitted provider
+   * rule: the receipt is written not_eligible and the rule sends it.
+   */
+  deferToProviderRule?: {
+    ruleIds: string[];
+    /** Bridge provider of the number (nod: Uazapi BYO or WAHA). */
+    provider: "uazapi" | "waha";
+    channelId: string;
+    connectionId: string;
+  } | null;
 };
 
 export type SendManualTestEventInput = ConversionEventTestInputDto;
@@ -290,6 +387,8 @@ const CTWA_SEND_SKIP_REASONS: Record<string, string> = {
   ctwa_entry_not_in_production: "entrada CTWA anterior à ativação",
   pipedrive_ctwa_context_invalid: "contexto Pipedrive CTWA inválido",
   kommo_ctwa_context_invalid: "contexto Kommo CTWA inválido",
+  manual_ctwa_context_invalid:
+    "conversão manual sem entrada CTWA verificada ou sem registro de auditoria",
   ctwa_processing_mode_unsupported: "modo de processamento não suportado",
   ctwa_provider_conversion_with_ad: "conversão de provedor CTWA com anúncio",
   provider_conversion_production_disabled:
@@ -686,12 +785,21 @@ export class ConversionEventsService {
       return { created: [], duplicates: [existing.id] };
     }
 
-    const initialStatus = this.resolveInitialStatus({
-      eventName: "LeadSubmitted",
-      adId: input.adId,
-      ctwaClid: input.ctwaClid,
-      valueCents: null,
-    });
+    const deferred = input.deferToProviderRule?.ruleIds.length
+      ? input.deferToProviderRule
+      : null;
+    const initialStatus: InitialStatus = deferred
+      ? {
+          status: "not_eligible",
+          errorCode: LEAD_SUBMITTED_DEFERRED_TO_RULE,
+          errorMessage: LEAD_SUBMITTED_DEFERRED_TO_RULE_MESSAGE,
+        }
+      : this.resolveInitialStatus({
+          eventName: "LeadSubmitted",
+          adId: input.adId,
+          ctwaClid: input.ctwaClid,
+          valueCents: null,
+        });
     const eventOccurredAt = this.resolveEventOccurredAt(input.eventOccurredAt);
     const customerIdentityKey = this.resolveCustomerIdentityKey(
       input.phoneHash,
@@ -720,6 +828,16 @@ export class ConversionEventsService {
         currency: null,
         contentName: null,
         customData: Prisma.JsonNull,
+        ...(deferred
+          ? {
+              sourcePayload: {
+                provider: deferred.provider,
+                channelId: deferred.channelId,
+                connectionId: deferred.connectionId,
+                leadSubmittedDeferredToRuleIds: deferred.ruleIds,
+              },
+            }
+          : {}),
         errorCode: initialStatus.errorCode,
         errorMessage: initialStatus.errorMessage,
       },
@@ -731,6 +849,8 @@ export class ConversionEventsService {
   async recordExternalConversion(
     input: RecordExternalConversionInput,
     client: ConversionEventPrismaClient = this.prisma,
+    /** Internal: already inside the guard transaction opened below. */
+    insideGuardTransaction = false,
   ): Promise<RecordExternalConversionResult> {
     const existing = (await client.conversionEventLog.findUnique({
       where: { dedupeKey: input.dedupeKey },
@@ -739,7 +859,10 @@ export class ConversionEventsService {
     if (
       !existing &&
       input.ctwaDestination &&
-      input.eventName === "LeadSubmitted"
+      input.eventName === "LeadSubmitted" &&
+      // A manual LeadSubmitted (tarefa 21) is a NEW conversion of the lead,
+      // never a retry of its entry receipt (the entry may be deferred).
+      input.sourceTrigger !== MANUAL_CONVERSION_PROCESSING_MODE
     ) {
       // A retained legacy parser identity and the current per-click identity
       // must share the original canonical receipt, event ID and occurrence time.
@@ -790,6 +913,63 @@ export class ConversionEventsService {
       return this.reconcileExistingExternalConversion(existing, input, client);
     }
 
+    const guardDestinationId =
+      input.ctwaDestination?.destinationId ??
+      input.metaConversionDestinationId ??
+      null;
+    let lifetimeDuplicate: Awaited<
+      ReturnType<typeof guardLeadLifetimeConversion>
+    > = null;
+    if (
+      input.leadLifetimeGuard &&
+      input.leadId &&
+      guardDestinationId &&
+      isLeadLifetimeEvent(input.eventName)
+    ) {
+      // The identity lock only holds inside a transaction: open one when the
+      // caller did not (the whole record then commits under it).
+      if (!insideGuardTransaction && !input.leadLifetimeGuard.inTransaction) {
+        return this.prisma.$transaction((transaction) =>
+          this.recordExternalConversion(input, transaction, true),
+        );
+      }
+      // The lead already converted for this destination (another number or
+      // the other pipeline): the receipt below is STILL written, with the
+      // full attribution of this entry (channel, connection, ad, click,
+      // CTWA destination), because it is this number's proof of origin
+      // (resolveCtwaLeadProof) and its conversation in the reports. It is
+      // recorded not_eligible with the reason and is never sent to Meta.
+      lifetimeDuplicate = await guardLeadLifetimeConversion(
+        client as Prisma.TransactionClient,
+        {
+          workspaceId: input.workspaceId,
+          leadId: input.leadId,
+          eventName: input.eventName,
+          conversionDestinationId: guardDestinationId,
+          channelId: input.leadLifetimeGuard.channelId,
+          pipeline: input.leadLifetimeGuard.pipeline,
+          ownDedupeKey: input.dedupeKey,
+          includeAutoLead: leadSubmittedRuleOverrideEnabled(this.env),
+        },
+      );
+      // nod: a concurrent writer of the SAME record (same dedupeKey, e.g. the
+      // live entry and its replay) may have committed while this one waited
+      // for the identity lock. Reconcile with it here instead of hitting the
+      // unique index, which would abort this transaction (no "duplicate").
+      const committed = (await client.conversionEventLog.findUnique({
+        where: { dedupeKey: input.dedupeKey },
+      })) as ConversionEventLogRecord | null;
+      if (committed) {
+        if (committed.workspaceId !== input.workspaceId)
+          throw new ConversionRecordError("conversion_workspace_mismatch");
+        return this.reconcileExistingExternalConversion(
+          committed,
+          input,
+          client,
+        );
+      }
+    }
+
     // No ctwa_clid, no CTWA path: the page/pixel destination exists only for a
     // lead that carries the click id (the messaging pixel requires it).
     if (
@@ -805,8 +985,37 @@ export class ConversionEventsService {
         )))
     )
       throw new ConversionRecordError("ctwa_destination_not_authorized");
-
-    const initialStatus = this.resolveExternalInitialStatus(input);
+    // Order: once-per-lead duplicate, then deferral to the provider rule,
+    // then the regular status. Both refusals keep the full attribution row.
+    const deferredToRule =
+      !lifetimeDuplicate &&
+      input.eventName === "LeadSubmitted" &&
+      input.deferToProviderRule?.ruleIds.length
+        ? input.deferToProviderRule
+        : null;
+    const initialStatus: InitialStatus = lifetimeDuplicate
+      ? {
+          status: "not_eligible",
+          errorCode: lifetimeDuplicate.reasonCode,
+          // Shown as is on the Eventos Meta audit page.
+          errorMessage:
+            lifetimeDuplicate.reasonCode === LEAD_CONVERTED_ON_ANOTHER_NUMBER
+              ? "Lead já convertido por outro número para este pixel: entrada registrada como origem, não enviada à Meta"
+              : "Lead já convertido por outra regra ou pela entrada do anúncio para este pixel: registrado como origem, não enviado à Meta",
+        }
+      : deferredToRule
+        ? {
+            status: "not_eligible",
+            errorCode: LEAD_SUBMITTED_DEFERRED_TO_RULE,
+            errorMessage: LEAD_SUBMITTED_DEFERRED_TO_RULE_MESSAGE,
+          }
+        : this.resolveExternalInitialStatus(input);
+    const sourcePayload = deferredToRule
+      ? {
+          ...input.sourcePayload,
+          leadSubmittedDeferredToRuleIds: deferredToRule.ruleIds,
+        }
+      : input.sourcePayload;
     const purchaseKind = await this.resolvePurchaseKind(
       {
         workspaceId: input.workspaceId,
@@ -878,18 +1087,30 @@ export class ConversionEventsService {
           contentName: input.contentName ?? null,
           sourcePayload: input.ctwaDestination
             ? ({
-                ...input.sourcePayload,
+                ...sourcePayload,
                 ctwaDestination: input.ctwaDestination,
               } as Prisma.InputJsonValue)
-            : input.sourcePayload
-              ? (input.sourcePayload as Prisma.InputJsonValue)
+            : sourcePayload
+              ? (sourcePayload as Prisma.InputJsonValue)
               : Prisma.JsonNull,
-          customData: Prisma.JsonNull,
+          customData: input.customData
+            ? (input.customData as Prisma.InputJsonValue)
+            : Prisma.JsonNull,
           errorCode: initialStatus.errorCode,
           errorMessage: initialStatus.errorMessage,
         },
       });
 
+      if (lifetimeDuplicate) {
+        // Callers map "duplicate" to a duplicate production/replay item that
+        // points to THIS receipt (its own proof of origin), never queued.
+        return {
+          conversionEventLogId: log.id,
+          status: "duplicate",
+          deliveryStatus: log.status,
+          duplicateReasonCode: lifetimeDuplicate.reasonCode,
+        };
+      }
       return {
         conversionEventLogId: log.id,
         status: "created",
@@ -923,8 +1144,17 @@ export class ConversionEventsService {
   ): Promise<RecordExternalConversionResult> {
     const promotesHistoricalEvent =
       existing.status === "imported" && input.deliveryStatus !== "imported";
+    // Any other existing receipt keeps its status (idempotent retries: a
+    // deferred receipt stays deferred, a sent one is never re-deferred).
     const promotedStatus: InitialStatus | null = promotesHistoricalEvent
-      ? this.resolveExternalInitialStatus(input)
+      ? input.eventName === "LeadSubmitted" &&
+        input.deferToProviderRule?.ruleIds.length
+        ? {
+            status: "not_eligible",
+            errorCode: LEAD_SUBMITTED_DEFERRED_TO_RULE,
+            errorMessage: LEAD_SUBMITTED_DEFERRED_TO_RULE_MESSAGE,
+          }
+        : this.resolveExternalInitialStatus(input)
       : null;
     const businessSource =
       existing.businessSource === "paid" || input.businessSource !== "paid"
@@ -1306,6 +1536,7 @@ export class ConversionEventsService {
       eventName: log.eventName,
       dedupeKey: eventId,
       phoneHash: log.phoneHash,
+      leadName: await this.leadNameForCapi(log),
       adId: log.adId,
       ctwaClid: log.ctwaClid,
       valueCents: log.valueCents,
@@ -1493,6 +1724,52 @@ export class ConversionEventsService {
     };
   }
 
+  /**
+   * Fase 6.9 (PR #91 do nod): CRM stage of the lead's latest Meta instant-form
+   * submission, recorded when the lead is qualified by the manual conversion
+   * (#158) or the CRM Kanban (#176). Null when the lead (or another Lead row
+   * of the same phone) has no form submission read on the Graph.
+   */
+  async recordLeadFormCrmStage(input: {
+    workspaceId: string;
+    leadId: string;
+    leadIds?: string[];
+    phoneHash: string;
+    actorUserId: string;
+    qualifiedAt?: Date;
+    originConversionEventLogId?: string | null;
+  }): Promise<RecordLeadFormCrmResult | null> {
+    const submission = await findLatestLeadFormSubmission(
+      this.prisma,
+      input.workspaceId,
+      input.leadIds?.length ? input.leadIds : [input.leadId],
+    );
+    if (!submission) return null;
+    return recordLeadFormCrmConversion(this.prisma, {
+      workspaceId: input.workspaceId,
+      leadId: input.leadId,
+      phoneHash: input.phoneHash,
+      customerIdentityKey: this.resolveCustomerIdentityKey(input.phoneHash),
+      submission,
+      actorUserId: input.actorUserId,
+      qualifiedAt: input.qualifiedAt ?? new Date(),
+      originConversionEventLogId: input.originConversionEventLogId ?? null,
+    });
+  }
+
+  /** Read-only side of recordLeadFormCrmStage (confirmation step). */
+  async previewLeadFormCrmStage(
+    workspaceId: string,
+    leadIds: string[],
+  ): Promise<LeadFormCrmPreview | null> {
+    const submission = await findLatestLeadFormSubmission(
+      this.prisma,
+      workspaceId,
+      leadIds,
+    );
+    return submission ? previewLeadFormCrmStage(this.prisma, submission) : null;
+  }
+
   async sendReadyEvent(
     logId: string,
     options: SendReadyEventOptions = {},
@@ -1555,6 +1832,20 @@ export class ConversionEventsService {
       };
     }
 
+    // Fase 6.9 (PR #91 do nod): CRM stage of a Meta instant form. Its own
+    // dataset and token, never the messaging route nor the CAPI batch.
+    if (log.sourceTrigger === META_LEAD_FORM_CRM_TRIGGER)
+      return sendLeadFormCrmEvent(
+        {
+          prisma: this.prisma,
+          decrypt: (token) => this.metaTokenEncryption.decrypt(token),
+          graphVersion: this.env.META_GRAPH_API_VERSION ?? "v21.0",
+        },
+        log,
+        eventId,
+        { testEventCode: options.testEventCode ?? null },
+      );
+
     if (!(await this.externalCapiDeliveryOwnedByWppTrack(log))) {
       await this.prisma.conversionEventLog.updateMany({
         where: { id: log.id, status: "ready_to_send" },
@@ -1565,6 +1856,28 @@ export class ConversionEventsService {
         },
       });
 
+      return {
+        conversionEventLogId: log.id,
+        workspaceId: log.workspaceId,
+        status: "skipped",
+      };
+    }
+
+    // Porte do SaaS #158: a manual conversion registered close to Meta's
+    // 7-day limit may pass it while queued: kept in the panel as "Expirou
+    // antes do envio".
+    if (
+      log.sourceTrigger === MANUAL_CONVERSION_PROCESSING_MODE &&
+      Date.now() - log.eventOccurredAt.getTime() > MANUAL_META_WINDOW_MS
+    ) {
+      await this.prisma.conversionEventLog.updateMany({
+        where: { id: log.id, status: "ready_to_send" },
+        data: {
+          status: "not_eligible",
+          errorCode: "MetaEventTimeExpired",
+          errorMessage: MANUAL_EXPIRED_MESSAGE,
+        },
+      });
       return {
         conversionEventLogId: log.id,
         workspaceId: log.workspaceId,
@@ -1639,6 +1952,26 @@ export class ConversionEventsService {
       }
     }
 
+    // Tarefa 21: a manual conversion can be canceled while not sent. Claim it
+    // (ready_to_send -> dispatching) before any Meta effect so a cancel and
+    // this send never both win; the delivery update below sets the outcome.
+    if (log.sourceTrigger === MANUAL_CONVERSION_PROCESSING_MODE) {
+      const claimed = await this.prisma.conversionEventLog.updateMany({
+        where: { id: log.id, status: "ready_to_send", eventId: log.eventId },
+        data: {
+          status: "dispatching",
+          errorCode: "MetaCapiDeliveryUnknown",
+          // Read by the stuck-dispatch recovery (no updatedAt column).
+          errorMessage: manualDispatchingSince(new Date()),
+        },
+      });
+      if (claimed.count !== 1)
+        return {
+          conversionEventLogId: log.id,
+          workspaceId: log.workspaceId,
+          status: "skipped",
+        };
+    }
     const startedAt = new Date();
     const resolvedDestination = await this.resolveDeliveryRoute(log);
     if (
@@ -1664,6 +1997,7 @@ export class ConversionEventsService {
       eventName: log.eventName,
       dedupeKey: eventId,
       phoneHash: log.phoneHash,
+      leadName: await this.leadNameForCapi(log),
       adId: log.adId,
       ctwaClid: log.ctwaClid,
       valueCents: log.valueCents,
@@ -2347,6 +2681,12 @@ export class ConversionEventsService {
       return (await kommoCtwaConversionAuthorized(tx, log, intent))
         ? null
         : "kommo_ctwa_context_invalid";
+    // Tarefa 21: manual lead conversion to the lead's verified CTWA entry
+    // destination (proof re-read here + the owner/admin audit record).
+    if (p.processingMode === MANUAL_CONVERSION_PROCESSING_MODE)
+      return (await manualCtwaConversionAuthorized(tx, log, intent))
+        ? null
+        : MANUAL_CTWA_CONTEXT_INVALID;
     if (p.processingMode !== "frozen_provider_conversion")
       return "ctwa_processing_mode_unsupported";
     if (log.adId) return "ctwa_provider_conversion_with_ad";
@@ -2364,7 +2704,19 @@ export class ConversionEventsService {
       },
       include: {
         sourceDelivery: true,
-        channel: { include: { connection: { select: { provider: true } } } },
+        channel: {
+          include: {
+            connection: {
+              select: {
+                provider: true,
+                // Gate of Umbler/Unnichat rules for all numbers.
+                status: true,
+                removedAt: true,
+                parserRelease: { select: { status: true } },
+              },
+            },
+          },
+        },
         providerRule: {
           include: {
             conversionRule: true,
@@ -2376,17 +2728,26 @@ export class ConversionEventsService {
       },
     });
     if (!e || !e.channel) return "provider_conversion_execution_not_materialized";
-    // CTWA (no-ad) dispatch exists only for endpoint automations, which always
-    // keep their connection binding.
+    // 21/10/2026: an Umbler/Unnichat rule for ALL numbers stores its
+    // callbacks on its own (anchor) connection while the number may be on
+    // another connection of the provider: the origin is the number's channel
+    // and its own connection is the production gate.
+    const spansConnections =
+      providerRuleScope(e.providerRule) === "all_numbers" &&
+      providerRuleSpansProviderConnections(e.providerRule);
+    // CTWA (no-ad) dispatch exists only for endpoint automations (Payt,
+    // Unnichat, Umbler), which always keep their connection binding.
     if (!e.providerRule.connection || !e.providerRule.parserRelease)
       return "provider_conversion_origin_mismatch";
-    // A sale callback (Payt, Fase 4a) sits on its rule's endpoint (any
+    // A sale callback (Payt, Fase 4a; Braip, 6.5) sits on its rule's endpoint (any
     // WhatsApp connection of the workspace); its origin is the scoped channel,
     // which must belong to the connection of the verified CTWA entry, and the
     // event must be the durable winner of that sale.
     const paytPurchase =
-      String(e.providerRule.parserRelease.provider) === "payt" &&
-      e.providerRule.parserRelease.version === "automation-v1" &&
+      salesPlatformOf({
+        provider: String(e.providerRule.parserRelease.provider),
+        version: e.providerRule.parserRelease.version,
+      }) !== null &&
       ["Purchase", "InitiateCheckout", "CartAbandoned"].includes(
         log.eventName,
       );
@@ -2407,6 +2768,12 @@ export class ConversionEventsService {
         }))
       )
         return "provider_purchase_claim_missing";
+    } else if (spansConnections) {
+      if (
+        e.channel.connectionId !== intent.connectionId ||
+        e.sourceDelivery.connectionId !== e.providerRule.connectionId
+      )
+        return "provider_conversion_origin_mismatch";
     } else if (
       e.providerRule.connectionId !== intent.connectionId ||
       e.sourceDelivery.connectionId !== intent.connectionId
@@ -2420,11 +2787,15 @@ export class ConversionEventsService {
       !e.providerRule.productionActivatedAt
     )
       return "provider_rule_not_in_production";
+    const gate = spansConnections
+      ? e.channel.connection
+      : e.providerRule.connection;
     if (
       e.providerRule.parserRelease.status !== "certified" ||
-      e.providerRule.connection.removedAt ||
-      e.providerRule.connection.status !== "production" ||
-      e.providerRule.connection.parserRelease.status !== "certified"
+      !gate ||
+      gate.removedAt ||
+      gate.status !== "production" ||
+      gate.parserRelease?.status !== "certified"
     )
       return "provider_connection_not_certified";
     if (
@@ -2460,6 +2831,31 @@ export class ConversionEventsService {
    * ready_to_send (nothing reached Meta) but never silently: the reason is
    * persisted so the audit shows it and the owner can requeue the event.
    */
+  /**
+   * Nome do lead para o `fn` da CAPI (porte do #179/#180 do SaaS; o adapter
+   * normaliza, filtra e aplica o hash, e só envia com
+   * META_CAPI_SEND_FIRST_NAME ligado). Enriquecimento opcional: qualquer falha
+   * na leitura envia sem `fn`, nunca bloqueia o envio nem altera
+   * event_id/deduplicação.
+   */
+  private async leadNameForCapi(log: {
+    leadId?: string | null;
+    workspaceId?: string | null;
+  }): Promise<string | null> {
+    // Desligado (padrão): nem consulta o lead. Mesmo env do MetaCapiAdapter.
+    if (!metaCapiFirstNameEnabled(process.env)) return null;
+    if (!log.leadId || !log.workspaceId) return null;
+    try {
+      const lead = await this.prisma.lead.findFirst({
+        where: { id: log.leadId, workspaceId: log.workspaceId },
+        select: { name: true },
+      });
+      return lead?.name ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   private async recordCtwaSendSkip(
     log: ConversionEventLogRecord,
     reason: string,
@@ -2521,7 +2917,13 @@ export class ConversionEventsService {
           status: "ready_to_send",
           eventId: log.eventId,
         },
-        data: { status: "dispatching", errorCode: "MetaCapiDeliveryUnknown" },
+        data: {
+          status: "dispatching",
+          errorCode: "MetaCapiDeliveryUnknown",
+          ...(log.sourceTrigger === MANUAL_CONVERSION_PROCESSING_MODE
+            ? { errorMessage: manualDispatchingSince(new Date()) }
+            : {}),
+        },
       });
       // count 0: another sender already moved it out of ready_to_send.
       return { claimed: receipt.count === 1, denial: null };
@@ -2529,6 +2931,7 @@ export class ConversionEventsService {
     if (claim.denial) return this.recordCtwaSendSkip(log, claim.denial);
     if (!claim.claimed) return skipped;
     const startedAt = new Date();
+    const leadName = await this.leadNameForCapi(log);
     const started = await this.prisma.$transaction(async (tx) => {
       await lockUnnichatMetaPolicy(tx, intent.workspaceId);
       const current = await tx.conversionEventLog.findFirst({
@@ -2569,6 +2972,7 @@ export class ConversionEventsService {
           eventName: log.eventName,
           dedupeKey: log.eventId!,
           phoneHash: log.phoneHash,
+          leadName,
           // Optional enrichment only: a non-numeric ad hint is never sent.
           adId: log.adId && /^\d{1,32}$/u.test(log.adId) ? log.adId : null,
           ctwaClid: log.ctwaClid,
@@ -3166,6 +3570,12 @@ export class ConversionEventsService {
         errorMessage: null,
       };
     }
+    if (input.deliveryStatus === "not_eligible" && input.notEligibleReason)
+      return {
+        status: "not_eligible",
+        errorCode: input.notEligibleReason.errorCode,
+        errorMessage: input.notEligibleReason.errorMessage,
+      };
 
     if (
       input.ctwaDestination &&
@@ -3178,6 +3588,19 @@ export class ConversionEventsService {
         errorCode: "MetaEventTimeExpired",
         errorMessage:
           "Local CTWA lead retained; original event time is outside Meta's seven day window",
+      };
+    // Ad-attributed provider events: only the age is checked here (a small
+    // provider clock skew into the future must not drop a live sale).
+    if (
+      input.enforceMetaEventWindow &&
+      (!Number.isFinite(input.eventOccurredAt.getTime()) ||
+        Date.now() - input.eventOccurredAt.getTime() > 7 * 86400000)
+    )
+      return {
+        status: "not_eligible",
+        errorCode: "MetaEventTimeExpired",
+        errorMessage:
+          "Conversion retained locally; original event time is outside Meta's seven day window",
       };
     const resolved = this.resolveInitialStatus({
       eventName: input.eventName,

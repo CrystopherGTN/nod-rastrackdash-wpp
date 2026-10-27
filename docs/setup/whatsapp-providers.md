@@ -16,7 +16,7 @@ qualquer provedor.
 | Modelo | Onde se cria | Escopo | Providers |
 |---|---|---|---|
 | **Conexão de provedor + receiver** (`WhatsappInstance`) | `/integrations` → aba **WhatsApp** → card do provedor (Uazapi e WAHA; Z-API e NOD API aparecem como "Em breve" — conexões já existentes continuam gerenciáveis) | **Por workspace, quantas você quiser** | `uazapi_byo`, `nod_api`, `waha`, `zapi` |
-| **Conexão de webhook de entrada** (`InboundWebhookConnection`) | `/integrations` → aba **Atendimento e vendas** → card Umbler Talk / Gupshup / Data Crazy / Unnichat; aba **WhatsApp** → card **WhatsApp Cloud API** (Meta) | **Por workspace, quantas você quiser** | `umbler`, `gupshup`, `data_crazy`, `unnichat` (conexão presa ao número; [`unnichat.md`](unnichat.md)), `meta_cloud` (self-service); `uazapi` só automático (ver abaixo) |
+| **Conexão de webhook de entrada** (`InboundWebhookConnection`) | `/integrations` → aba **Atendimento e vendas** → card Umbler Talk / Gupshup / Data Crazy / Unnichat; aba **WhatsApp** → card **WhatsApp Cloud API** (Meta) e card **ROI Chat** | **Por workspace, quantas você quiser** | `umbler`, `gupshup`, `data_crazy`, `unnichat` (conexão presa ao número; [`unnichat.md`](unnichat.md)), `roichat` (Fase 6.8, conexão presa ao número; a mesma URL recebe entrada e compra; [`roichat.md`](roichat.md)), `meta_cloud` (self-service); `uazapi` só automático (ver abaixo) |
 | **Meta Ads (conta de anúncios)** | `/integrations` → aba **Anúncios** → card **Meta Ads** (login social ou token; não recebe conversas) | Por workspace | `meta` — token de usuário do sistema, veja [`meta-manual.md`](meta-manual.md) |
 
 Os dois primeiros modelos entregam **mensagens**. O terceiro entrega
@@ -98,7 +98,7 @@ Em `/integrations`, aba **WhatsApp**, clique no card do provedor (Uazapi ou WAHA
 | `POST /webhooks/whatsapp/:id` — **WAHA** (motor GoWS) | Idem (a configuração automática manda o token no cabeçalho `X-Wpptrack-Webhook-Token`) | `session` do envelope precisa ser **exatamente** a Sessão salva na conexão | **Pronto** — parser `waha` v2 (GoWS) enquanto a release certificada existir; veja [WAHA com motor GoWS](#waha-com-motor-gows-waha-servidor-do-aluno). Liberada no Hub, com regras de frase da equipe em Conversões |
 | `POST /webhooks/whatsapp/:id` — **Z-API** | Idem | `body.instanceId` precisa ser **exatamente** o Instance ID salvo | **Em breve** — o parser ainda não lê o payload real da Z-API; não use para receber leads |
 | `POST /webhooks/whatsapp/:id` — **NOD API** | Idem | — | **Ainda não existe** — a rota responde `501` ("Receiver inbound para nod_api ainda nao esta disponivel"). Em breve no Hub: só para conexões já existentes |
-| `POST /webhooks/inbound/:id?token=` — **Umbler / Gupshup / Data Crazy / Unnichat** | `?token=` comparado ao `secretHash` da conexão (rotacionável) | — | **Pronto** |
+| `POST /webhooks/inbound/:id?token=` — **Umbler / Gupshup / Data Crazy / Unnichat / ROI Chat** | `?token=` comparado ao `secretHash` da conexão (rotacionável) | — | **Pronto** |
 | `POST /webhooks/inbound/:id` — **Meta WhatsApp (Cloud API)** | `x-hub-signature-256` via `META_APP_SECRET`; **sem** `META_APP_SECRET`, só é aceito enquanto a conexão está em **observação** | — | **Pronto (CTWA)** — veja a seção Meta Cloud |
 | `GET /webhooks/inbound/:id` — handshake Meta Cloud | `hub.verify_token` comparado ao **Verify token** daquela conexão | `hub.mode=subscribe` | **Pronto** |
 | `POST /webhooks/uazapi` e `POST /webhooks/uazapi/instances/:id` (legado) | Env global `UAZAPI_WEBHOOK_AUTH_TOKEN` / hash por instância | Exigem uma linha `WhatsappInstance` com `provider = "uazapi"` (valor legado) — **o painel novo grava `uazapi_byo`**, então essas rotas não enxergam as conexões criadas pela UI | **Legado — use o receiver por conexão acima** |
@@ -342,15 +342,16 @@ local com fixtures; nenhum envio Meta real foi feito nesta entrega.
 permanente do Graph usado em [`meta-manual.md`](meta-manual.md)) faz a API
 validar o header `x-hub-signature-256` de cada POST.
 
-| `META_APP_SECRET` | Conexão em **observação** | Conexão em **produção** (envio automático) |
+| `META_APP_SECRET` | Conexão com o **envio desligado** | Conexão em **produção** (envio automático) |
 |---|---|---|
 | Preenchido | POST aceito só com assinatura válida | POST aceito só com assinatura válida |
 | Vazio | POST aceito (a API registra o aviso `meta_cloud_signature_unverified`) | **POST recusado com `404`** |
 
-Ou seja: dá para homologar sem ele, mas **antes de clicar em "Ativar
-envios automáticos" numa conexão `meta_cloud`, preencha
-`META_APP_SECRET` do próprio app e reinicie a API**. A ativação e a
-autorização de recuperação são bloqueadas enquanto estiver vazio. Uma
+Ou seja: **preencha `META_APP_SECRET` do próprio app e reinicie a API
+antes de criar a conexão `meta_cloud`**. Produção direta (Fase 6.1c): com o
+segredo, a conexão já nasce enviando; sem ele, nasce com o envio desligado
+(para não recusar as entregas da Meta) e a ativação e a autorização de
+recuperação ficam bloqueadas até o segredo existir. Uma
 conexão em produção continua recusando POSTs sem assinatura válida. Nunca
 use o segredo PalmUP nem envie o valor por chat.
 
@@ -376,10 +377,10 @@ credencial ou variável de ambiente própria neste template.
    provedor não fazem parte do parser Data Crazy v1.
 6. O parser **Data Crazy v1** já vem certificado pela migration
    `20261016090300_validated_parser_certification` (contrato validado com
-   CTWAs reais no SaaS). Após uma entrega CTWA real ser processada em
-   observação, configure a rota Meta do canal e ative a conexão em
-   produção, no mesmo gate usado por Gupshup e Meta Cloud; cada regra
-   continua precisando da própria ativação.
+   CTWAs reais no SaaS). Produção direta (Fase 6.1c): a conexão nasce em
+   produção, o canal já envia quando aparece e cada regra nasce enviando.
+   Configure a rota Meta do canal: sem rota, nada é enviado e a prontidão
+   do número diz o que falta.
 
 ## Umbler Talk e Gupshup — conexão de webhook de entrada
 
@@ -399,11 +400,11 @@ credencial ou variável de ambiente própria neste template.
    devem converter.
 5. Os parsers **Umbler v1** e **Gupshup v1** (mensagens) já vêm
    certificados pela migration `20261016090300_validated_parser_certification`
-   (os mesmos contratos em produção no SaaS). Isso só os torna elegíveis:
-   a conexão e cada regra continuam em observação até você ativar a
-   produção, uma a uma. A certificação também permite autorizar o
+   (os mesmos contratos em produção no SaaS). Produção direta (Fase 6.1c):
+   a conexão nasce em produção, cada número já envia e cada regra nasce
+   enviando; a rota Meta de cada número continua obrigatória para enviar. A certificação também permite autorizar o
    **replay controlado** de uma conexão Umbler, Gupshup ou Data Crazy
-   ainda em observação (antes ele pedia o parser certificado).
+   com o envio desligado (antes ele pedia o parser certificado).
 
 Umbler Talk entrega também as mensagens do atendente, então regras de
 frase com autor "equipe" funcionam. Gupshup entrega apenas o que o

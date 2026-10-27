@@ -11,6 +11,7 @@ import {
   reprocessProviderConversionAutomationCallbacksAction,
   rotateProviderConversionRuleEndpointAction,
   testProviderCatalogMessageAction,
+  removeConversionRulesAction,
   unifyConversionRulesAction,
   updateLegacyRuleAction,
   updateProviderConversionRuleAction,
@@ -27,6 +28,7 @@ import { ConversionsScreen } from "./conversions-screen";
 import { WorkspaceCurrencyProvider } from "../../../components/workspace-currency";
 import {
   ensureIntegrationEndpointAction,
+  loadIntegrationEventPayloadAction,
   removeIntegrationEndpointAction,
   retryIntegrationEventAction,
   revealIntegrationEndpointAction,
@@ -65,6 +67,9 @@ export default async function ConversionsPage({
     numbers: data.numbers,
     connections: data.connections,
     capabilities: data.capabilities,
+    // Porte do SaaS #164: um /channels que falhou nunca esconde as
+    // plataformas de venda (Payt, Braip, Yampi).
+    numbersPartial: data.numbersPartial,
     crm: {
       kommo: data.crmVisible && data.kommo.length > 0,
       pipedrive: data.crmVisible && data.pipedrive.length > 0,
@@ -106,6 +111,7 @@ export default async function ConversionsPage({
         createAction={createConversionRuleAction}
         confirmCreateAction={confirmConversionRuleCreateAction}
         unifyAction={unifyConversionRulesAction}
+        bulkRemoveAction={removeConversionRulesAction}
         providerRules={data.providerRules}
         legacyRules={data.legacyRules}
         legacyRulesState={data.legacyRulesState}
@@ -132,6 +138,10 @@ export default async function ConversionsPage({
                 endpoints: singleUrlData.endpoints.endpoints,
                 paytProducts: singleUrlData.paytProducts,
                 paytUnattributed: singleUrlData.unattributed.payt,
+                braipProducts: singleUrlData.braipProducts,
+                braipUnattributed: singleUrlData.unattributed.braip,
+                yampiProducts: singleUrlData.yampiProducts,
+                yampiUnattributed: singleUrlData.unattributed.yampi,
                 actions: {
                   ensure: ensureIntegrationEndpointAction,
                   reveal: revealIntegrationEndpointAction,
@@ -139,6 +149,7 @@ export default async function ConversionsPage({
                   remove: removeIntegrationEndpointAction,
                   retry: retryIntegrationEventAction,
                   setPublicUrl: setRulePublicUrlAction,
+                  loadPayload: loadIntegrationEventPayloadAction,
                 },
               }
             : undefined

@@ -72,10 +72,15 @@ export function ruleEditCapabilities(
       carriesValue &&
       (origin === "whatsapp_label" ||
         origin === "automation_umbler" ||
-        origin === "automation_unnichat"),
+        origin === "automation_unnichat" ||
+        // Fase 6.8: ROI Chat, valor de reserva opcional (a compra traz o valor).
+        origin === "automation_roichat"),
     currency: carriesValue && origin !== "structured_catalog",
     catalogAliases: origin === "structured_catalog" && Boolean(rule.catalog),
-    productFilter: origin === "automation_payt",
+    productFilter:
+      origin === "automation_payt" ||
+      origin === "automation_braip" ||
+      origin === "automation_yampi",
   };
 }
 
@@ -109,6 +114,7 @@ export function ruleEditDraft(
     scope: rule.scope ?? "specific_numbers",
     channelIds: [...rule.channelIds],
     connectionId: rule.connectionId,
+    crossConnection: rule.crossConnectionScope === true,
     name: rule.conversionRule.name,
     primaryPhrase: labels ? "" : primaryPhrase,
     variationPhrases: labels ? "" : variations.join("\n"),
@@ -222,11 +228,23 @@ export function buildRuleUpdatePayload(
   const scopeChanged = draft.scope !== currentScope;
   const numbersChanged =
     draft.scope === "specific_numbers" && !sameSet(draft.channelIds, rule.channelIds);
-  if (scopeChanged || numbersChanged) {
+  // Umbler/Unnichat: "Ampliar para todas as conexões" (or back to the
+  // rule's connection only).
+  const automation =
+    draft.origin === "automation_unnichat" ||
+    draft.origin === "automation_umbler" ||
+    draft.origin === "automation_roichat";
+  const crossChanged =
+    automation &&
+    draft.scope === "all_numbers" &&
+    draft.crossConnection !== (rule.crossConnectionScope === true);
+  if (scopeChanged || numbersChanged || crossChanged) {
     const issue = scopeIssue(draft, context);
     if (issue) return { ok: false, message: issue };
     if (draft.scope === "all_numbers") {
-      payload.scope = "all_numbers";
+      if (scopeChanged) payload.scope = "all_numbers";
+      if (automation && (crossChanged || scopeChanged))
+        payload.crossConnectionScope = draft.crossConnection;
     } else {
       if (scopeChanged) payload.scope = "specific_numbers";
       payload.channelIds = [...draft.channelIds];
@@ -262,7 +280,12 @@ export function buildRuleUpdatePayload(
   }
 
   if (capabilities.value) {
-    const values = valueChanges(rule, draft, false);
+    // ROI Chat: the rule value is only a fallback (optional, removable).
+    const values = valueChanges(
+      rule,
+      draft,
+      draft.origin === "automation_roichat",
+    );
     if (!values.ok) return values;
     Object.assign(payload, values.value);
   }

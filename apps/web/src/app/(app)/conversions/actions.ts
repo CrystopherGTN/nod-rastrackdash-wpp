@@ -9,6 +9,8 @@ import {
   providerConversionRuleAdaptInputSchema,
   providerConversionRuleBlockedReprocessResultSchema,
   providerConversionRuleExecutionAuditSchema,
+  providerConversionRuleBulkRemoveInputSchema,
+  providerConversionRuleBulkRemoveResultSchema,
   providerConversionRuleIdempotentCreateInputSchema,
   providerConversionRuleIdempotentCreateResultSchema,
   providerConversionRuleNumberActivationResultSchema,
@@ -25,6 +27,7 @@ import {
   type ProviderConversionAutomationReprocessBatchResultDto,
   type ProviderConversionRuleBlockedReprocessResultDto,
   type ProviderConversionRuleExecutionAuditDto,
+  type ProviderConversionRuleBulkRemoveResultDto,
   type ProviderConversionRulePendingNumberDto,
   type ProviderConversionRulePendingNumberReasonDto,
   type StructuredCatalogTestMessageResultDto,
@@ -70,6 +73,8 @@ export type ConversionScreenActionResult = {
   };
   /** "Reprocessar bloqueadas": contagens da rodada. */
   reprocess?: ProviderConversionRuleBlockedReprocessResultDto;
+  /** "Excluir selecionadas": what happened to each rule. */
+  bulkRemove?: ProviderConversionRuleBulkRemoveResultDto;
   unify?: {
     outcome: "created" | "reused_existing" | "replayed";
     ruleId: string;
@@ -188,6 +193,10 @@ const curatedMessages: Readonly<Record<string, string>> = {
     "O teste de pedido só existe para regras de catálogo.",
   "A Payt envia compra aprovada, Pix/boleto gerado ou carrinho abandonado":
     "A Payt envia compra aprovada, Pix/boleto gerado ou carrinho abandonado.",
+  "A Braip envia compra aprovada, Pix/boleto gerado ou carrinho abandonado":
+    "A Braip envia compra aprovada, boleto/Pix gerado ou checkout abandonado.",
+  "A Yampi envia compra aprovada, Pix/boleto gerado ou carrinho abandonado":
+    "A Yampi envia pedido pago, pedido aguardando pagamento (boleto/Pix) ou carrinho abandonado.",
   "Escolha a conexao de WhatsApp dos numeros desta regra":
     "Escolha números de uma conexão de WhatsApp para esta regra.",
   "Configure a Meta deste número (página e pixel do workspace ou rotas próprias) antes de ativar o canal":
@@ -342,9 +351,10 @@ export async function createConversionRuleAction(
       ruleMode: result.data.rule.mode,
       pendingNumbers: result.data.rule.pendingNumbers ?? [],
       ...(result.data.webhookUrl ? { webhookUrl: result.data.webhookUrl } : {}),
-      message: result.data.webhookUrl
-        ? "Regra criada em observação. Copie o endereço agora: ele não é exibido de novo."
-        : "Regra criada em observação. Nada é enviado à Meta até você ativar o envio automático.",
+      message: createdRuleMessage(
+        result.data.rule.mode,
+        Boolean(result.data.webhookUrl),
+      ),
     };
   } catch (error) {
     const message = (error as Error | null)?.message?.trim() ?? "";
@@ -438,10 +448,13 @@ export async function unifyConversionRulesAction(
   const input = providerConversionRuleUnifyInputSchema.safeParse({
     ruleIds: formData.getAll("ruleId").filter((id) => typeof id === "string"),
     ...(formText(formData, "name") ? { name: formText(formData, "name") } : {}),
+    ...(formText(formData, "acknowledgeDifferences") === "true"
+      ? { acknowledgeDifferences: true }
+      : {}),
   });
 
   if (!input.success) {
-    return { ok: false, message: "Escolha ao menos duas regras iguais." };
+    return { ok: false, message: "Escolha as regras iguais que quer unificar." };
   }
 
   try {
@@ -457,11 +470,16 @@ export async function unifyConversionRulesAction(
 
     revalidateRules();
     const { outcome, rule } = result.data;
+    const automation =
+      rule.origin === "automation_unnichat" ||
+      rule.origin === "automation_umbler";
     return {
       ok: true,
       ruleId: rule.id,
       message:
-        outcome === "created"
+        automation && outcome !== "replayed"
+          ? `Pronto: agora uma regra vale para todos os números ${rule.origin === "automation_umbler" ? "da Umbler" : "do Unnichat"}, de todas as conexões. As URLs antigas continuam funcionando e entregam nesta regra; quando puder, troque-as pela URL do evento.`
+          : outcome === "created"
           ? "Pronto: agora uma regra vale para todos os números. As regras antigas foram pausadas e o histórico delas continua salvo. Dá para voltar atrás: retome as regras pausadas e pause a regra para todos os números."
           : outcome === "reused_existing"
             ? "Já existia uma regra igual para todos os números. As regras por número foram pausadas e ela segue valendo."
@@ -476,7 +494,71 @@ export async function unifyConversionRulesAction(
       },
     };
   } catch (error) {
+    if (apiStatus(error) === 409 && apiCode(error) === "provider_rule_unify_differences") {
+      return {
+        ok: false,
+        message:
+          "As regras têm valores ou modos diferentes. Confira quais vão valer e confirme antes de unificar.",
+      };
+    }
     return failure(error, "Não foi possível unificar as regras.", unifyUnknownMessage);
+  }
+}
+
+const bulkRemoveUnknownMessage =
+  "Não deu para confirmar a exclusão. Atualize a página para ver quais regras saíram.";
+
+/**
+ * "Excluir selecionadas": removes several rules; the API answers per rule so
+ * a partial success is reported, never hidden. A rule other unified rules
+ * point to only goes when its id is also sent as "confirmTargetId".
+ */
+export async function removeConversionRulesAction(
+  formData: FormData,
+): Promise<ConversionScreenActionResult> {
+  const ruleIds = formData
+    .getAll("ruleId")
+    .filter((id): id is string => typeof id === "string" && id.trim() !== "");
+  const confirmTargetRuleIds = formData
+    .getAll("confirmTargetId")
+    .filter((id): id is string => typeof id === "string" && id.trim() !== "");
+  const input = providerConversionRuleBulkRemoveInputSchema.safeParse({
+    ruleIds,
+    ...(confirmTargetRuleIds.length > 0 ? { confirmTargetRuleIds } : {}),
+  });
+
+  if (!input.success) {
+    return { ok: false, message: "Escolha as regras que quer excluir." };
+  }
+
+  try {
+    const response = await serverApiFetch<unknown>(
+      "/conversion-rules/providers/bulk-delete",
+      { method: "POST", body: JSON.stringify(input.data) },
+    );
+    const result =
+      providerConversionRuleBulkRemoveResultSchema.safeParse(response);
+
+    if (!result.success) {
+      return { ok: false, outcomeUnknown: true, message: bulkRemoveUnknownMessage };
+    }
+
+    revalidateRules();
+    const { removedCount, results } = result.data;
+    return {
+      ok: removedCount === results.length,
+      bulkRemove: result.data,
+      message:
+        removedCount === results.length
+          ? `${removedCount} ${removedCount === 1 ? "regra excluída" : "regras excluídas"}. O histórico continua salvo.`
+          : `${removedCount} de ${results.length} excluídas. Veja abaixo o que ficou.`,
+    };
+  } catch (error) {
+    return failure(
+      error,
+      "Não foi possível excluir as regras selecionadas.",
+      bulkRemoveUnknownMessage,
+    );
   }
 }
 
@@ -586,7 +668,7 @@ export async function reprocessBlockedExecutionsAction(
         message:
           apiCode(error) === "provider_rule_reprocess_in_progress"
           ? "Já existe um reprocessamento em andamento para esta regra. Aguarde ele terminar."
-          : "A regra está pausada ou em observação. Ative o envio automático da regra antes de reprocessar.",
+          : "A regra está pausada ou com o envio desligado. Retome o envio da regra antes de reprocessar.",
       };
     }
     return failure(
@@ -595,6 +677,24 @@ export async function reprocessBlockedExecutionsAction(
       reprocessUnknownMessage,
     );
   }
+}
+
+/**
+ * Fase 6.1c (produção direta): a regra de uma integração validada já nasce
+ * enviando. Sem envio, só quando o servidor está com o envio de regras
+ * desligado ou o leitor da integração ainda não foi validado.
+ */
+function createdRuleMessage(
+  mode: "observation" | "production",
+  hasWebhookUrl: boolean,
+): string {
+  const base =
+    mode === "production"
+      ? "Regra criada e enviando: cada conversão reconhecida vai para a Meta pelo destino de cada número."
+      : "Regra criada sem envio: o envio de conversões está desligado na configuração da API, ou esta integração ainda não pode enviar. Depois de resolver, use “Ativar envio” nesta regra.";
+  return hasWebhookUrl
+    ? `${base} Copie o endereço agora: ele não é exibido de novo.`
+    : base;
 }
 
 function plural(count: number, one: string, many: string): string {
@@ -611,7 +711,12 @@ function reprocessSummary(
   ];
   if (result.stillBlocked > 0) {
     parts.push(
-      `${plural(result.stillBlocked, "fica como está", "ficam como estão")} (número ainda sem envio ativo, pausado de propósito na época ou que não é QR)`,
+      `${plural(result.stillBlocked, "fica como está", "ficam como estão")} (número ainda sem envio ativo, pausado de propósito na época ou que não é Uazapi/WAHA)`,
+    );
+  }
+  if ((result.alreadyConverted ?? 0) > 0) {
+    parts.push(
+      `${plural(result.alreadyConverted ?? 0, "fica como está", "ficam como estão")} porque o lead já foi convertido por outro número ou pela entrada do anúncio (nada é enviado de novo à Meta)`,
     );
   }
   if (result.expired > 0) {
@@ -751,7 +856,13 @@ export async function adaptProviderConversionRuleAction(
     }
 
     revalidateRules();
-    return { ok: true, message: "Regra conectada aos números, em observação." };
+    return {
+      ok: true,
+      message:
+        result.data.mode === "production"
+          ? "Regra conectada aos números e enviando para a Meta."
+          : "Regra conectada aos números, com o envio desligado.",
+    };
   } catch (error) {
     return failure(
       error,
@@ -861,6 +972,14 @@ export async function removeProviderConversionRuleAction(
       message: "Regra excluída. O histórico dela continua salvo.",
     };
   } catch (error) {
+    // Porte do #161: a rule already removed (another tab, a bulk delete).
+    if (apiStatus(error) === 404) {
+      return {
+        ok: false,
+        message:
+          "Esta regra não foi encontrada (talvez já tenha sido excluída). Atualize a página para conferir.",
+      };
+    }
     return failure(
       error,
       "Não foi possível excluir a regra.",

@@ -19,13 +19,26 @@ const baseline = JSON.parse(
   ),
 ) as Record<string, unknown>;
 
-/** Remove só o que a Fase 5.2 acrescenta: a moeda (sempre "BRL" aqui). */
+/**
+ * Remove só o que veio depois da referência: a moeda da Fase 5.2 (sempre
+ * "BRL" aqui) e os campos novos e só aditivos da Fase 6.3a (conciliação
+ * diária e cobertura da Meta) e da Fase 6.4 (versão da miniatura guardada).
+ * Os números continuam os mesmos.
+ */
+const ADDED_AFTER_BASELINE = new Set([
+  "currency",
+  "adConversationsStarted",
+  "dailyComparisonLeadEventDeferred",
+  "metaSyncCoverage",
+  "thumbnailVersion",
+]);
+
 function withoutCurrency(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(withoutCurrency);
   if (value && typeof value === "object") {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>)
-        .filter(([key]) => key !== "currency")
+        .filter(([key]) => !ADDED_AFTER_BASELINE.has(key))
         .map(([key, item]) => [key, withoutCurrency(item)]),
     );
   }

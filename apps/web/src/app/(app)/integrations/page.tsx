@@ -9,6 +9,7 @@ import type {
   MetaAssetsDto,
   MetaConnectionCapabilitiesDto,
   MetaConnectionDto,
+  MetaLeadFormConnectionDto,
   MetaManualConfigurationDto,
   ProviderConversionRuleDto,
   CurrentWorkspaceDto,
@@ -45,6 +46,7 @@ import {
 } from "./pipedrive-actions";
 import {
   ensureIntegrationEndpointAction,
+  loadIntegrationEventPayloadAction,
   removeIntegrationEndpointAction,
   retryIntegrationEventAction,
   revealIntegrationEndpointAction,
@@ -56,6 +58,7 @@ import { loadSingleUrlData } from "./single-url/single-url-data";
 import {
   AutomationEventUrlsPanel,
   PaytSingleUrlPanel,
+  SalesPlatformSingleUrlPanel,
   type SingleUrlActions,
 } from "./single-url/single-url-panels";
 import { buildIntegrationCards } from "./hub/integration-cards";
@@ -115,12 +118,17 @@ import {
   testMetaOAuthAdvancedConnectionAction,
   syncMetaManualHistoryAction,
 } from "./meta-manual-actions";
+import { MetaLeadFormsPanel } from "./meta-lead-forms-panel";
 import { MetaManualConnectionPanel } from "./meta-manual-connection-panel";
 import {
   metaAssetsRefreshSucceeded,
   resolveMetaStatus,
 } from "./meta-connection-state";
 import { MetaReportingAccountsForm } from "./meta-reporting-accounts-form";
+import {
+  whatsappInstanceActivityView,
+  type WhatsappInstanceActivities,
+} from "./whatsapp-instance-activity";
 import { WorkspaceCurrencyProvider } from "../../../components/workspace-currency";
 import { getWorkspaceCurrencySettings } from "../../../lib/currency-settings";
 
@@ -269,6 +277,22 @@ async function getLegacyWhatsappInstances(): Promise<
   }
 }
 
+/** Fase 6.9 (PR #91 do nod): conexões de formulários Meta (Lead Ads). */
+async function getMetaLeadFormConnections(): Promise<
+  ResourceResult<MetaLeadFormConnectionDto[]>
+> {
+  try {
+    return {
+      data: await serverApiFetch<MetaLeadFormConnectionDto[]>(
+        "/integrations/meta-lead-forms",
+      ),
+      state: "real",
+    };
+  } catch {
+    return { data: [], state: "error" };
+  }
+}
+
 async function getMetaCapabilities(): Promise<
   ResourceResult<MetaConnectionCapabilitiesDto>
 > {
@@ -381,6 +405,10 @@ async function getInboundWebhookData(): Promise<
                 },
           channels:
             channelsResult.status === "fulfilled" ? channelsResult.value : [],
+          channelsState:
+            channelsResult.status === "fulfilled"
+              ? ("real" as const)
+              : ("error" as const),
           detailState:
             overviewResult.status === "fulfilled" &&
             channelsResult.status === "fulfilled"
@@ -427,6 +455,48 @@ async function getWhatsappConnections(): Promise<
   } catch {
     return { data: [], state: "error" };
   }
+}
+
+/** Fase 6.3b (SaaS #125/#126): conexões com atividade por número. */
+const activityProviders = new Set(["uazapi_byo", "waha"]);
+
+function providerStatusTimeoutMs(): number {
+  const configuredTimeout = Number(
+    process.env.WPPTRACK_WEB_PROVIDER_STATUS_TIMEOUT_MS ?? 2000,
+  );
+
+  return Number.isFinite(configuredTimeout) && configuredTimeout > 0
+    ? configuredTimeout
+    : 2000;
+}
+
+/**
+ * Fase 6.3b (porte do SaaS #126): uma leitura em paralelo por conexão Uazapi
+ * BYO ou WAHA (um número cada). Falha vira "indisponível", nunca zero.
+ */
+async function getWhatsappConnectionActivities(
+  connectionIds: Iterable<string>,
+): Promise<WhatsappInstanceActivities> {
+  const timeoutMs = providerStatusTimeoutMs();
+  const entries = await Promise.all(
+    [...new Set(connectionIds)].map(async (connectionId) => {
+      try {
+        const payload = await serverApiFetch<unknown>(
+          `/integrations/whatsapp-connections/${encodeURIComponent(connectionId)}/activity`,
+          { signal: AbortSignal.timeout(timeoutMs) },
+        );
+
+        return [
+          connectionId,
+          whatsappInstanceActivityView(payload, new Date()),
+        ] as const;
+      } catch {
+        return [connectionId, { state: "unavailable" }] as const;
+      }
+    }),
+  );
+
+  return Object.fromEntries(entries);
 }
 
 async function getAccountUser(): Promise<AccountUserSummary | null> {
@@ -1011,6 +1081,7 @@ export default async function IntegrationsPage({
     kommoSettings,
     pipedriveSettings,
     singleUrlData,
+    metaLeadFormsResult,
   ] = await Promise.all([
     oauthConnected
       ? getMetaOAuthAdvancedConfiguration()
@@ -1031,11 +1102,28 @@ export default async function IntegrationsPage({
     ),
     // Fase 5.3: cada leitura falha sozinha (uma API antiga não derruba a tela).
     loadSingleUrlData(),
+    getMetaLeadFormConnections(),
   ]);
   const licenseLocked = Boolean(
     licenseStatus && licenseLockReason(licenseStatus) !== null,
   );
   const inboundWebhookData = inboundWebhookResult.data;
+  // Fase 6.3b: atividade das conexões Uazapi BYO e WAHA (as listadas e as
+  // pontes das regras de frase, que apontam para a mesma conexão).
+  const whatsappConnectionActivities = await getWhatsappConnectionActivities([
+    ...whatsappConnectionsResult.data
+      .filter((connection) => activityProviders.has(connection.provider))
+      .map((connection) => connection.id),
+    ...(inboundWebhookData?.connections ?? []).flatMap(
+      ({ overview, channels }) =>
+        overview.connection.provider === "uazapi" ||
+        overview.connection.provider === "waha"
+          ? channels.flatMap((channel) =>
+              channel.whatsappInstanceId ? [channel.whatsappInstanceId] : [],
+            )
+          : [],
+    ),
+  ]);
   const pipeline = pipelineResult.data;
   const isPlatformOperator = Boolean(workspace?.platformRole);
   const workspacePermissionsUnavailable = workspaceResult.state === "error";
@@ -1120,6 +1208,11 @@ export default async function IntegrationsPage({
   const allInboundChannels = inboundConnections.flatMap(
     ({ channels }) => channels,
   );
+  // Kommo/Pipedrive channel bindings (porte do #165): a failed numbers read is
+  // "unknown", never "no number" (and must not let saving drop bindings).
+  const inboundChannelsUnavailable =
+    (inboundWebhookResult.state === "error" && inboundWebhookData === null) ||
+    inboundConnections.some(({ channelsState }) => channelsState === "error");
   const inboundConnectionsFor = (provider: string) =>
     inboundConnections.filter(
       ({ overview }) => overview.connection.provider === provider,
@@ -1156,6 +1249,15 @@ export default async function IntegrationsPage({
   const paytRules = (inboundWebhookData?.providerRules ?? []).filter(
     (rule) => rule.automationSource === "payt",
   );
+  // Fase 6.5: Braip, same base as Payt (only through the single URL).
+  const braipRules = (inboundWebhookData?.providerRules ?? []).filter(
+    (rule) => rule.automationSource === "braip",
+  );
+  // Fase 6.7: Yampi, same base as Braip (only through the single URL). Open
+  // to every workspace in the student edition (no private-integration gate).
+  const yampiRules = (inboundWebhookData?.providerRules ?? []).filter(
+    (rule) => rule.automationSource === "yampi",
+  );
 
   // Fase 5.3: URL única (Payt) e URLs por evento (Unnichat e Umbler).
   const singleUrlEnabled = Boolean(singleUrlData.endpoints?.enabled);
@@ -1171,9 +1273,16 @@ export default async function IntegrationsPage({
     remove: removeIntegrationEndpointAction,
     retry: retryIntegrationEventAction,
     setPublicUrl: setRulePublicUrlAction,
+    loadPayload: loadIntegrationEventPayloadAction,
   };
   const paytIntegrationUrl =
     singleUrlEndpoints.find((endpoint) => endpoint.provider === "payt") ??
+    null;
+  const braipIntegrationUrl =
+    singleUrlEndpoints.find((endpoint) => endpoint.provider === "braip") ??
+    null;
+  const yampiIntegrationUrl =
+    singleUrlEndpoints.find((endpoint) => endpoint.provider === "yampi") ??
     null;
   const ruleEventsFor = (origin: string) => [
     ...new Set(
@@ -1182,7 +1291,11 @@ export default async function IntegrationsPage({
           (rule) =>
             (rule.origin === origin ||
               (origin === "automation_payt" &&
-                rule.automationSource === "payt")) &&
+                rule.automationSource === "payt") ||
+              (origin === "automation_braip" &&
+                rule.automationSource === "braip") ||
+              (origin === "automation_yampi" &&
+                rule.automationSource === "yampi")) &&
             rule.conversionRule.active,
         )
         .map((rule) => rule.conversionRule.eventName),
@@ -1225,6 +1338,22 @@ export default async function IntegrationsPage({
       activeRuleCount: paytRules.filter((rule) => rule.conversionRule.active)
         .length,
       integrationUrl: Boolean(paytIntegrationUrl),
+    },
+    braip: {
+      loaded:
+        Boolean(inboundWebhookData) && inboundWebhookData!.providerRulesEnabled,
+      ruleCount: braipRules.length,
+      activeRuleCount: braipRules.filter((rule) => rule.conversionRule.active)
+        .length,
+      integrationUrl: Boolean(braipIntegrationUrl),
+    },
+    yampi: {
+      loaded:
+        Boolean(inboundWebhookData) && inboundWebhookData!.providerRulesEnabled,
+      ruleCount: yampiRules.length,
+      activeRuleCount: yampiRules.filter((rule) => rule.conversionRule.active)
+        .length,
+      integrationUrl: Boolean(yampiIntegrationUrl),
     },
     crm: {
       kommo: {
@@ -1269,6 +1398,7 @@ export default async function IntegrationsPage({
         deleteAction={deleteWhatsappConnectionAction}
         configureWebhookAction={configureWahaWebhookAction}
         licenseLocked={licenseLocked}
+        activities={whatsappConnectionActivities}
       />
     );
   }
@@ -1308,6 +1438,7 @@ export default async function IntegrationsPage({
         setChannelStatusAction={setInboundWebhookChannelStatusAction}
         saveRoutesAction={saveInboundWebhookChannelRoutesAction}
         licenseLocked={licenseLocked}
+        instanceActivities={whatsappConnectionActivities}
       />
     );
   }
@@ -1334,6 +1465,28 @@ export default async function IntegrationsPage({
     ) : (
       inboundPanel(provider)
     );
+  // Fase 6.8 (porte do #183): ROI Chat, uma conexão por número; a URL de
+  // cada número recebe a entrada do lead E a compra (regra "Compra no ROI
+  // Chat"). Produção direta: nasce enviando, sem passo de liberação.
+  const roichatPanel = (
+    <div className="integration-modal-stack">
+      <div className="integration-modal-note">
+        <strong>Uma URL por número, para a entrada e a compra</strong>
+        <p className="muted">
+          Crie uma conexão para cada número do ROI Chat e cadastre a URL dele
+          no ROI Chat. A mesma URL recebe a entrada do lead que veio do anúncio
+          e a compra (com <code>event_name: "Purchase"</code>, valor e moeda).
+          A compra vira conversão pela regra “Compra no ROI Chat”, em
+          Conversões. Com a rota Meta do número configurada, tudo já segue
+          para a Meta.
+        </p>
+      </div>
+      {inboundPanel("roichat", {
+        scopeDescription:
+          "Informe o nome e o número, gere a URL do número e cadastre-a no ROI Chat.",
+      })}
+    </div>
+  );
   const paytRulesBlock = (
     <div className="integration-modal-note">
       <strong>Regras de venda</strong>
@@ -1408,8 +1561,8 @@ export default async function IntegrationsPage({
             única vez.
           </li>
           <li>
-            A regra começa em observação; ative o envio quando conferir as
-            primeiras vendas.
+            A regra já começa enviando: cada venda reconhecida vai para a Meta
+            pelo destino do número do comprador.
           </li>
         </ol>
         {hasWhatsappNumber ? (
@@ -1436,6 +1589,137 @@ export default async function IntegrationsPage({
             </a>
           </>
         )}
+      </div>
+    </div>
+  );
+
+  // Fase 6.5: Braip, mesma base da Payt. Só pela URL única da conta (não há
+  // URL por regra); o leitor já entra em uso, nada a liberar.
+  const braipRulesLink = hasWhatsappNumber ? (
+    <Link
+      className="button primary"
+      href={
+        braipRules.length > 0
+          ? "/conversions"
+          : "/conversions?nova=automation_braip"
+      }
+    >
+      {braipRules.length > 0
+        ? "Gerenciar regras da Braip"
+        : "Criar regra de venda da Braip"}
+    </Link>
+  ) : (
+    <>
+      <p className="muted">
+        Antes, conecte um número de WhatsApp para saber de qual anúncio veio
+        cada comprador.
+      </p>
+      <a className="button" href="#integracao-whatsapp">
+        Ir para WhatsApp
+      </a>
+    </>
+  );
+  const braipPanel = singleUrlEnabled ? (
+    <div className="integration-modal-stack">
+      <SalesPlatformSingleUrlPanel
+        provider="braip"
+        endpoint={braipIntegrationUrl}
+        products={singleUrlData.braipProducts}
+        unattributed={singleUrlData.unattributed.braip}
+        legacyUrls={legacyUrlsFor(singleUrlLegacy, "braip")}
+        ruleEvents={ruleEventsFor("automation_braip")}
+        canManage={canManageSingleUrl}
+        licenseLocked={licenseLocked}
+        actions={singleUrlActions}
+        numberNames={singleUrlNumberNames}
+      />
+      <div className="integration-modal-note">
+        <strong>Regras de venda</strong>
+        <p className="muted">
+          Crie uma regra por evento (compra aprovada, boleto/Pix gerado,
+          checkout abandonado), para todos os números ou só para alguns, e, se
+          quiser, só para certos produtos. A regra já começa enviando: a venda
+          segue para a regra do número por onde o comprador chegou.
+        </p>
+        {braipRulesLink}
+      </div>
+    </div>
+  ) : (
+    <div className="integration-modal-stack">
+      <div className="integration-modal-note">
+        <strong>Como funciona</strong>
+        <p className="muted">
+          A Braip avisa cada venda numa URL única da conta. Essa URL só existe
+          com os webhooks de entrada e as regras de conversão ligados nesta
+          instalação; peça a quem administra a instalação para conferir.
+        </p>
+        {braipRulesLink}
+      </div>
+    </div>
+  );
+
+  // Fase 6.7: Yampi, mesma base da Braip. Só pela URL única da conta (não há
+  // URL por regra); o leitor já entra em uso, nada a liberar. Liberada para
+  // todos os workspaces.
+  const yampiRulesLink = hasWhatsappNumber ? (
+    <Link
+      className="button primary"
+      href={
+        yampiRules.length > 0
+          ? "/conversions"
+          : "/conversions?nova=automation_yampi"
+      }
+    >
+      {yampiRules.length > 0
+        ? "Gerenciar regras da Yampi"
+        : "Criar regra de venda da Yampi"}
+    </Link>
+  ) : (
+    <>
+      <p className="muted">
+        Antes, conecte um número de WhatsApp para saber de qual anúncio veio
+        cada comprador.
+      </p>
+      <a className="button" href="#integracao-whatsapp">
+        Ir para WhatsApp
+      </a>
+    </>
+  );
+  const yampiPanel = singleUrlEnabled ? (
+    <div className="integration-modal-stack">
+      <SalesPlatformSingleUrlPanel
+        provider="yampi"
+        endpoint={yampiIntegrationUrl}
+        products={singleUrlData.yampiProducts}
+        unattributed={singleUrlData.unattributed.yampi}
+        legacyUrls={legacyUrlsFor(singleUrlLegacy, "yampi")}
+        ruleEvents={ruleEventsFor("automation_yampi")}
+        canManage={canManageSingleUrl}
+        licenseLocked={licenseLocked}
+        actions={singleUrlActions}
+        numberNames={singleUrlNumberNames}
+      />
+      <div className="integration-modal-note">
+        <strong>Regras de venda</strong>
+        <p className="muted">
+          Crie uma regra por evento (pedido pago, pedido aguardando pagamento,
+          carrinho abandonado), para todos os números ou só para alguns, e, se
+          quiser, só para certos produtos. A regra já começa enviando: a venda
+          segue para a regra do número por onde o comprador chegou.
+        </p>
+        {yampiRulesLink}
+      </div>
+    </div>
+  ) : (
+    <div className="integration-modal-stack">
+      <div className="integration-modal-note">
+        <strong>Como funciona</strong>
+        <p className="muted">
+          A Yampi avisa cada venda numa URL única da conta. Essa URL só existe
+          com os webhooks de entrada e as regras de conversão ligados nesta
+          instalação; peça a quem administra a instalação para conferir.
+        </p>
+        {yampiRulesLink}
       </div>
     </div>
   );
@@ -1788,6 +2072,12 @@ export default async function IntegrationsPage({
               ) : null}
             </>
           ) : null}
+          <MetaLeadFormsPanel
+            connections={metaLeadFormsResult.data}
+            canManage={canManageIntegrations}
+            licenseLocked={licenseLocked}
+            loadFailed={metaLeadFormsResult.state === "error"}
+          />
           <p className="muted integration-domain-note">
             {oauthAdvancedEnabled
               ? "A conexão Meta fica protegida no backend. Cada conta ativa usa o Pixel e a Página vinculados a sua BM."
@@ -1816,11 +2106,14 @@ export default async function IntegrationsPage({
     waha: whatsappProviderPanel("waha"),
     ...comingSoonPanels,
     meta_cloud: inboundPanel("meta_cloud"),
+    roichat: roichatPanel,
     umbler: automationUrlsPanel("umbler"),
     gupshup: inboundPanel("gupshup"),
     data_crazy: inboundPanel("data_crazy"),
     unnichat: automationUrlsPanel("unnichat"),
     payt: paytPanel,
+    braip: braipPanel,
+    yampi: yampiPanel,
     meta: metaPanel,
     kommo:
       workspace && kommoViewerId && canManageKommo ? (
@@ -1831,6 +2124,7 @@ export default async function IntegrationsPage({
             connections={kommoSettings.connections}
             loadState={kommoSettings.state}
             allChannels={allInboundChannels}
+            channelsUnavailable={inboundChannelsUnavailable}
             canManage={canManageKommo}
             licenseLocked={licenseLocked}
           />
@@ -1849,6 +2143,7 @@ export default async function IntegrationsPage({
             connections={pipedriveSettings.connections}
             loadState={pipedriveSettings.state}
             allChannels={allInboundChannels}
+            channelsUnavailable={inboundChannelsUnavailable}
             canManage={canManageKommo}
             licenseLocked={licenseLocked}
           />
@@ -2018,11 +2313,14 @@ export default async function IntegrationsPage({
           waha: [rulesLink],
           zapi: [rulesLink],
           meta_cloud: [rulesLink],
+          roichat: [rulesLink],
           umbler: [rulesLink],
           gupshup: [rulesLink],
           data_crazy: [rulesLink],
           unnichat: [rulesLink],
           payt: [rulesLink],
+          braip: [rulesLink],
+          yampi: [rulesLink],
         }}
         tabIntro={{
           whatsapp: whatsappIntro,

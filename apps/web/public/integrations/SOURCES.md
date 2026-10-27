@@ -22,6 +22,7 @@ instead of a broken image.
 | `payt.svg` | Logo markup of the `PaytLogo` component on https://payt.com.br (site bundle `assets/BzoOw8z8.js`), wrapped as a standalone SVG (`viewBox 0 0 48 39`), colors unchanged. Same file as the SaaS reference (copied 2026-10-15) | Colored artwork, shown on the dark card. No public brand kit found. |
 | `pipedrive.svg` | Header logo (inline SVG, `aria-label="Pipedrive"`) on https://www.pipedrive.com | The inline markup has no color of its own (the site paints it via CSS); stored as the monochrome white version, shown on the dark tile. Official kit is on request: https://www.pipedrive.com/en/newsroom/press-kit — confirm there. |
 | `unnichat.png` | https://unnichat.com.br/favicon.png (official app symbol, 1046x1046, 8-bit PNG). Same file as the SaaS reference (copied 2026-10-15) | Symbol only (no wordmark found as a file), shown on a light tile. No public brand kit found. |
+| `braip.png` | https://ev.braip.com/img/logo-collor.png (official app symbol on the Braip login page, 458x458), downloaded 2026-10-15. Same file as the SaaS reference (copied 2026-10-27) | Symbol only (wordmark not served as a standalone file). The light rounded container of the app icon was removed (glyph kept, same color, transparent background) so it reads on the dark tile. No public brand kit found. |
 | `kommo.png` | https://www.kommo.com/static/images/pages/support/kommo-logo.png (1200x256) | Dark ink, light tile. No public brand kit found. |
 
 ## Plain wordmark fallbacks (official file not used)
@@ -29,9 +30,11 @@ instead of a broken image.
 | File | Reason |
 | --- | --- |
 | `datacrazy.svg` | datacrazy.io only serves a 175x59 WebP logo (below 256 px, not SVG/PNG). |
+| `roichat.svg` | ROI Chat (WhatsApp API Oficial, Fase 6.8); plain wordmark placeholder, same file as the SaaS reference (copied 2026-10-27). PENDENTE: get the official ROI Chat logo and its usage permission and swap the file, keeping the name. |
 | `meta.svg` | (also the WhatsApp Cloud API card) Meta's brand resource center requires accepting its terms and Brand Review approval before use — the account owner must do this. |
 | `uazapi.svg` | No official logo file could be retrieved with a verifiable source (docs.uazapi.com was not reachable when this was prepared); neutral wordmark until the owner provides the file. |
 | `nod-api.svg`, `zapi.svg` | "Em breve" cards; no public logo kit found; neutral wordmarks. |
+| `yampi.svg` | Fase 6.7: same neutral wordmark placeholder as the SaaS (copied 2026-10-27); no official Yampi artwork with usage terms collected yet. PENDENTE: get the official Yampi logo and its usage permission and swap the file, keeping the name. |
 
 Providers that arrive in later updates (Go High Level)
 add their own logo file and a row here.

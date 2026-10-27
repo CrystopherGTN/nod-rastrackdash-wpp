@@ -31,6 +31,7 @@ import {
   type RuleEditDraft,
 } from "./rule-edit";
 import { RuleEndpoint } from "./rule-endpoint";
+import { LeadSubmittedOverrideNotice } from "./lead-submitted-override";
 import {
   ProductFilterPicker,
   type SingleUrlActions,
@@ -54,6 +55,9 @@ const automationOrigins: readonly ProviderConversionRuleOriginDto[] = [
   "automation_umbler",
   "automation_unnichat",
   "automation_payt",
+  "automation_braip",
+  "automation_roichat",
+  "automation_yampi",
 ];
 
 /**
@@ -69,7 +73,11 @@ export function ruleManageTabs(
     { id: "edit", label: "Editar" },
   ];
   if (automationOrigins.includes(origin)) {
-    tabs.push({ id: "endpoint", label: "Endereço e configuração" });
+    // Fase 6.8: a compra do ROI Chat chega pela URL de cada número
+    // (Integrações); a regra não tem endereço próprio para mostrar.
+    if (origin !== "automation_roichat") {
+      tabs.push({ id: "endpoint", label: "Endereço e configuração" });
+    }
     if (canManage) tabs.push({ id: "received", label: "Eventos recebidos" });
   }
   if (origin === "structured_catalog" && rule.catalog) {
@@ -82,6 +90,9 @@ export const unseenUrlWarning =
   "O novo endereço só aparece agora e o anterior já parou de funcionar. Copie e cole na plataforma antes de sair daqui.";
 
 export function deleteConfirmText(origin: ProviderConversionRuleOriginDto): string {
+  if (origin === "automation_roichat") {
+    return "A regra para de reconhecer as compras do ROI Chat na hora (as URLs dos números continuam recebendo as entradas). O histórico continua salvo. Não dá para desfazer.";
+  }
   return automationOrigins.includes(origin)
     ? "A regra para de reconhecer conversões na hora e o endereço dela deixa de funcionar. O histórico continua salvo. Não dá para desfazer."
     : "A regra para de reconhecer conversões na hora. O histórico continua salvo. Não dá para desfazer.";
@@ -111,12 +122,21 @@ export function RuleManage({
   onChanged,
   integrationEndpoints = [],
   paytProducts = [],
+  braipProducts = [],
+  yampiProducts = [],
   singleUrlActions,
+  numbersUnavailable = false,
 }: {
+  /** GET /channels de alguma conexão falhou: números incompletos. */
+  numbersUnavailable?: boolean;
   /** Fase 5.3: URLs únicas/por evento do workspace (sem a chave). */
   integrationEndpoints?: IntegrationEndpointDto[];
   /** Fase 5.3: produtos vistos nas vendas da Payt (filtro de produto). */
   paytProducts?: IntegrationDetectedProductDto[];
+  /** Fase 6.5: produtos vistos nas vendas da Braip (filtro de produto). */
+  braipProducts?: IntegrationDetectedProductDto[];
+  /** Fase 6.7: produtos vistos nas vendas da Yampi (filtro de produto). */
+  yampiProducts?: IntegrationDetectedProductDto[];
   singleUrlActions?: SingleUrlActions;
   rule: ProviderConversionRuleDto;
   origin: ProviderConversionRuleOriginDto;
@@ -208,6 +228,13 @@ export function RuleManage({
           <strong>Excluir “{name}”?</strong>
         </p>
         <p>{deleteConfirmText(origin)}</p>
+        {rule.unifiedIntoRuleId && !rule.numberRemoved ? (
+          <p className="action-note warn">
+            Esta regra foi unificada: a URL antiga dela encaminha os eventos
+            para a regra que vale para todos os números. Ao excluir, essa URL
+            deixa de funcionar.
+          </p>
+        ) : null}
         {deleteError ? (
           <p className="action-note warn" role="alert">
             {deleteError}
@@ -318,6 +345,9 @@ export function RuleManage({
             updateAction={actions.update}
             onSaved={onSaved}
             paytProducts={paytProducts}
+            braipProducts={braipProducts}
+            yampiProducts={yampiProducts}
+            numbersUnavailable={numbersUnavailable}
           />
         ) : null}
         {tab === "endpoint" ? (
@@ -341,6 +371,10 @@ export function RuleManage({
                 (endpoint) =>
                   (origin === "automation_payt" &&
                     endpoint.provider === "payt") ||
+                  (origin === "automation_braip" &&
+                    endpoint.provider === "braip") ||
+                  (origin === "automation_yampi" &&
+                    endpoint.provider === "yampi") ||
                   (origin === "automation_unnichat" &&
                     endpoint.provider === "unnichat" &&
                     endpoint.eventName === rule.conversionRule.eventName) ||
@@ -391,8 +425,16 @@ function RuleEditForm({
   updateAction,
   onSaved,
   paytProducts = [],
+  braipProducts = [],
+  yampiProducts = [],
+  numbersUnavailable = false,
 }: {
+  numbersUnavailable?: boolean;
   paytProducts?: IntegrationDetectedProductDto[];
+  /** Fase 6.5: produtos vistos nas vendas da Braip (filtro de produto). */
+  braipProducts?: IntegrationDetectedProductDto[];
+  /** Fase 6.7: produtos vistos nas vendas da Yampi (filtro de produto). */
+  yampiProducts?: IntegrationDetectedProductDto[];
   rule: ProviderConversionRuleDto;
   origin: ProviderConversionRuleOriginDto;
   numbers: ConversionNumber[];
@@ -481,6 +523,11 @@ function RuleEditForm({
         <p className="action-note">
           Para trocar a origem ou o evento, crie uma regra nova e exclua esta.
         </p>
+        <LeadSubmittedOverrideNotice
+          enabled={capabilities?.leadSubmittedRuleOverrideEnabled === true}
+          eventName={rule.conversionRule.eventName}
+          mode={rule.mode}
+        />
       </fieldset>
 
       <ScopeStep
@@ -492,20 +539,41 @@ function RuleEditForm({
         onChange={patch}
         disabled={disabled}
         connectionLocked
+        initialCrossConnection={rule.crossConnectionScope === true}
         legend="Números"
+        numbersUnavailable={numbersUnavailable}
       />
 
       {editCaps.productFilter ? (
         <fieldset className="conversion-flow-fieldset" disabled={disabled}>
           <legend>Produtos</legend>
           <ProductFilterPicker
-            products={paytProducts}
+            provider={
+              origin === "automation_braip"
+                ? "braip"
+                : origin === "automation_yampi"
+                  ? "yampi"
+                  : "payt"
+            }
+            products={
+              origin === "automation_braip"
+                ? braipProducts
+                : origin === "automation_yampi"
+                  ? yampiProducts
+                  : paytProducts
+            }
             selected={draft.productCodes}
             onChange={(productCodes) => patch({ productCodes })}
             disabled={disabled}
           />
           <p className="action-note">
-            O valor de cada venda vem da própria Payt.
+            O valor de cada venda vem da própria{" "}
+            {origin === "automation_braip"
+              ? "Braip"
+              : origin === "automation_yampi"
+                ? "Yampi (só os produtos, sem frete e sem juros)"
+                : "Payt"}
+            .
           </p>
         </fieldset>
       ) : null}

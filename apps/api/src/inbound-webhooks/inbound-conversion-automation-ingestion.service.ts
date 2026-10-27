@@ -2,8 +2,30 @@ import { inboundParserProductionEligible } from "./inbound-webhook-parser-eligib
 import { createHash, randomUUID } from "node:crypto";
 import { buildProviderPurchaseIdentity } from "../conversion-rules/provider-purchase-identity";
 import { PAYT_LEAD_OTHER_CHANNEL_REASON } from "../conversion-rules/provider-purchase-routing";
-import { PROVIDER_RULE_OVERRIDDEN_REASON } from "../conversion-rules/provider-rule-scope";
+import {
+  observationDetailOf,
+  observedReprocessMessage,
+} from "../conversion-rules/provider-conversion-observation-detail";
+import {
+  PROVIDER_RULE_OVERRIDDEN_REASON,
+  providerRuleScope,
+  providerRuleSpansProviderConnections,
+} from "../conversion-rules/provider-rule-scope";
 import type { ProviderConversionManualReplayApproval } from "../conversion-rules/provider-conversion-orchestrator.service";
+
+/** Umbler/Unnichat rule "todas as conexões" (any connection of the provider). */
+function automationRuleSpansConnections(rule: {
+  scope?: string | null;
+  crossConnectionScope?: boolean | null;
+  conversionRule: { triggerType: string; eventName: string };
+  parserRelease?: { provider: string } | null;
+  connection?: { provider: string } | null;
+}): boolean {
+  return (
+    providerRuleScope(rule) === "all_numbers" &&
+    providerRuleSpansProviderConnections(rule)
+  );
+}
 import {
   BadRequestException,
   ConflictException,
@@ -33,6 +55,7 @@ import { RUNTIME_ENV, type RuntimeEnv } from "../common/runtime/runtime.module";
 import {
   PAYT_PRODUCT_NOT_IN_RULE_REASON,
   ProviderConversionObservationService,
+  type AutomationCallbackOrigin,
   type ProviderConversionAutomationObservationResult,
   type ProviderConversionEvaluationMode,
 } from "../conversion-rules/provider-conversion-observation.service";
@@ -53,17 +76,27 @@ import {
   UMBLER_AUTOMATION_V1_PARSER_VERSION,
 } from "./providers/umbler/umbler-automation-v1.parser";
 import {
-  parsePaytAutomationV1,
-  parsePaytSaleEventV1,
-  paytSaleEventNameOf,
-  type ParsedPaytAutomationV1,
-  PAYT_AUTOMATION_V1_PARSER_VERSION,
-} from "./providers/payt/payt-automation-v1.parser";
+  parseSaleEventV1,
+  parseSalePurchaseV1,
+  saleEventNameOf,
+  saleNotThisRuleErrorCode,
+  salesPlatformOf,
+  type ParsedSaleAutomationV1,
+} from "./providers/sales-platform-sale";
+import { normalizeBraipBody } from "./providers/braip/braip-body";
 import {
   parseUnnichatAutomationV1,
   type ParsedUnnichatAutomationV1,
   UNNICHAT_AUTOMATION_V1_PARSER_VERSION,
 } from "./providers/unnichat/unnichat-automation-v1.parser";
+import {
+  parseRoichatAutomationV1,
+  type ParsedRoichatAutomationV1,
+  ROICHAT_AUTOMATION_V1_NOT_PURCHASE,
+  ROICHAT_AUTOMATION_V1_PARSER_VERSION,
+  ROICHAT_PURCHASE_REPEAT_WINDOW_SECONDS,
+  ROICHAT_PURCHASE_REPEATED_REASON,
+} from "./providers/roichat/roichat-automation-v1.parser";
 
 const publicEndpointNotFoundMessage = "Webhook não encontrado";
 const publicPersistenceFailureMessage = "Webhook temporariamente indisponível";
@@ -73,6 +106,11 @@ const ignoredUntrackedLeadReason = "ignored_untracked_lead";
 const ignoredParseErrors = new Set<string>([
   "payt_automation_v1_not_purchase",
   "payt_automation_v1_event_not_in_rule",
+  "braip_automation_v1_not_purchase",
+  "braip_automation_v1_event_not_in_rule",
+  ROICHAT_AUTOMATION_V1_NOT_PURCHASE,
+  "yampi_automation_v1_not_purchase",
+  "yampi_automation_v1_event_not_in_rule",
 ]);
 const ignoredEmptyTemplateReason = "ignored_empty_template";
 const paytLeadOtherChannelMessage =
@@ -235,8 +273,9 @@ type ParsedUnnichatAutomation = ParsedUnnichatAutomationV1 & {
 };
 type ParsedAutomation =
   | ParsedUmblerAutomationV1
-  | ParsedPaytAutomationV1
-  | ParsedUnnichatAutomation;
+  | ParsedSaleAutomationV1
+  | ParsedUnnichatAutomation
+  | ParsedRoichatAutomationV1;
 type AutomationParseResult =
   | { ok: true; value: ParsedAutomation }
   | { ok: false; errorCode: string };
@@ -290,11 +329,21 @@ export class InboundConversionAutomationIngestionService {
     input: InboundConversionAutomationIngestionInput,
   ): Promise<InboundConversionAutomationIngestionResult> {
     this.assertFeatureEnabled();
-    const endpoint = await this.authenticateEndpoint(
+    const authenticated = await this.authenticateEndpoint(
       input.endpointId,
       input.token,
     );
-    const rawBody = this.requireJsonBody(input.contentType, input.rawBody);
+    const endpoint = authenticated.endpoint;
+    // Braip (6.5): JSON or form-urlencoded, converted to canonical JSON.
+    const rawBody =
+      endpoint.providerRule.parserRelease.provider === "braip"
+        ? this.requireBraipBody(input.contentType, input.rawBody)
+        : this.requireJsonBody(input.contentType, input.rawBody);
+    if (authenticated.forwardedFrom) {
+      // The OLD URL keeps showing that it still receives ("Desativar URL
+      // antiga"), the unified rule's own URL does not move.
+      await this.touchForwardedEndpoint(authenticated.forwardedFrom);
+    }
     const { ruleOutcome: _internal, ...result } = await this.ingestForEndpoint({
       endpoint,
       rawBody,
@@ -302,8 +351,34 @@ export class InboundConversionAutomationIngestionService {
         input.providerAttempt,
       ),
       integrationEndpointId: null,
+      touchRuleEndpoint: !authenticated.forwardedFrom,
+      // The URL that was called names the connection (number) of the
+      // callback: the rule's own, or the OLD rule's for a forwarded URL.
+      origin: {
+        connectionId: (authenticated.forwardedFrom ?? endpoint).providerRule
+          .connectionId,
+        channelId: null,
+      },
     });
     return result;
+  }
+
+  /** Best effort: never fails a callback that is already authenticated. */
+  private async touchForwardedEndpoint(
+    endpoint: LoadedConversionEndpoint,
+  ): Promise<void> {
+    try {
+      await this.prisma.providerConversionRuleEndpoint.updateMany({
+        where: {
+          id: endpoint.id,
+          workspaceId: endpoint.workspaceId,
+          removedAt: null,
+        },
+        data: { lastDeliveryAt: new Date() },
+      });
+    } catch {
+      // The forwarded delivery itself carries the receipt.
+    }
   }
 
   /**
@@ -329,6 +404,11 @@ export class InboundConversionAutomationIngestionService {
      * arrived (only the rule's explicit reprocess may send it).
      */
     occurrenceReceivedAt?: Date;
+    /**
+     * Fase 6.1a (porte do #159): connection and number the router proved for
+     * this callback (rules "todas as conexões" resolve it first).
+     */
+    origin?: AutomationCallbackOrigin | null;
   }): Promise<RoutedIngestionResult | null> {
     this.assertFeatureEnabled();
     const endpoint = await this.loadRoutableEndpoint(
@@ -343,7 +423,90 @@ export class InboundConversionAutomationIngestionService {
       integrationEndpointId: input.integrationEndpointId,
       routedChannelId: input.routedChannelId ?? null,
       occurrenceReceivedAt: input.occurrenceReceivedAt,
+      origin: input.origin ?? null,
     });
+  }
+
+  /**
+   * ROI Chat: a purchase received by the NUMBER's own URL (one connection per
+   * number) and routed to the rule "Compra no ROI Chat" that owns that
+   * number. Same path as the rule's own URL (delivery, decision, gates,
+   * replay); the origin is the URL's number, never guessed from the lead.
+   * Null when the rule can no longer receive callbacks.
+   */
+  async ingestFromConnection(input: {
+    workspaceId: string;
+    providerRuleId: string;
+    rawBody: Buffer;
+    providerAttempt: number | null;
+    origin: AutomationCallbackOrigin;
+  }): Promise<InboundConversionAutomationIngestionResult | null> {
+    this.assertFeatureEnabled();
+    const endpoint = await this.loadRoutableEndpoint(
+      input.workspaceId,
+      input.providerRuleId,
+    );
+    if (!endpoint) return null;
+    return this.ingestForEndpoint({
+      endpoint,
+      rawBody: input.rawBody,
+      providerAttempt: input.providerAttempt,
+      integrationEndpointId: null,
+      touchRuleEndpoint: false,
+      origin: input.origin,
+    });
+  }
+
+  /**
+   * ROI Chat 12h repeat guard (owner decision, 25/10/2026). The contract has
+   * no order id: the same lead, on the same number, with the same value and
+   * currency, arriving again within 12 hours is the SAME purchase resent; it
+   * is counted on the first delivery and never observed again. A different
+   * value/currency, another number or more than 12 hours later is a new
+   * purchase (repurchase is allowed). Production applies the same window to
+   * the frozen decisions (businessDedupePolicy), under its advisory lock.
+   */
+  private async findRoichatRepeatedPurchase(input: {
+    endpoint: PublicConversionEndpoint;
+    parsed: ParsedRoichatAutomationV1;
+    channelId: string | null;
+    receivedAt: Date;
+  }): Promise<{ id: string; firstReceivedAt: Date } | null> {
+    if (!input.channelId) return null;
+    try {
+      return await this.prisma.inboundWebhookDelivery.findFirst({
+        where: {
+          workspaceId: input.endpoint.workspaceId,
+          provider: "roichat",
+          purpose: "conversion_automation",
+          firstReceivedAt: {
+            gte: new Date(
+              input.receivedAt.getTime() -
+                ROICHAT_PURCHASE_REPEAT_WINDOW_SECONDS * 1_000,
+            ),
+            lte: input.receivedAt,
+          },
+          AND: [
+            {
+              normalizedSummary: {
+                path: ["purchaseFingerprint"],
+                equals: input.parsed.purchaseFingerprint,
+              },
+            },
+            {
+              normalizedSummary: {
+                path: ["callbackOrigin", "channelId"],
+                equals: input.channelId,
+              },
+            },
+          ],
+        },
+        orderBy: [{ firstReceivedAt: "desc" }, { id: "desc" }],
+        select: { id: true, firstReceivedAt: true },
+      });
+    } catch {
+      throw new ServiceUnavailableException(publicPersistenceFailureMessage);
+    }
   }
 
   private async ingestForEndpoint(input: {
@@ -355,15 +518,24 @@ export class InboundConversionAutomationIngestionService {
     /** Router-proven number; undefined keeps the one stored on the delivery. */
     routedChannelId?: string | null;
     occurrenceReceivedAt?: Date;
+    /**
+     * Whether the rule's own URL counts this receipt. False for routed
+     * callbacks and for an old URL forwarded to the rule it was unified into
+     * (porte do #159). The per-rule URL's lastDeliveryAt tells the operator
+     * whether the OLD URL still receives ("Desativar URL antiga").
+     */
+    touchRuleEndpoint?: boolean;
+    origin?: AutomationCallbackOrigin | null;
   }): Promise<RoutedIngestionResult> {
     const routedChannelId = input.routedChannelId ?? undefined;
     const { endpoint, rawBody, providerAttempt } = input;
-    // The per-rule URL's lastDeliveryAt tells the operator whether the OLD URL
-    // still receives ("Desativar URL antiga"); routed callbacks do not move it.
-    const touchRuleEndpoint = input.integrationEndpointId === null;
+    const touchRuleEndpoint =
+      input.touchRuleEndpoint ?? input.integrationEndpointId === null;
     const payload = JSON.parse(rawBody.toString("utf8")) as unknown;
-    const parsed = this.parseAutomation(endpoint, payload);
+    // The arrival is read first: a ROI Chat purchase without event_time takes
+    // it as its time (re-evaluations pass the stored firstReceivedAt).
     const receivedAt = new Date();
+    const parsed = this.parseAutomation(endpoint, payload, receivedAt);
     // When the occurrence happened for the production gate (a retry keeps
     // the original receipt time); bookkeeping stays at "now".
     const occurrenceReceivedAt = input.occurrenceReceivedAt ?? receivedAt;
@@ -400,6 +572,7 @@ export class InboundConversionAutomationIngestionService {
           deliveryId: existing.id,
           deliveryReceivedAt: existing.firstReceivedAt,
           parsed: effective.parsed,
+          origin: input.origin ?? null,
           ...(effective.evaluationMode
             ? { evaluationMode: effective.evaluationMode }
             : {}),
@@ -431,6 +604,34 @@ export class InboundConversionAutomationIngestionService {
       };
     }
 
+    if (parsed.ok && parsed.value.provider === "roichat") {
+      const repeated = await this.findRoichatRepeatedPurchase({
+        endpoint,
+        parsed: parsed.value,
+        channelId: input.origin?.channelId ?? null,
+        receivedAt,
+      });
+      if (repeated) {
+        await this.recordDuplicate(
+          endpoint,
+          repeated.id,
+          providerAttempt,
+          receivedAt,
+          touchRuleEndpoint,
+        );
+        return {
+          status: "accepted",
+          deliveryId: repeated.id,
+          duplicate: true,
+          observationStatus: "duplicate",
+          ruleOutcome: {
+            status: "duplicate",
+            reasonCode: ROICHAT_PURCHASE_REPEATED_REASON,
+          },
+        };
+      }
+    }
+
     const deliveryId = randomUUID();
     const encrypted = this.encryption.encrypt(rawBody, {
       workspaceId: endpoint.workspaceId,
@@ -444,6 +645,8 @@ export class InboundConversionAutomationIngestionService {
         ingressKey,
         providerAttempt,
         integrationEndpointId: input.integrationEndpointId,
+        touchRuleEndpoint,
+        origin: input.origin ?? null,
         rawBodyLength: rawBody.length,
         receivedAt,
         firstReceivedAt: occurrenceReceivedAt,
@@ -497,6 +700,7 @@ export class InboundConversionAutomationIngestionService {
       deliveryReceivedAt: occurrenceReceivedAt,
       parsed: parsed.value,
       routedChannelId,
+      origin: input.origin ?? null,
     });
     await this.enqueueEligibleObservation(endpoint.workspaceId, observed);
 
@@ -625,7 +829,11 @@ export class InboundConversionAutomationIngestionService {
     }
 
     const payload = this.decryptAutomationPayload(delivery);
-    const parsed = this.parseAutomation(endpoint, payload);
+    const parsed = this.parseAutomation(
+      endpoint,
+      payload,
+      delivery.firstReceivedAt,
+    );
     if (!parsed.ok) {
       throw new ConflictException(
         "O payload não corresponde ao contrato de automação atual",
@@ -997,8 +1205,11 @@ export class InboundConversionAutomationIngestionService {
       !rule.productionActivatedAt ||
       !inboundParserProductionEligible(rule.parserRelease) ||
       rule.parserRelease.version !== UMBLER_AUTOMATION_V1_PARSER_VERSION ||
-      rule.connection.status !== "production" ||
-      !inboundParserProductionEligible(rule.connection.parserRelease)
+      // A rule for all Umbler/Unnichat numbers is gated per number (its
+      // connection only stores the deliveries); the others by their own.
+      (!automationRuleSpansConnections(rule) &&
+        (rule.connection.status !== "production" ||
+          !inboundParserProductionEligible(rule.connection.parserRelease)))
     ) {
       throw new ConflictException(
         "Ative o envio automático da regra antes de reprocessar callbacks",
@@ -1148,6 +1359,11 @@ export class InboundConversionAutomationIngestionService {
         deliveryNormalized?.paidLeadResolved === true,
       payloadAvailable,
       payloadExpiresAt: delivery.payloadExpiresAt.toISOString(),
+      observationDetail: observationDetailOf({
+        status,
+        reasonCode: execution?.reasonCode,
+        normalizedResult: execution?.normalizedResult,
+      }),
       reprocessable:
         payloadAvailable &&
         (execution
@@ -1245,7 +1461,11 @@ export class InboundConversionAutomationIngestionService {
     }
 
     const payload = this.decryptAutomationPayload(delivery);
-    const parsed = this.parseAutomation(endpoint, payload);
+    const parsed = this.parseAutomation(
+      endpoint,
+      payload,
+      delivery.firstReceivedAt,
+    );
     if (!parsed.ok) {
       return {
         deliveryId,
@@ -1322,7 +1542,29 @@ export class InboundConversionAutomationIngestionService {
         executionId: observed.executionId,
         status: "skipped",
         reasonCode: observed.reasonCode,
-        message: "A regra ainda permanece em observação",
+        message: observedReprocessMessage(observed.observationDetail),
+      };
+    }
+    // Sales platforms: re-evaluating a sale that is STILL observed returns
+    // its own observed execution through the observation purchase claim
+    // ("purchase_duplicate"). Nothing was sent: say why, not "não exige envio".
+    if (
+      observed.reasonCode === "purchase_duplicate" &&
+      currentExecution?.status === "observed" &&
+      observed.executionId === currentExecution.id
+    ) {
+      return {
+        deliveryId,
+        executionId: currentExecution.id,
+        status: "skipped",
+        reasonCode: currentExecution.reasonCode ?? observed.reasonCode,
+        message: observedReprocessMessage(
+          observationDetailOf({
+            status: currentExecution.status,
+            reasonCode: currentExecution.reasonCode,
+            normalizedResult: currentExecution.normalizedResult,
+          }),
+        ),
       };
     }
 
@@ -1375,7 +1617,11 @@ export class InboundConversionAutomationIngestionService {
       };
     }
     const payload = this.decryptAutomationPayload(delivery);
-    const parsed = this.parseAutomation(endpoint, payload);
+    const parsed = this.parseAutomation(
+      endpoint,
+      payload,
+      delivery.firstReceivedAt,
+    );
     if (!parsed.ok) {
       return {
         deliveryId,
@@ -1551,6 +1797,37 @@ export class InboundConversionAutomationIngestionService {
     });
   }
 
+  /** Callback origin stored with the delivery (first receipt). */
+  private async storedCallbackOrigin(
+    endpoint: PublicConversionEndpoint,
+    deliveryId: string,
+  ): Promise<AutomationCallbackOrigin | null> {
+    try {
+      const delivery = await this.prisma.inboundWebhookDelivery.findFirst({
+        where: {
+          id: deliveryId,
+          workspaceId: endpoint.workspaceId,
+          connectionId: endpoint.providerRule.connectionId,
+          providerRuleEndpointId: endpoint.id,
+        },
+        select: { normalizedSummary: true },
+      });
+      const stored = this.jsonRecord(
+        this.jsonRecord(delivery?.normalizedSummary)?.callbackOrigin as
+          | Prisma.JsonValue
+          | undefined,
+      );
+      if (!stored || typeof stored.connectionId !== "string") return null;
+      return {
+        connectionId: stored.connectionId,
+        channelId:
+          typeof stored.channelId === "string" ? stored.channelId : null,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   private jsonRecord(
     value: Prisma.JsonValue | null | undefined,
   ): Record<string, Prisma.JsonValue> | null {
@@ -1578,7 +1855,11 @@ export class InboundConversionAutomationIngestionService {
   private async authenticateEndpoint(
     endpointId: string,
     token: unknown,
-  ): Promise<PublicConversionEndpoint> {
+  ): Promise<{
+    endpoint: PublicConversionEndpoint;
+    /** Old URL of a rule merged by "Unificar" (its callbacks go to the target). */
+    forwardedFrom: PublicConversionEndpoint | null;
+  }> {
     let endpoint: PublicConversionEndpoint | null;
     try {
       endpoint = asBoundEndpoint(
@@ -1596,12 +1877,46 @@ export class InboundConversionAutomationIngestionService {
       token,
     );
     const rule = endpoint?.providerRule;
-    // Payt rules intentionally sit on the WhatsApp connection of their
-    // numbers. The persisted parser release, not that connection's provider,
-    // identifies the callback contract.
-    const isPaytAutomation =
-      rule?.parserRelease.provider === "payt" &&
-      rule?.parserRelease.version === PAYT_AUTOMATION_V1_PARSER_VERSION;
+    // Sales-platform rules (Payt, Braip) intentionally sit on the WhatsApp
+    // connection of their numbers. The persisted parser release, not that
+    // connection's provider, identifies the callback contract.
+    const isPaytAutomation = salesPlatformOf(rule?.parserRelease) !== null;
+
+    // "Unificar" of automations (21/10/2026): the merged rule is paused and
+    // linked to the rule for all numbers. Its OLD URL keeps working: the
+    // callback is handed to the unified rule (same ingress key as the
+    // per-event URL, so both URLs collapse into one delivery).
+    if (
+      endpoint &&
+      rule &&
+      tokenMatches &&
+      endpoint.removedAt === null &&
+      endpoint.publicUrlDisabledAt == null &&
+      rule.removedAt === null &&
+      !rule.conversionRule.active &&
+      rule.unifiedIntoProviderRuleId &&
+      rule.conversionRule.triggerType === "provider_automation" &&
+      !isPaytAutomation &&
+      (rule.connection.provider === "umbler" ||
+        rule.connection.provider === "unnichat") &&
+      rule.connection.removedAt === null &&
+      ["observation", "production"].includes(rule.connection.status) &&
+      rule.parserRelease.status !== "retired"
+    ) {
+      const target = await this.loadRoutableEndpoint(
+        endpoint.workspaceId,
+        rule.unifiedIntoProviderRuleId,
+      );
+      if (
+        target &&
+        target.providerRule.parserRelease.provider ===
+          rule.parserRelease.provider &&
+        target.providerRule.conversionRule.eventName ===
+          rule.conversionRule.eventName
+      ) {
+        return { endpoint: target, forwardedFrom: endpoint };
+      }
+    }
 
     if (
       !endpoint ||
@@ -1616,7 +1931,10 @@ export class InboundConversionAutomationIngestionService {
       rule.conversionRule.triggerType !== "provider_automation" ||
       (!isPaytAutomation &&
         rule.connection.provider !== "umbler" &&
-        rule.connection.provider !== "unnichat") ||
+        rule.connection.provider !== "unnichat" &&
+        // Fase 6.8: the ROI Chat rule's own URL is born disabled (the
+        // purchase arrives on the number URL); kept here for parity.
+        rule.connection.provider !== "roichat") ||
       rule.connection.removedAt !== null ||
       !["observation", "production"].includes(rule.connection.status) ||
       rule.parserRelease.status === "retired"
@@ -1624,7 +1942,7 @@ export class InboundConversionAutomationIngestionService {
       throw new NotFoundException(publicEndpointNotFoundMessage);
     }
 
-    return endpoint;
+    return { endpoint, forwardedFrom: null };
   }
 
   /**
@@ -1649,9 +1967,7 @@ export class InboundConversionAutomationIngestionService {
       throw new ServiceUnavailableException(publicPersistenceFailureMessage);
     }
     const rule = endpoint?.providerRule;
-    const isPaytAutomation =
-      rule?.parserRelease.provider === "payt" &&
-      rule?.parserRelease.version === PAYT_AUTOMATION_V1_PARSER_VERSION;
+    const isPaytAutomation = salesPlatformOf(rule?.parserRelease) !== null;
     if (
       !endpoint ||
       !rule ||
@@ -1660,7 +1976,9 @@ export class InboundConversionAutomationIngestionService {
       rule.conversionRule.triggerType !== "provider_automation" ||
       (!isPaytAutomation &&
         rule.connection.provider !== "umbler" &&
-        rule.connection.provider !== "unnichat") ||
+        rule.connection.provider !== "unnichat" &&
+        // Fase 6.8: the ROI Chat purchase routed from the number URL.
+        rule.connection.provider !== "roichat") ||
       rule.connection.removedAt !== null ||
       !["observation", "production"].includes(rule.connection.status) ||
       rule.parserRelease.status === "retired"
@@ -1694,35 +2012,62 @@ export class InboundConversionAutomationIngestionService {
     return rawBody;
   }
 
+  /** Braip (6.5): JSON or form-urlencoded, converted to canonical JSON. */
+  private requireBraipBody(
+    contentType: string | undefined,
+    rawBody: Buffer | undefined,
+  ): Buffer {
+    if (!rawBody || rawBody.length === 0) {
+      throw new BadRequestException("Payload obrigatório");
+    }
+    if (rawBody.length > MAX_INBOUND_WEBHOOK_PAYLOAD_BYTES) {
+      throw new PayloadTooLargeException("Payload do webhook excede o limite");
+    }
+    const normalized = normalizeBraipBody(contentType, rawBody);
+    if (!normalized.ok) {
+      if (normalized.errorCode === "braip_body_unsupported") {
+        throw new UnsupportedMediaTypeException(
+          "Webhook requer JSON ou application/x-www-form-urlencoded",
+        );
+      }
+      throw new BadRequestException("Payload inválido");
+    }
+    return normalized.body;
+  }
+
   private parseAutomation(
     endpoint: PublicConversionEndpoint,
     payload: unknown,
+    // Arrival of the stored postback (re-evaluation); live ingestion = now.
+    receivedAt?: Date,
   ): AutomationParseResult {
     const rule = endpoint.providerRule;
-    if (
-      rule.parserRelease.provider === "payt" &&
-      rule.parserRelease.version === PAYT_AUTOMATION_V1_PARSER_VERSION
-    ) {
-      // A Payt postback may be Purchase, InitiateCheckout or CartAbandoned. A
-      // rule only takes its own event; any other one is ignored (never an
-      // error), exactly like a non-purchase on a Purchase rule.
-      const notThisRule =
-        rule.conversionRule.eventName === "Purchase"
-          ? "payt_automation_v1_not_purchase"
-          : "payt_automation_v1_event_not_in_rule";
+    const salesPlatform = salesPlatformOf(rule.parserRelease);
+    if (salesPlatform) {
+      // A sales-platform postback (Payt, Braip) may be Purchase,
+      // InitiateCheckout or CartAbandoned. A rule only takes its own event;
+      // any other one is ignored (never an error), exactly like a
+      // non-purchase on a Purchase rule.
+      const notThisRule = saleNotThisRuleErrorCode(
+        salesPlatform,
+        rule.conversionRule.eventName,
+      );
       // Classify the event FIRST: a postback of another event (or of an
       // unsupported status) is ignored before identity/phone/value are
       // judged.
-      if (paytSaleEventNameOf(payload) !== rule.conversionRule.eventName) {
+      if (
+        saleEventNameOf(salesPlatform, payload) !==
+        rule.conversionRule.eventName
+      ) {
         return { ok: false, errorCode: notThisRule };
       }
       // Purchase rules keep the validated Purchase-only contract.
       const parsed =
         rule.conversionRule.eventName === "Purchase"
-          ? parsePaytAutomationV1(payload)
-          : parsePaytSaleEventV1(payload);
+          ? parseSalePurchaseV1(salesPlatform, payload, { receivedAt })
+          : parseSaleEventV1(salesPlatform, payload, { receivedAt });
       if (!parsed.ok) {
-        return parsed.errorCode === "payt_sale_v1_status_not_supported"
+        return "kind" in parsed && parsed.kind === "status_not_supported"
           ? { ok: false, errorCode: notThisRule }
           : { ok: false, errorCode: parsed.errorCode };
       }
@@ -1735,7 +2080,7 @@ export class InboundConversionAutomationIngestionService {
           ...parsed.value,
           externalExecutionKey: buildProviderPurchaseIdentity({
             workspaceId: endpoint.workspaceId,
-            provider: "payt",
+            provider: salesPlatform,
             accountRef: parsed.value.accountRef,
             orderRef: parsed.value.orderRef,
             eventName: parsed.value.eventName,
@@ -1748,6 +2093,14 @@ export class InboundConversionAutomationIngestionService {
       rule.parserRelease.version === UMBLER_AUTOMATION_V1_PARSER_VERSION
     ) {
       return parseUmblerAutomationV1(payload);
+    }
+    if (
+      rule.parserRelease.provider === "roichat" &&
+      rule.parserRelease.version === ROICHAT_AUTOMATION_V1_PARSER_VERSION
+    ) {
+      // The rule only takes purchases (the number URL also receives the
+      // lead entries, which never reach a rule).
+      return parseRoichatAutomationV1(payload, receivedAt ?? new Date());
     }
     if (
       rule.parserRelease.provider === "unnichat" &&
@@ -1781,8 +2134,14 @@ export class InboundConversionAutomationIngestionService {
     switch (endpoint.providerRule.parserRelease.provider) {
       case "payt":
         return "payt-automation-v1";
+      case "braip":
+        return "braip-automation-v1";
+      case "yampi":
+        return "yampi-automation-v1";
       case "unnichat":
         return "unnichat-automation-v1";
+      case "roichat":
+        return "roichat-automation-v1";
       default:
         return "umbler-automation-v1";
     }
@@ -1833,13 +2192,21 @@ export class InboundConversionAutomationIngestionService {
      * reprocess or a resend by the old URL decides the same number.
      */
     routedChannelId?: string;
+    /** Callback origin (porte do #159); the one stored with the delivery wins. */
+    origin?: AutomationCallbackOrigin | null;
   }): Promise<ProviderConversionAutomationObservationResult> {
     const routedChannelId =
       input.routedChannelId ??
       (await this.storedRoutedChannelId(input.endpoint, input.deliveryId));
+    // Replays and resends keep the origin of the first receipt.
+    const origin =
+      (await this.storedCallbackOrigin(input.endpoint, input.deliveryId)) ??
+      input.origin ??
+      null;
     const observed = await this.conversionObservation.observeAutomation({
       workspaceId: input.endpoint.workspaceId,
       connectionId: input.endpoint.providerRule.connectionId,
+      origin,
       deliveryId: input.deliveryId,
       externalDeliveryId: input.parsed.externalExecutionKey,
       deliveryReceivedAt: input.deliveryReceivedAt,
@@ -1877,6 +2244,14 @@ export class InboundConversionAutomationIngestionService {
           currency:
             "currency" in input.parsed ? input.parsed.currency : undefined,
           testCallback: "test" in input.parsed ? input.parsed.test : undefined,
+          // ROI Chat: 12h repeat guard identity (digest, no PII) and where
+          // the purchase time came from (payload, arrival or future-capped).
+          ...("purchaseFingerprint" in input.parsed
+            ? {
+                purchaseFingerprint: input.parsed.purchaseFingerprint,
+                eventTimeSource: input.parsed.eventTimeSource,
+              }
+            : {}),
           decisionId: observed.decisionId,
           decisionCode: observed.decisionCode,
           executionStatus: this.automationObservationStatus(observed),
@@ -1884,6 +2259,7 @@ export class InboundConversionAutomationIngestionService {
           channelResolved: Boolean(observed.channelId),
           paidLeadResolved: observed.leadResolved,
           manuallyReprocessed: input.manualRecovery === true,
+          ...(origin ? { callbackOrigin: origin } : {}),
           evaluatedAt: processedAt.toISOString(),
           ...(routedChannelId ? { routedChannelId } : {}),
         }),
@@ -2042,10 +2418,10 @@ export class InboundConversionAutomationIngestionService {
       return { parsed: stored.parsed ?? input.parsed };
     }
 
-    // Only Payt resends may cure a source mismatch; other providers keep the
-    // stored body once a decision exists.
+    // Only sales-platform resends (Payt, Braip) may cure a source mismatch;
+    // other providers keep the stored body once a decision exists.
     const mismatchExecutionId =
-      input.endpoint.providerRule.parserRelease?.provider === "payt"
+      salesPlatformOf(input.endpoint.providerRule.parserRelease) !== null
         ? await this.sourceMismatchExecutionId(
             input.endpoint,
             input.parsed.externalExecutionKey,
@@ -2137,6 +2513,7 @@ export class InboundConversionAutomationIngestionService {
         encryptionKeyVersion: true,
         payloadExpiresAt: true,
         normalizedSummary: true,
+        firstReceivedAt: true,
       },
     });
     if (
@@ -2167,6 +2544,7 @@ export class InboundConversionAutomationIngestionService {
       const parsed = this.parseAutomation(
         endpoint,
         JSON.parse(rawBody.toString("utf8")) as unknown,
+        delivery.firstReceivedAt,
       );
       return {
         rawBody,
@@ -2282,6 +2660,8 @@ export class InboundConversionAutomationIngestionService {
     providerAttempt: number | null;
     integrationEndpointId: string | null;
     rawBodyLength: number;
+    touchRuleEndpoint: boolean;
+    origin: AutomationCallbackOrigin | null;
     receivedAt: Date;
     /** Original receipt of the occurrence ("Tentar de novo"); else receivedAt. */
     firstReceivedAt?: Date;
@@ -2340,10 +2720,14 @@ export class InboundConversionAutomationIngestionService {
                   parserStatus: "parsed",
                   automation: parsed.automation,
                   eventName: parsed.eventName,
+                  ...("purchaseFingerprint" in parsed
+                    ? { purchaseFingerprint: parsed.purchaseFingerprint }
+                    : {}),
                   executionStatus: "decision_pending",
                   reasonCode: "decision_pending",
                   channelResolved: false,
                   paidLeadResolved: false,
+                  ...(input.origin ? { callbackOrigin: input.origin } : {}),
                   rawBodyLength: input.rawBodyLength,
                 }
               : {
@@ -2367,7 +2751,7 @@ export class InboundConversionAutomationIngestionService {
         input.endpoint,
         input.receivedAt,
         Boolean(parsed),
-        input.integrationEndpointId === null,
+        input.touchRuleEndpoint,
       );
     });
   }

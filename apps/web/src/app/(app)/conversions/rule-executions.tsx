@@ -7,6 +7,11 @@ import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { PresentationMask } from "../../../components/presentation-mask";
 import { executionReasonLabel } from "../settings/provider-conversion-labels";
+import {
+  isDeferredToRuleReason,
+  leadSubmittedOverrideCopy,
+  leadsAwaitingRuleLabel,
+} from "./lead-submitted-override";
 import type {
   ConversionScreenActionResult,
   ProviderConversionRuleActionResult,
@@ -24,7 +29,7 @@ const statusLabels: Record<
   ProviderConversionRuleExecutionAuditDto["items"][number]["status"],
   { label: string; tone: "" | "warn" | "bad" | "neutral" }
 > = {
-  observed: { label: "Reconhecida em observação", tone: "neutral" },
+  observed: { label: "Reconhecida sem envio", tone: "neutral" },
   eligible: { label: "Na fila de envio", tone: "neutral" },
   materialized: { label: "Evento enviado", tone: "" },
   duplicate: { label: "Repetida", tone: "warn" },
@@ -155,7 +160,7 @@ export function RuleExecutions({
           <dd>{audit.summary.materialized}</dd>
         </div>
         <div>
-          <dt>Em observação</dt>
+          <dt>Sem envio</dt>
           <dd>{audit.summary.observed}</dd>
         </div>
         <div>
@@ -163,6 +168,17 @@ export function RuleExecutions({
           <dd>{audit.summary.blocked + audit.summary.failed}</dd>
         </div>
       </dl>
+      {audit.leadsAwaitingRule &&
+      leadsAwaitingRuleLabel(audit.leadsAwaitingRule) ? (
+        <div
+          className="feedback-banner warn"
+          role="status"
+          data-lead-submitted-override="awaiting"
+        >
+          <strong>{leadsAwaitingRuleLabel(audit.leadsAwaitingRule)}</strong>
+          <span>{leadSubmittedOverrideCopy.awaitingHint}</span>
+        </div>
+      ) : null}
       <BlockedReprocessPanel
         summary={audit.blockedReprocess}
         canManage={canManage && Boolean(reprocessAction)}
@@ -177,7 +193,10 @@ export function RuleExecutions({
       ) : (
         <ul className="conversion-executions-list" role="list">
           {audit.items.map((item) => {
-            const status = statusLabels[item.status];
+            // Tarefa 20: deferred entry receipt is not queued.
+            const status = isDeferredToRuleReason(item.reasonCode)
+              ? { label: leadSubmittedOverrideCopy.deferredChip, tone: "neutral" as const }
+              : statusLabels[item.status];
             return (
               <li key={item.executionId}>
                 <div className="conversion-executions-head">
@@ -256,7 +275,9 @@ function BlockedReprocessPanel({
 }) {
   if (!summary) return null;
   const rulePaused = summary.ruleSendsNow === false;
-  const total = summary.ready + summary.stillBlocked + summary.expired;
+  const alreadyConverted = summary.alreadyConverted ?? 0;
+  const total =
+    summary.ready + summary.stillBlocked + alreadyConverted + summary.expired;
   if (total === 0 && !note) return null;
 
   return (
@@ -284,6 +305,14 @@ function BlockedReprocessPanel({
               <span className="status-chip warn">{summary.stillBlocked}</span>{" "}
               {summary.stillBlocked === 1 ? "fica como está" : "ficam como estão"}
             </li>
+            {alreadyConverted > 0 ? (
+              <li>
+                <span className="status-chip neutral">{alreadyConverted}</span>{" "}
+                {alreadyConverted === 1
+                  ? "já convertida por outro número ou pela entrada do anúncio (não é reenviada)"
+                  : "já convertidas por outro número ou pela entrada do anúncio (não são reenviadas)"}
+              </li>
+            ) : null}
             <li>
               <span className="status-chip neutral">{summary.expired}</span>{" "}
               {summary.expired === 1 ? "expirada" : "expiradas"} (mais de{" "}
@@ -294,12 +323,12 @@ function BlockedReprocessPanel({
             Reenviamos só conversas dos últimos {summary.windowDays} dias
             (limite da Meta) e nunca enviamos a mesma conversão duas vezes.
             Conversas de números sem envio ativo, pausados de propósito na época
-            ou que não são QR ficam como estão.
+            ou que não são Uazapi/WAHA ficam como estão.
           </p>
           {rulePaused ? (
             <p className="action-note warn">
-              A regra está pausada ou em observação: nada é reenviado até
-              você ativar o envio automático dela.
+              A regra está pausada ou com o envio desligado: nada é reenviado
+              até você retomar o envio dela.
             </p>
           ) : summary.ready === 0 && summary.stillBlocked > 0 ? (
             <p className="action-note warn">

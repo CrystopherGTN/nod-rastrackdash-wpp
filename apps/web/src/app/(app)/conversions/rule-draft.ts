@@ -9,6 +9,7 @@ import {
   conversionEventRequiresValue,
 } from "@wpptrack/shared";
 import {
+  automationPlatformOf,
   contactMessageProviders,
   originChannelProviders,
   ruleOriginDefinition,
@@ -46,8 +47,18 @@ export type RuleDraft = {
   eventName: ConversionEventNameDto;
   scope: RuleScopeChoice;
   channelIds: string[];
-  /** Automação da Umbler: a conexão que recebe a chamada. */
+  /**
+   * Automação Umbler/Unnichat: a conexão âncora da regra. Nula numa regra
+   * nova (vem dos números escolhidos ou, em "Todos os números", da conexão
+   * viva mais antiga do provedor); fixa ao editar (Fase 6.1a, #159).
+   */
   connectionId: string | null;
+  /**
+   * Umbler/Unnichat "Todos os números": true = "da <plataforma> (todas as
+   * conexões)" (default of a new rule); false = only the rule's connection
+   * (the historical shape of existing rules).
+   */
+  crossConnection: boolean;
   name: string;
   primaryPhrase: string;
   variationPhrases: string;
@@ -95,6 +106,7 @@ export function emptyRuleDraft(
     scope: "all_numbers",
     channelIds: [],
     connectionId: null,
+    crossConnection: definition.connection === "provider_anchor",
     name: "",
     primaryPhrase: "",
     variationPhrases: "",
@@ -118,6 +130,48 @@ export function emptyRuleDraft(
 
 type Result<T> = { ok: true; value: T } | { ok: false; message: string };
 
+/** Umbler/Unnichat: os números específicos de uma regra ficam numa conexão. */
+export function automationSingleConnectionNote(origin: string): string {
+  return `Em “Números específicos”, escolha números de uma mesma conexão. Para vários números de conexões diferentes, use “Todos os números ${automationPlatformOf(origin)}”.`;
+}
+
+/** "Unnichat" / "Umbler" no texto do alcance de uma automação. */
+export function automationPlatformName(origin: string): string {
+  if (origin === "automation_umbler") return "Umbler";
+  if (origin === "automation_roichat") return "ROI Chat";
+  return "Unnichat";
+}
+
+/**
+ * Âncora de uma regra NOVA Umbler/Unnichat para todos os números: uma
+ * conexão viva do provedor com número aqui (produção primeiro, depois a
+ * ordem da lista). Ela só guarda as entregas da regra: todos os números do
+ * provedor são cobertos qualquer que seja a âncora.
+ */
+export function automationAnchorConnectionId(
+  origin: ProviderConversionRuleOriginDto,
+  context: Pick<DraftContext, "numbers" | "connections"> &
+    Partial<Pick<DraftContext, "capabilities">>,
+): string | null {
+  const providers = originChannelProviders(origin, context.capabilities ?? null);
+  const withNumbers = new Set(
+    context.numbers
+      .filter((number) => providers.includes(number.provider))
+      .map((number) => number.connectionId),
+  );
+  const candidates = context.connections.filter(
+    (connection) =>
+      providers.includes(connection.provider) &&
+      connection.status !== "paused" &&
+      withNumbers.has(connection.id),
+  );
+  return (
+    candidates.find((connection) => connection.status === "production")?.id ??
+    candidates[0]?.id ??
+    null
+  );
+}
+
 /**
  * Conexão enviada com a regra. A automação da Umbler usa a conexão escolhida;
  * frase, catálogo e etiqueta só levam conexão quando todos os números
@@ -135,8 +189,12 @@ export function resolveRuleConnectionId(
     .map((id) => context.numbers.find((number) => number.id === id))
     .filter((number): number is ConversionNumber => Boolean(number));
 
-  if (definition.connection === "same_provider") {
-    return draft.connectionId;
+  if (definition.connection === "provider_anchor") {
+    // Editing keeps the rule's connection; a new rule takes the chosen
+    // numbers' connection, or an anchor of the provider for all numbers.
+    if (draft.connectionId) return draft.connectionId;
+    if (draft.scope === "specific_numbers") return chosen[0]?.connectionId ?? null;
+    return automationAnchorConnectionId(draft.origin, context);
   }
 
   if (definition.connection === "any") {
@@ -146,10 +204,25 @@ export function resolveRuleConnectionId(
       draft.origin,
       context.capabilities ?? null,
     );
+    // Porte do SaaS #164: números não lidos (um /channels que falhou) não
+    // escondem a plataforma de venda; "Todos os números" ainda fica preso a
+    // uma conexão de WhatsApp da conta (a em produção primeiro).
+    const whatsappConnections = context.connections.filter((connection) =>
+      providers.includes(connection.provider),
+    );
     return (
       chosen[0]?.connectionId ??
       context.numbers.find((number) => providers.includes(number.provider))
         ?.connectionId ??
+      (draft.scope === "all_numbers"
+        ? (whatsappConnections.find(
+            (connection) => connection.status === "production",
+          ) ??
+            whatsappConnections.find(
+              (connection) => connection.status !== "paused",
+            ) ??
+            whatsappConnections[0])?.id
+        : undefined) ??
       null
     );
   }
@@ -174,6 +247,21 @@ export function draftChannelProviders(
 export const paytSingleConnectionNote =
   "As vendas da Payt ficam ligadas à conexão dos números escolhidos: escolha números de uma mesma conexão.";
 
+export const braipSingleConnectionNote =
+  "As vendas da Braip ficam ligadas à conexão dos números escolhidos: escolha números de uma mesma conexão.";
+
+export const yampiSingleConnectionNote =
+  "As vendas da Yampi ficam ligadas à conexão dos números escolhidos: escolha números de uma mesma conexão.";
+
+/** Nota de "mesma conexão" da plataforma de venda da origem (Payt, Braip, Yampi). */
+export function salesSingleConnectionNote(origin: string): string {
+  return origin === "automation_braip"
+    ? braipSingleConnectionNote
+    : origin === "automation_yampi"
+      ? yampiSingleConnectionNote
+      : paytSingleConnectionNote;
+}
+
 /** Why the chosen reach cannot be sent, or null when it is fine. */
 export function scopeIssue(
   draft: Pick<
@@ -183,10 +271,6 @@ export function scopeIssue(
   context: DraftContext,
 ): string | null {
   const definition = ruleOriginDefinition(draft.origin);
-
-  if (definition.connection === "same_provider" && !draft.connectionId) {
-    return "Escolha a conexão que vai chamar o endereço desta regra.";
-  }
 
   if (draft.scope === "all_numbers") {
     return null;
@@ -209,16 +293,18 @@ export function scopeIssue(
       : "Um dos números escolhidos ainda não funciona com esta origem.";
   }
   if (
-    definition.connection === "same_provider" &&
-    chosen.some((number) => number.connectionId !== draft.connectionId)
+    definition.connection === "provider_anchor" &&
+    (new Set(chosen.map((number) => number.connectionId)).size > 1 ||
+      (draft.connectionId !== null &&
+        chosen.some((number) => number.connectionId !== draft.connectionId)))
   ) {
-    return "Escolha só números da conexão selecionada.";
+    return automationSingleConnectionNote(draft.origin);
   }
   if (
     definition.connection === "any" &&
     new Set(chosen.map((number) => number.connectionId)).size > 1
   ) {
-    return paytSingleConnectionNote;
+    return salesSingleConnectionNote(draft.origin);
   }
   return null;
 }
@@ -373,8 +459,9 @@ function catalogPayload(
 }
 
 /**
- * Create payload for POST /conversion-rules/providers. Rules always start in
- * observation (nothing is sent to Meta until "Ativar envio automático").
+ * Create payload for POST /conversion-rules/providers. Fase 6.1c (produção
+ * direta): no mode is sent, so the API decides; a rule of a validated
+ * integration is born sending to Meta.
  */
 export function buildRulePayload(
   draft: RuleDraft,
@@ -408,30 +495,66 @@ export function buildRulePayload(
     ...(connectionId ? { connectionId } : {}),
     ...(draft.scope === "all_numbers" ? { scope: "all_numbers" } : {}),
     channelIds: draft.scope === "all_numbers" ? [] : [...draft.channelIds],
-    mode: "observation",
   };
 
   switch (draft.origin) {
     case "automation_payt":
-      // O valor de cada venda e o evento vêm do postback da Payt: nada de
-      // valor médio, frases ou etiquetas.
+    case "automation_braip":
+    case "automation_yampi":
+      // O valor de cada venda e o evento vêm do postback da plataforma: nada
+      // de valor médio, frases ou etiquetas. A Braip (6.5) e a Yampi (6.7)
+      // recebem só pela URL única: a URL própria da regra nasce sempre
+      // desativada.
       return {
         ok: true,
         value: {
           ...base,
           triggerType: "provider_automation",
           eventName,
-          automationSource: "payt",
+          automationSource:
+            draft.origin === "automation_braip"
+              ? "braip"
+              : draft.origin === "automation_yampi"
+                ? "yampi"
+                : "payt",
           ...(draft.productCodes.length > 0
             ? { productFilterCodes: [...draft.productCodes] }
             : {}),
-          ...(context.singleUrl ? { perRuleUrl: false } : {}),
+          ...(context.singleUrl ||
+          draft.origin === "automation_braip" ||
+          draft.origin === "automation_yampi"
+            ? { perRuleUrl: false }
+            : {}),
           // Moeda da venda -> da regra -> do workspace.
           ...(conversionEventCarriesValue(eventName) && draft.currency
             ? { defaultCurrency: draft.currency }
             : {}),
         },
       };
+    case "automation_roichat": {
+      // Fase 6.8 (porte do #183): só compra; o valor vem da venda
+      // (valor_venda/moeda). O valor da regra é só reserva, opcional.
+      const cents = moneyToCents(draft.averageValue);
+      if (draft.averageValue.trim() && !cents) {
+        return { ok: false, message: "Informe um valor de reserva válido." };
+      }
+      return {
+        ok: true,
+        value: {
+          ...base,
+          triggerType: "provider_automation",
+          eventName: "Purchase",
+          automationSource: "roichat",
+          ...(cents ? { defaultValueCents: cents } : {}),
+          ...(draft.currency ? { defaultCurrency: draft.currency } : {}),
+          ...(draft.scope === "all_numbers" && draft.crossConnection
+            ? { crossConnectionScope: true }
+            : {}),
+          // A compra chega pela URL de cada número (sem URL por regra).
+          perRuleUrl: false,
+        },
+      };
+    }
     case "automation_umbler":
     case "automation_unnichat": {
       const values = valueFields({ ...draft, eventName }, false);
@@ -443,6 +566,9 @@ export function buildRulePayload(
           triggerType: "provider_automation",
           eventName,
           ...values.value,
+          ...(draft.scope === "all_numbers" && draft.crossConnection
+            ? { crossConnectionScope: true }
+            : {}),
           ...(context.singleUrl ? { perRuleUrl: false } : {}),
         },
       };

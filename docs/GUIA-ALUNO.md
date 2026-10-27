@@ -127,7 +127,7 @@ Fluxo: **Salvar conexão → Testar → Gerar receiver** (copie a URL completa, 
 
 As variáveis `UAZAPI_*`/`WAHA_*`/`ZAPI_*`/`NOD_API_BROKER_URL` continuam existindo, mas hoje são só o **padrão do deployment** (fallback quando a conexão não traz aquele campo) — não são mais o caminho principal.
 
-### 10.2 Aba Atendimento e vendas — cards Umbler, Gupshup, Data Crazy, Unnichat e Payt (e WhatsApp Cloud API na aba WhatsApp)
+### 10.2 Aba Atendimento e vendas — cards Umbler, Gupshup, Data Crazy, Unnichat, Payt, Braip e Yampi (e WhatsApp Cloud API na aba WhatsApp)
 
 Conexões por workspace, cada uma com segredo próprio. **Umbler Talk** e **Gupshup**:
 
@@ -152,19 +152,50 @@ canal é diferente:
    fazem parte do parser v1.
 5. O parser **Data Crazy v1** já vem certificado pela atualização (é o mesmo
    contrato validado com CTWAs reais no SaaS); não há passo de certificação.
-   Depois que uma entrega CTWA real for processada em observação, configure
-   a rota Meta e ative produção (a conexão e cada regra, uma a uma), no mesmo
-   gate de Gupshup e Meta Cloud. Nada vai para produção sozinho.
+   Produção direta: a conexão nasce em produção, o número já envia quando
+   aparece e cada regra nasce enviando. Configure a rota Meta (página e
+   pixel) do número: sem rota, nada é enviado e a prontidão do número diz o
+   que falta.
 
 **Payt** (plataforma de venda) não tem conexão própria: as vendas viram
 conversões por uma regra em **Conversões → Nova regra → origem Payt**, uma
 regra por evento (Compra aprovada → `Purchase`, Pix/boleto gerado →
 `InitiateCheckout`, Carrinho abandonado (beta) → `CartAbandoned`). Copie o
 endereço da regra para o Postback da Payt e confira em **Eventos recebidos**;
-a regra nasce em observação. Só vendas de leads CTWA (com `ctwa_clid`) dos
+a regra já nasce enviando. Só vendas de leads CTWA (com `ctwa_clid`) dos
 números da regra são enviadas; sem ID do anúncio, só de leads que entraram por
 um número Unnichat (par único página + pixel). Passo a passo, verificação e
 rollback em [`setup/payt.md`](setup/payt.md).
+
+**Braip** (plataforma de venda, Fase 6.5) também não tem conexão própria e
+recebe por uma **URL única** da conta: no card **Braip**, clique em **Gerar
+URL única**, copie e cole na Braip em **Ferramentas → Postback → Nova
+configuração** (todos os produtos, método POST; eventos Pagamento Aprovado e
+Aguardando Pagamento). Depois crie em **Conversões → Nova regra → Venda na
+Braip** uma regra por evento (Compra aprovada → `Purchase`, Boleto/Pix gerado
+→ `InitiateCheckout`, Checkout abandonado (beta) → `CartAbandoned`); a regra
+já nasce enviando e não há nada para liberar ou certificar: o leitor da Braip
+já vem em uso com a atualização. Reembolso, chargeback e cancelamento são
+recebidos e ignorados. As vendas que não viraram conversão aparecem em
+**Vendas sem atribuição**, com o motivo e **Ver dados recebidos**; tudo o que
+chegou pelas URLs únicas fica em **Backoffice → Webhooks WhatsApp →
+Recebimentos das URLs únicas**. Passo a passo, verificação e recuperação em
+[`setup/braip.md`](setup/braip.md).
+
+**Yampi** (plataforma de venda, Fase 6.7) funciona como a Braip e está
+liberada para todos os workspaces: no card **Yampi**, clique em **Gerar URL
+única**, copie e cadastre num webhook da loja na Yampi com os eventos
+`order.paid`, `order.created`, `order.status.updated` e `cart.reminder` (não
+precisa copiar a chave secreta da Yampi). Depois crie em **Conversões → Nova
+regra → Venda na Yampi** uma regra por evento (Pedido pago → `Purchase`,
+Pedido aguardando pagamento (boleto/Pix) → `InitiateCheckout`, Carrinho
+abandonado (beta) → `CartAbandoned`); a regra já nasce enviando e não há nada
+para liberar ou certificar: o leitor da Yampi já vem em uso (validado com
+payloads reais no SaaS). O valor é só o dos produtos (sem frete e sem juros) e
+a Compra leva à Meta os itens reais do pedido, com o order bump. O mesmo
+pedido nunca vira duas compras; cancelamento, reembolso e pagamento recusado
+são recebidos e ignorados. Passo a passo, conferência e recuperação em
+[`setup/yampi.md`](setup/yampi.md).
 
 **Unnichat** é uma conexão por número: no card **Unnichat**, informe o
 número de WhatsApp do cliente (não o do lead) ao gerar o webhook, cole a URL de entrada
@@ -174,8 +205,24 @@ regra por evento e chame a URL dela no ponto do fluxo. Sem `ctwa_clid` nada é
 enviado; lead com `ctwa_clid` e sem ID do anúncio vai pelo único par página +
 pixel do número. Cada número escolhe o roteamento Meta: **Herdar do workspace**
 (padrão) ou **Configurar neste número**, com a prontidão e o motivo. Parsers certificados pela migration; conexão,
-número e regras nascem em observação. Passo a passo, verificação e rollback em
+número e regras já nascem enviando. Passo a passo, verificação e rollback em
 [`setup/unnichat.md`](setup/unnichat.md).
+
+**ROI Chat** (WhatsApp API Oficial, Fase 6.8) fica na aba **WhatsApp**, ao
+lado de WAHA e WhatsApp Cloud API, e é uma conexão por número: no card **ROI
+Chat**, clique em **Gerar webhook**, informe o nome e o número de WhatsApp
+atendido pelo ROI Chat (o seu, nunca o do lead) e copie a URL completa (com
+`?token=`, aparece uma vez). No ROI Chat, cole essa URL no webhook do mesmo
+número: ela recebe a **entrada** do lead que veio do anúncio (cria o lead) e a
+**compra** (`event_name: "Purchase"`, `valor_venda` e `moeda`). Para a
+compra virar `Purchase` na Meta, crie em **Conversões → Nova regra → Compra no
+ROI Chat** a regra para todos os números do ROI Chat ou para números
+específicos; o valor vem da própria compra. A mesma compra repetida em menos de
+12 horas conta uma vez só. Os leitores já vêm em uso (validados com payloads
+reais do ROI Chat): conexão, número e regra já nascem enviando, sem liberar
+nada. A rota da Meta do número é aprendida pelo anúncio da primeira entrada
+(com a conta de anúncio conectada em Meta Ads). Passo a passo, conferência e
+recuperação em [`setup/roichat.md`](setup/roichat.md).
 
 ### 10.3 Meta WhatsApp (Cloud API) — conectar a Meta direto (CTWA)
 
@@ -222,7 +269,7 @@ suportado como conexão inbound por webhook, conforme o passo 10.2.
 
 Detalhe completo de cada variável em [`setup/environment.md`](setup/environment.md#gatilhos-de-conversão--obrigatórias-no-caminho-do-aluno).
 
-A origem aparece na central de Gatilhos assim que existe uma conexão inbound (Umbler, Gupshup, Meta Cloud). **Data Crazy** segue o fluxo CTWA de observação e ativação de produção do passo 10.2 (o parser já vem certificado); o canal só é descoberto após o primeiro webhook. Para **Uazapi**, a origem é criada automaticamente pelo produto quando chega a primeira mensagem **enviada pelo número conectado** ou uma mudança de etiqueta. A **WAHA** também cria a origem automaticamente (regras de frase da equipe, sem etiquetas). A **Z-API** está "Em breve": não recebe lead de anúncio nem tem regras de frase por enquanto.
+A origem aparece na central de Gatilhos assim que existe uma conexão inbound (Umbler, Gupshup, Meta Cloud). **Data Crazy** segue o fluxo CTWA do passo 10.2 (o parser já vem certificado e a conexão nasce em produção); o canal só é descoberto após o primeiro webhook. Para **Uazapi**, a origem é criada automaticamente pelo produto quando chega a primeira mensagem **enviada pelo número conectado** ou uma mudança de etiqueta. A **WAHA** também cria a origem automaticamente (regras de frase da equipe, sem etiquetas). A **Z-API** está "Em breve": não recebe lead de anúncio nem tem regras de frase por enquanto.
 
 ### 10.4 Aba CRM — cards Kommo e Pipedrive (opcional)
 
@@ -238,13 +285,255 @@ WhatsApp que já existe no workspace. **Sem `ctwa_clid` nada é enviado.**
 - **Pipedrive:** gere uma chave nova com `openssl rand -base64 32` e preencha
   `PIPEDRIVE_CRM_ENCRYPTION_KEY` na env da API — **diferente** da chave do
   Kommo (igual ou inválida, a API não sobe). Depois: token de API do Pipedrive →
-  conectar → atualizar catálogo → números autorizados → regras de etapa (nascem
-  em observação) → gerar a URL do webhook (aparece uma vez) → criar no Pipedrive
+  conectar → atualizar catálogo → números autorizados → regras de etapa (já
+  nascem enviando) → gerar a URL do webhook (aparece uma vez) → criar no Pipedrive
   o webhook v2 de **negócio alterado**. Passo a passo em
   [`setup/pipedrive.md`](setup/pipedrive.md).
 
 Com a licença bloqueada, os dois CRMs ficam só leitura (gravações respondem 423)
 e nada é processado ou enviado em segundo plano.
+
+### 10.5 "Lead recebido" pela regra e conversão manual no lead
+
+- **Lead recebido pela regra (ligado por padrão).** Sem nenhuma regra de
+  "Lead recebido", nada muda: o Lead recebido (LeadSubmitted na Meta) é enviado
+  na entrada da conversa do anúncio. Se você criar uma regra de conversão com o
+  evento **Lead recebido** (frase da equipe, catálogo ou automação) e ela
+  estiver ativa e enviando, os números que ela cobre passam a enviar o Lead
+  recebido **quando a regra for acionada**; a entrada da conversa fica só como
+  origem e conta como conversa nos relatórios. Nunca saem os dois: é uma vez
+  por lead e pixel. A lista de regras mostra o selo **"Substitui envio na
+  entrada"**; em **Eventos Meta** a entrada aparece como **"Adiado para a
+  regra"**; e as Execuções da regra mostram "N leads aguardando a regra" quando
+  a regra demora mais de 3 dias. Vale nos números em que pode existir regra de
+  Lead recebido: Uazapi BYO e WAHA (conectadas pela URL do servidor + token, um
+  número por conexão; frase da equipe ou catálogo), Umbler (frase, catálogo ou
+  automação) e Unnichat (automação). Nos números do Meta Cloud, Gupshup e Data
+  Crazy o Lead recebido continua saindo na entrada. Se a conexão WhatsApp do
+  número estiver desativada, a entrada não é adiada; com a licença bloqueada
+  nada é enviado à Meta até a licença voltar. Para desligar, defina
+  `LEAD_SUBMITTED_RULE_OVERRIDE_ENABLED=false` nas variáveis da API e
+  reinicie a API (detalhe em [`setup/environment.md`](setup/environment.md)).
+- **Conversão manual no lead.** Donos e administradores do workspace veem, no
+  detalhe do lead (Leads → abrir o lead → seção Conversões), o botão
+  **"Registrar conversão manual"**: escolha o evento (qualquer um do catálogo),
+  a data (até 90 dias; a Meta só aceita até 7 dias, o resto fica só no
+  painel), o valor e, na Compra, o número do pedido. O destino Meta é o mesmo
+  das automações do lead (anúncio do lead ou entrada CTWA); você não escolhe o
+  pixel. Antes de gravar, a tela mostra se vai para a Meta e, quando não vai,
+  por quê. Proteções: o mesmo evento "uma vez por lead" (Lead recebido, Lead
+  qualificado...) já enviado por uma regra é recusado; usa o mesmo `event_id`
+  da regra, então a Meta nunca conta dois; o mesmo pedido não entra duas vezes
+  (inclusive contra a Payt, a Braip e a Yampi, pelo id do pedido); o mesmo evento nas últimas 24h pede confirmação.
+  Dá para cancelar enquanto nada chegou à Meta. Com a licença bloqueada o botão
+  fica desabilitado (a API responde 423). A compra manual da Hotmart entra
+  quando essa plataforma for portada.
+
+### 10.6 Visão Geral, Relatórios e Eventos Meta: números do período
+
+Nada para configurar; vale logo depois da atualização.
+
+- **Investimento e Conversas Meta seguem o período escolhido.** Na Visão Geral
+  e em Relatórios (campanhas, conjuntos e anúncios), esses números vêm só dos
+  dias sincronizados da Meta dentro do período. Um dia sem dado da Meta conta
+  como zero. Antes, um período depois que os anúncios pararam podia repetir o
+  total da última sincronização.
+- **Aviso "Atenção aos dados da Meta".** Ele aparece quando o período começa
+  antes do primeiro dia que a Meta tem sincronizado ("Dados da Meta disponíveis
+  a partir de dd/mm"). Também aparece quando uma conta de anúncios está há mais
+  de 24 horas sem sincronizar ou com erro. Nesse caso, reconecte a Meta em
+  Integrações ou use **Sincronizar Meta** em Relatórios. Uma conta conectada há
+  menos de 24 horas não gera aviso.
+- **Cards da Visão Geral seguem a sua Jornada** (Configurações → Jornada).
+  Cada etapa visível vira um card, na ordem e com o nome que você configurou.
+  "Compras" e "Receita tráfego" só aparecem quando a Jornada tem Compra. A
+  ordem padrão do catálogo passou a ser: Lead qualificado antes de Checkout
+  iniciado e Compra no fim. A ordem que você já salvou não muda. Uma etapa
+  nova entra logo depois da etapa anterior a ela no catálogo, e não mais no
+  fim do funil.
+- **Conciliação diária "Meta x conversas reais".** O gráfico compara as
+  conversas iniciadas que a Meta informa com as conversas de anúncio que
+  chegaram no mesmo dia, contadas como "Conversas por anúncio". Quando parte
+  dos leads tem o Lead recebido enviado depois, pela sua regra (seção 10.5), o
+  gráfico mostra uma terceira barra, "Leads (evento Lead enviado)".
+- **Eventos Meta:** o filtro de evento lista todos os eventos configurados no
+  workspace, na ordem do funil. No acesso de suporte pelo backoffice, o detalhe
+  de uma venda cujo valor foi corrigido depois de registrado (por exemplo a
+  Payt sem os juros do parcelamento) mostra "valor corrigido (antes R$ X)".
+- Quando várias contas Meta estão sincronizando ao mesmo tempo, Relatórios não
+  mostra mais "Contas Meta com períodos diferentes" se o período salvo delas é
+  o mesmo.
+
+Tudo isso é leitura: funciona também com a licença bloqueada.
+### 10.7 CRM Kanban (quadro dos leads por etapa da Jornada)
+
+O item **CRM** do menu (seção Operação, logo depois de Leads) é um quadro
+Kanban dos leads de anúncio (CTWA). Não confunda com a aba **CRM** de
+Integrações (Kommo e Pipedrive): o quadro não depende de nenhuma delas.
+
+- **Colunas.** São as etapas visíveis da Jornada (Configurações → Jornada),
+  começando por **Leads novos**. Se o "Lead recebido pela regra" (10.5) estiver
+  em uso, aparece antes a coluna **Conversas iniciadas**, só de leitura. Sem
+  nenhuma etapa visível, o quadro mostra "Configure a Jornada".
+- **Onde cada lead fica.** Cada lead aparece uma vez, na etapa mais avançada
+  com conversão válida (enviada ou a caminho da Meta, ou uma conversão manual
+  só no painel). Canceladas, bloqueadas, duplicadas e com falha não contam. O
+  topo mostra o total real de cada coluna; cada coluna mostra 20 cards e
+  "Carregar mais (N restantes)".
+- **Card.** Nome, telefone, campanha e anúncio (com a miniatura guardada do
+  criativo, 10.9, ou a da Meta enquanto o link dela vale), há quantos dias está na etapa, o valor nas colunas de compra e o
+  número de WhatsApp quando há mais de uma conexão ativa. O modo apresentação
+  esconde os dados sensíveis. Clicar no card abre o detalhe do lead numa
+  janela; ao fechar, o quadro continua onde estava.
+- **Mover um lead (donos e administradores).** Arraste o card para uma etapa
+  **seguinte** (mouse, ou teclado: Espaço para pegar, setas, Espaço/Enter para
+  soltar, Esc cancela; no celular, uma coluna por vez e o botão "Mover
+  para…"). Abre a mesma confirmação da conversão manual (10.5), com o evento da
+  coluna travado e o valor padrão da Jornada. Confirmando, é registrada uma
+  conversão manual que aparece como **"Manual (Kanban)"**, com as mesmas
+  proteções (uma vez por lead, pedido repetido, janela de 7 dias da Meta).
+  Pular etapas é permitido, mas só a etapa de destino é enviada. Voltar etapa
+  ou soltar na mesma etapa é recusado. Cancelar devolve o card ao lugar.
+- **Membros analistas** veem o quadro e abrem os leads, mas não movem cards.
+- **Filtros** (ficam na URL): período de chegada do lead (padrão: últimos 30
+  dias; até 180 dias), número de WhatsApp (conexões ativas) e campanha. O
+  quadro se atualiza sozinho a cada 60 segundos e pelo botão **Atualizar**.
+- **Licença bloqueada:** o quadro continua visível, mas os cards não arrastam
+  e aparece o aviso de licença bloqueada; a API responde 423 a qualquer
+  movimento, porque mover é registrar uma conversão.
+- Não há variável de ambiente nem migration para o quadro.
+
+### 10.8 Filtros da Visão Geral, Relatórios, Leads e Eventos (aplicados sozinhos)
+
+Os filtros se aplicam sozinhos: não existe mais o botão **Aplicar**. Ao trocar
+um seletor, a tela atualiza na hora (aparece "Atualizando..." e os números
+anteriores ficam visíveis até chegarem os novos). Nas datas e nos campos de
+texto, a tela espera você parar de digitar; **Enter** aplica na hora. Um
+período com o fim antes do início mostra "Fim antes do início" e não é
+aplicado. Todos os filtros ficam no endereço da página, então dá para salvar
+ou mandar o link.
+
+- **Visão Geral.** Período, contas de anúncio (caixa com busca e a moeda de
+  cada conta), Business Manager, **Número WhatsApp** e **Campanhas**.
+  - O número lista as conexões WhatsApp ativas do workspace (aba WhatsApp de
+    Integrações: Uazapi, WAHA e as demais). Uma
+    conexão removida sai da lista, mas um link antigo com ela continua valendo
+    ("Número removido").
+  - Campanhas: busque pelo nome ou ID e marque até 10. Com um número escolhido,
+    as campanhas que trouxeram conversas para ele aparecem primeiro, com a
+    contagem. As escolhidas viram etiquetas abaixo da barra, com "x" para
+    tirar uma e "Limpar campanhas".
+  - **Por que alguns valores mostram "-".** A Meta informa investimento e
+    conversas por campanha e por conta, nunca por número. Só com o número,
+    Investimento e Conversas Meta ficam "-" (são da conta). Com número e
+    campanha: se a campanha só levou conversas para esse número, os valores
+    são dela; se também levou para outro número, aparecem os valores da
+    campanha inteira, marcados, sem custo por etapa e sem ROAS; sem a
+    sincronização da Meta no período, aparece "Aguardando sincronização da
+    Meta". Uma campanha removida ou de outra conta mostra "Campanha não
+    encontrada" com o botão para limpar.
+  - "Abrir relatórios" leva o mesmo recorte (com várias campanhas, vai sem as
+    campanhas, porque Relatórios filtra uma por vez). Os atalhos dos cards de
+    leads levam o número e a campanha para a lista de Leads; quando a lista não
+    consegue reproduzir o mesmo número (várias campanhas, ou "voltaram" e
+    "2+ conversas" com campanha), o card fica sem link.
+- **Relatórios.** A barra fica em três grupos: **Período**, **Escopo**
+  (campanhas, conjuntos ou anúncios; contas, número, nome e os filtros
+  avançados) e **Ações** (exportar CSV e sincronizar a Meta). Com um número
+  escolhido, um aviso lembra que investimento e métricas Meta continuam no
+  escopo da campanha ou da conta, e o **Exportar CSV** leva o número também.
+  Se você estava dentro de uma campanha e trocou o BM ou a conta para um
+  recorte que não a contém, a tabela fica vazia (não é erro da API).
+- **Leads.** Busca, base (leads novos, voltaram, 2+ conversas), situação,
+  etapa e os filtros avançados se aplicam sozinhos. Vindo de uma conexão em
+  Integrações ("Ver leads deste número"), a lista mostra "Número WhatsApp" no
+  topo e só os leads dessa conexão; "Ver todos os números" tira esse recorte.
+  A exportação CSV/Excel leva os mesmos filtros, inclusive o número.
+- **Eventos Meta e Revisão de compras.** Período, evento, estado, origem,
+  visualização e regra também se aplicam sozinhos.
+- **Integrações → WhatsApp.** Cada conexão Uazapi ou WAHA mostra **Atividade do
+  número**: leads de anúncio (CTWA) de 24 horas, 7 dias e total, o último lead
+  e se chegou webhook nas últimas 24 horas, com o botão **Ver leads deste
+  número**. Se a leitura falhar, aparece "Atividade indisponível" (nunca zero
+  inventado). Na ponte das regras de frase da Uazapi/WAHA (aba Atendimento e
+  vendas), os contadores de entrada aparecem como "Não medido", porque o lead
+  de anúncio entra pela conexão WhatsApp.
+- **CRM Kanban.** O filtro de campanha do quadro (10.7) usa a mesma busca.
+- **Limite:** o filtro de número cobre as conexões WhatsApp do workspace (aba
+  WhatsApp de Integrações). Leads de Unnichat, Umbler, Gupshup, Data Crazy e
+  Meta Cloud não têm esse número e saem da lista quando um número é escolhido.
+- **Licença bloqueada:** filtros, atividade e exportação continuam funcionando
+  (são leituras).
+- Não há variável de ambiente nem migration para os filtros.
+
+### 10.9 Menos chamadas à Meta e miniaturas guardadas
+
+Nada para configurar; vale depois da atualização (que tem duas migrations
+aditivas: faça o backup do PostgreSQL antes, como em toda migration).
+
+- **Conta Meta que precisa reconectar.** Se a Meta disser que o token não vale
+  mais ou que a conta de anúncios perdeu a permissão, a sincronização dos
+  relatórios **dessa conta** pausa (sem ficar tentando de novo) e Relatórios
+  mostra "Reconecte a conta Meta". O aviso "Atenção aos dados da Meta" (10.6)
+  passa a listar essa conta como bloqueada. O envio de conversões à Meta
+  continua normal. Para liberar, reconecte, valide ou use "Testar" na conexão
+  Meta em Integrações.
+- **Limite de uso da Meta.** Quando o app Meta está perto do limite de uso, a
+  sincronização em segundo plano espera e volta sozinha; o login e o botão
+  **Conectar Meta (PalmUP)** nunca ficam bloqueados por isso. O limite é por
+  app: o app da PalmUP e o seu app próprio são contados separados (não dê o
+  nome "Login social PalmUP" a um token do seu app).
+- **Miniaturas dos criativos.** A imagem de cada criativo é buscada uma vez e
+  guardada no seu banco. A página do lead, os anúncios de Relatórios e os
+  cards do CRM Kanban (10.7) mostram essa imagem mesmo depois que o link da
+  Meta expira. Logo depois da atualização as miniaturas aparecem aos poucos,
+  conforme as próximas sincronizações (até 150 criativos por conta em cada uma,
+  primeiro os anúncios com entrega).
+- **Ajustes opcionais** (leitura só por anúncio, relatório assíncrono, envio
+  da CAPI em lote, janela incremental): todas as variáveis têm padrão seguro e
+  estão em `docs/setup/environment.md` ("Limite de uso da Meta").
+- **Licença bloqueada:** ver relatórios e miniaturas continua funcionando;
+  "Sincronizar Meta" é escrita e responde 423, como antes.
+
+### 10.10 Formulários Meta (Lead Ads) e importação do Dashboard Leads
+
+Opcional: só para quem anuncia com **formulário instantâneo** da Meta. A
+atualização tem uma migration aditiva (`20261027145000_meta_lead_forms`): faça
+o backup do PostgreSQL antes, como em toda migration. Não há variável nova; os
+formulários usam `META_APP_SECRET` (sem ela nenhum lead de formulário entra),
+`META_WEBHOOK_VERIFY_TOKEN`, `META_TOKEN_ENCRYPTION_KEY` e `API_PUBLIC_URL`, que
+já existem. Guia completo: `docs/setup/meta-lead-forms.md`.
+
+- **Configurar:** no app Meta, assine o campo `leadgen` do objeto Page com a
+  URL `{API_PUBLIC_URL}/webhooks/meta`. Em Integrações → Anúncios → card
+  **Meta** → **Formulários Meta**, cadastre a Página (token de System User e o
+  dataset do CRM) e clique em **Assinar Página**. A conexão já nasce ativa: não
+  há nada para liberar.
+- **Leads:** cada formulário enviado vira um lead com a origem "Formulário
+  Meta". Se a pessoa já conversava no WhatsApp, é o mesmo lead, com a mesma
+  atribuição.
+- **Etapa do CRM:** ao registrar **Lead qualificado** no lead (conversão
+  manual, 10.5) ou arrastar o card para essa coluna no **CRM** (10.7), a etapa
+  vai para o dataset do CRM da Meta, uma vez por formulário. A confirmação da
+  conversão manual mostra se ela será enviada. Um lead com formulário e
+  WhatsApp manda os dois eventos, cada um ao seu destino.
+- **Remover ou desativar:** uma conexão que **já recebeu formulários** não pode
+  ser removida (o botão some e a API responde 409, para não apagar o
+  histórico): use **Desativar**. Desativada, a Página para de receber leads (o
+  webhook responde 2xx e ignora, então a Meta não reentrega) e as etapas do CRM
+  dela ficam bloqueadas; envios, leads e etapas ficam guardados, e
+  **Reativar** volta a receber. Sem nenhum formulário recebido, **Remover**
+  continua disponível. Desativada, a Página segue reservada para o mesmo
+  workspace.
+- **Falhas:** configuração faltando (dataset, conexão desativada) e falha de login
+  da Meta aparecem em Eventos Meta e voltam com **Reenviar bloqueados**.
+- **Dashboard Leads:** quem migra daquela ferramenta pode importar o histórico
+  com o comando `dashboard-leads:import` (simula por padrão; o que já foi
+  enviado à Meta não é reenviado). Passo a passo:
+  `docs/setup/dashboard-leads-import.md`. As credenciais do Supabase vão só na
+  linha do comando, nunca no `.env`.
+- **Licença bloqueada:** a seção mostra as conexões, mas criar, alterar,
+  assinar, desativar, reativar e remover respondem 423; a importação com `--apply` é recusada.
 
 ## 11. Marca (whitelabel) — opcional
 

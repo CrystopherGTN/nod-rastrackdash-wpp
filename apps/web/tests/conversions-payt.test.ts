@@ -161,7 +161,6 @@ describe("Payt: rascunho e payload", () => {
         connectionId: "conn_umbler",
         scope: "all_numbers",
         channelIds: [],
-        mode: "observation",
         triggerType: "provider_automation",
         eventName: "CartAbandoned",
         automationSource: "payt",
@@ -209,7 +208,6 @@ describe("Payt: rascunho e payload", () => {
         "channelIds",
         "connectionId",
         "eventName",
-        "mode",
         "name",
         "scope",
         "triggerType",
@@ -236,10 +234,24 @@ describe("Payt: rascunho e payload", () => {
   });
 
   it("pede um número de WhatsApp quando não há nenhum compatível", () => {
-    expect(buildRulePayload(paytDraft(), { ...context, numbers: [] })).toEqual({
+    expect(
+      buildRulePayload(paytDraft(), { ...context, numbers: [], connections: [] }),
+    ).toEqual({
       ok: false,
       message: "Conecte um número de WhatsApp antes de criar esta regra.",
     });
+  });
+
+  // Porte do SaaS #164 (fase 6.5): números não lidos (um /channels que
+  // falhou) não impedem "Todos os números": a regra fica presa a uma conexão
+  // de WhatsApp da conta.
+  it("liga “Todos os números” a uma conexão de WhatsApp quando os números não foram lidos", () => {
+    const result = buildRulePayload(paytDraft({ scope: "all_numbers" }), {
+      ...context,
+      numbers: [],
+    });
+    expect(result.ok).toBe(true);
+    expect(result.ok && result.value.connectionId).toBe(connections[0]!.id);
   });
 });
 
@@ -327,7 +339,7 @@ describe("Payt: Nova regra", () => {
       ruleId: "rule_payt",
       webhookUrl: "https://api.example.test/webhooks/inbound/conversions/e1?token=t",
       message:
-        "Regra criada em observação. Copie o endereço agora: ele não é exibido de novo.",
+        "Regra criada e enviando. Copie o endereço agora: ele não é exibido de novo.",
     }));
     renderFlow(createAction);
 
@@ -364,7 +376,6 @@ describe("Payt: Nova regra", () => {
       eventName: "CartAbandoned",
       connectionId: "conn_umbler",
       scope: "all_numbers",
-      mode: "observation",
     });
     // A URL aparece uma única vez, com o passo a passo da Payt.
     expect(screen.getByText("URL de postback da Payt (exibida uma única vez)")).toBeTruthy();
@@ -554,11 +565,11 @@ describe("Payt: endereço e eventos recebidos", () => {
     await user.click(screen.getByRole("button", { name: /Reprocessar evento de/ }));
     expect(
       screen.getByText(
-        "Reavaliar 1 evento recebido? A regra está em observação: nada é enviado à Meta.",
+        "Reavaliar 1 evento recebido? A regra está com o envio desligado: nada é enviado à Meta.",
       ),
     ).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Reprocessar" }));
-    expect(await screen.findByText("1 reavaliado em observação.")).toBeTruthy();
+    expect(await screen.findByText("1 reavaliado sem envio.")).toBeTruthy();
   });
 
   it("resume reprocessamentos reavaliados em observação e traduz os motivos da venda", () => {
@@ -572,7 +583,7 @@ describe("Payt: endereço e eventos recebidos", () => {
         observed: 2,
         items: [],
       }),
-    ).toBe("2 reavaliados em observação, 1 continua bloqueado.");
+    ).toBe("2 reavaliados sem envio, 1 continua bloqueado.");
     expect(executionReasonLabel("payt_lead_other_channel")).toContain("Lead de outro número");
     expect(executionReasonLabel("purchase_duplicate")).toContain("Venda repetida");
     expect(executionReasonLabel("payt_automation_v1_not_purchase")).toBe(
@@ -582,7 +593,7 @@ describe("Payt: endereço e eventos recebidos", () => {
       "Evento da Payt fora desta regra",
     );
     expect(executionReasonLabel("automation_matched_payt_observation")).toBe(
-      "Reconhecido em observação",
+      "Número do lead no motor antigo de conversões: nada enviado à Meta",
     );
   });
 

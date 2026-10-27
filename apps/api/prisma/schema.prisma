@@ -59,6 +59,9 @@ enum DiagnosticSource {
   data_crazy
   payt
   unnichat
+  braip
+  roichat
+  yampi
 }
 
 enum DiagnosticSeverity {
@@ -296,6 +299,9 @@ enum InboundWebhookProvider {
   payt
   unnichat
   waha
+  braip
+  roichat
+  yampi
 }
 
 enum InboundWebhookParserReleaseStatus {
@@ -434,6 +440,8 @@ model Workspace {
   members                          WorkspaceMember[]
   invites                          WorkspaceInvite[]
   whatsappInstances                WhatsappInstance[]
+  metaLeadFormConnections          MetaLeadFormConnection[]
+  metaLeadSubmissions              MetaLeadSubmission[]
   uazapiChatLabelStates            UazapiChatLabelState[]
   diagnosticEvents                 DiagnosticEvent[]
   webhookLogs                      WebhookLog[]
@@ -458,6 +466,7 @@ model Workspace {
   metaAdSetDailyInsights           MetaAdSetDailyInsight[]
   metaAds                          MetaAd[]
   metaAdDailyInsights              MetaAdDailyInsight[]
+  metaCreativeThumbnails           MetaCreativeThumbnail[]
   externalDataConnectors           ExternalDataConnector[]
   externalIngestionRecords         ExternalIngestionRecord[]
   activeSessions                   AuthSession[]                        @relation("AuthSessionActiveWorkspace")
@@ -1018,6 +1027,11 @@ model ProviderConversionRuleConfig {
   connectionId              String?
   parserReleaseId           String?
   scope                     ProviderConversionRuleScope           @default(specific_numbers)
+  /// Fase 6.1a (porte do #159): Umbler/Unnichat "Todos os números da
+  /// <plataforma> (todas as conexões)". true só para regras criadas/editadas
+  /// com a opção nova ou geradas pelo "Unificar" de automações. NULL/false =
+  /// números da conexão da regra.
+  crossConnectionScope      Boolean?
   /// Set when "Unificar" replaced this rule by a workspace-wide one; the rule
   /// is kept (paused) with its whole history.
   unifiedIntoProviderRuleId String?
@@ -1199,7 +1213,7 @@ model IntegrationEndpointEvent {
   externalKey           String?
   eventName             String?
   providerStatus        String?
-  /// pending | routed | unattributed | ignored | invalid
+  /// pending | routed | unattributed | ignored | invalid | rejected (6.5)
   status                String
   reasonCode            String?
   productCode           String?
@@ -1485,6 +1499,7 @@ model Lead {
   purchaseReviews             PurchaseReview[]
   providerConversionDecisions ProviderConversionDecisionAudit[]
   pipedriveWebhookEvents      PipedriveWebhookEvent[]
+  metaLeadSubmissions         MetaLeadSubmission[]
 
   @@unique([workspaceId, id])
   @@unique([workspaceId, phoneHash])
@@ -1670,6 +1685,9 @@ model MetaReportingAccount {
   lastSyncSince           String?
   lastSyncUntil           String?
   syncError               String?
+  /// Disjuntor só da sincronização de relatórios. Nunca lido pelo envio CAPI/CTWA.
+  reportingSyncBlockedAt  DateTime?
+  reportingSyncBlockReason String?
   createdAt               DateTime            @default(now())
   updatedAt               DateTime            @updatedAt
 
@@ -1686,6 +1704,7 @@ model MetaReportingAccount {
   @@index([workspaceId, active])
   @@index([workspaceId, active, businessId, adAccountId])
   @@index([workspaceId, businessConnectionId, active])
+  @@index([workspaceId, reportingSyncBlockedAt])
   @@index([businessConnectionId])
   @@index([conversionDestinationId])
   @@index([businessId])
@@ -2329,6 +2348,38 @@ model MetaAd {
   @@index([workspaceId, status])
 }
 
+/// Miniatura guardada do criativo (uma linha por workspace + criativo Meta).
+/// Criativos da Meta não mudam: os bytes são buscados uma vez e servidos pelo
+/// nosso endpoint autenticado; URLs assinadas do fbcdn (expiram em oe=) ficam
+/// só como origem/fallback. Nunca rebuscada em toda sincronização.
+model MetaCreativeThumbnail {
+  id                 String    @id @default(cuid())
+  workspaceId        String
+  creativeId         String
+  /// image | video
+  source             String?
+  /// ready | url_only | missing | failed
+  status             String
+  sourceUrl          String?
+  sourceUrlExpiresAt DateTime?
+  contentType        String?
+  imageBytes         Bytes?
+  byteSize           Int?
+  /// Hash curto do conteúdo, usado como versão (cache) da URL da imagem.
+  version            String?
+  fetchedAt          DateTime?
+  nextAttemptAt      DateTime?
+  attemptCount       Int       @default(0)
+  lastError          String?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, creativeId])
+  @@index([workspaceId, status, nextAttemptAt])
+}
+
 model MetaAdDailyInsight {
   id                       String   @id @default(cuid())
   workspaceId              String
@@ -2765,4 +2816,71 @@ model KommoConversionDedupe {
   @@unique([workspaceId, verifiedAccountId, dealId, eventName])
   @@index([workspaceId, sourceEventId])
   @@index([publicationStatus, publicationNextAttemptAt])
+}
+
+/// Fase 6.9 (PR #91 do nod): formulários instantâneos da Meta (Lead Ads) de
+/// uma Página roteados para este workspace. Tokens em AES-256-GCM com
+/// META_TOKEN_ENCRYPTION_KEY: o token Graph lê os leads (leads_retrieval); o
+/// token do dataset envia a etapa do CRM (Conversions API for CRM).
+model MetaLeadFormConnection {
+  id                  String    @id @default(cuid())
+  workspaceId         String
+  label               String
+  pageId              String
+  /// Vazio: todos os formulários da Página não reservados por outra conexão.
+  formIds             String[]  @default([])
+  crmDatasetId        String?
+  qualifiedEventName  String    @default("LeadQualificado")
+  graphTokenEncrypted String
+  graphTokenIv        String
+  graphTokenTag       String
+  graphTokenLast4     String
+  capiTokenEncrypted  String?
+  capiTokenIv         String?
+  capiTokenTag        String?
+  capiTokenLast4      String?
+  active              Boolean   @default(true)
+  pageSubscribedAt    DateTime?
+  createdByUserId     String?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  workspace   Workspace            @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  submissions MetaLeadSubmission[]
+
+  @@unique([workspaceId, pageId])
+  @@index([pageId, active])
+}
+
+/// Um envio de formulário instantâneo. O Lead é uma pessoa por telefone: quem
+/// preenche o formulário e conversa no WhatsApp é o mesmo Lead; cada envio
+/// guarda o seu ID de lead da Meta, que o evento de CRM usa (user_data.lead_id).
+model MetaLeadSubmission {
+  id            String    @id @default(cuid())
+  workspaceId   String
+  connectionId  String
+  leadId        String?
+  metaLeadId    String    @unique
+  pageId        String
+  formId        String?
+  campaignId    String?
+  adSetId       String?
+  adId          String?
+  fullName      String?
+  email         String?
+  phone         String?
+  fieldData     Json?
+  metaCreatedAt DateTime?
+  /// fetched | fetch_failed (o webhook chegou, mas a leitura na Graph falhou).
+  fetchStatus   String
+  fetchError    String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  workspace  Workspace              @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  connection MetaLeadFormConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  lead       Lead?                  @relation(fields: [leadId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, leadId, metaCreatedAt])
+  @@index([workspaceId, createdAt])
 }

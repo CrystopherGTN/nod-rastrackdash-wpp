@@ -33,10 +33,15 @@ import { MetaCloudWabaSubscriptionService } from "./meta-cloud-waba-subscription
 import { ProviderRuleBlockedReprocessController } from "./provider-rule-blocked-reprocess.controller";
 import { ProviderRuleBlockedReprocessService } from "./provider-rule-blocked-reprocess.service";
 import { InboundWebhookParserRegistry } from "./providers/inbound-webhook-parser.registry";
+import { RoichatPurchaseIngressService } from "./roichat-purchase-ingress.service";
+import { ROICHAT_PURCHASE_INGRESS } from "./roichat-purchase-ingress.token";
 import { UazapiConversionBridgeService } from "./uazapi-conversion-bridge.service";
 import { UazapiProviderConversionService } from "./uazapi-provider-conversion.service";
 import { MetaTokenEncryptionService } from "../integrations/meta/meta-token-encryption.service";
 import { INTEGRATION_ENV } from "../integrations/integration.types";
+import { BackofficeIntegrationEventsController } from "./backoffice-integration-events.controller";
+import { BackofficeParserReleasesController } from "./backoffice-parser-releases.controller";
+import { BackofficeIntegrationEventsService } from "./backoffice-integration-events.service";
 import { WhatsappProvidersModule } from "../integrations/whatsapp-providers/whatsapp-providers.module";
 
 @Module({
@@ -55,6 +60,8 @@ import { WhatsappProvidersModule } from "../integrations/whatsapp-providers/what
     }),
   ],
   controllers: [
+    BackofficeIntegrationEventsController,
+    BackofficeParserReleasesController,
     InboundWebhookConnectionsController,
     InboundWebhookPublicController,
     IntegrationEndpointsController,
@@ -62,6 +69,7 @@ import { WhatsappProvidersModule } from "../integrations/whatsapp-providers/what
     ProviderRuleBlockedReprocessController,
   ],
   providers: [
+    BackofficeIntegrationEventsService,
     InboundConversionAutomationIngestionService,
     InboundWebhookChannelRoutesService,
     InboundWebhookConnectionsService,
@@ -81,6 +89,12 @@ import { WhatsappProvidersModule } from "../integrations/whatsapp-providers/what
     MetaCloudWabaRateLimiter,
     MetaCloudWabaSubscriptionService,
     ProviderRuleBlockedReprocessService,
+    // Fase 6.8: the ROI Chat purchase received on the number URL.
+    RoichatPurchaseIngressService,
+    {
+      provide: ROICHAT_PURCHASE_INGRESS,
+      useExisting: RoichatPurchaseIngressService,
+    },
     UazapiConversionBridgeService,
     UazapiProviderConversionService,
     MetaTokenEncryptionService,

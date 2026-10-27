@@ -23,9 +23,12 @@ import {
   blockedReprocessCutoff,
   blockedReprocessWhere,
   findReprocessableExecutions,
+  partitionAlreadyConverted,
   ruleAcceptsReprocess,
 } from "../conversion-rules/provider-rule-blocked-reprocess";
+import { InboundWebhookMetaRouteReaderService } from "./inbound-webhook-meta-route-reader.service";
 import { UazapiProviderConversionService } from "./uazapi-provider-conversion.service";
+import { leadSubmittedRuleOverrideEnabled } from "../conversion-rules/lead-submitted-rule-override";
 
 /**
  * "Reprocessar bloqueadas" of one rule: retries, through the existing
@@ -117,7 +120,7 @@ export class ProviderRuleBlockedReprocessService {
     try {
       const base = blockedReprocessWhere(workspaceId, rule.id);
       const cutoff = blockedReprocessCutoff(now);
-      const [expired, inWindow, ready] = await Promise.all([
+      const [expired, inWindow, candidates] = await Promise.all([
         this.prisma.providerConversionRuleExecution.count({
           where: { ...base, occurredAt: { lt: cutoff } },
         }),
@@ -131,6 +134,20 @@ export class ProviderRuleBlockedReprocessService {
           limit: BLOCKED_REPROCESS_SCAN_LIMIT,
         }),
       ]);
+      // Never re-enqueue what the production job would only mark duplicate
+      // (lead already converted by another number / the CTWA entry).
+      const { ready, alreadyConverted } = await partitionAlreadyConverted(
+        this.prisma,
+        {
+          workspaceId,
+          executions: candidates,
+          includeAutoLead: leadSubmittedRuleOverrideEnabled(this.env),
+          previewRoute: (route) =>
+            new InboundWebhookMetaRouteReaderService(this.prisma).previewRoute(
+              route,
+            ),
+        },
+      );
       const batch = ready.slice(0, BLOCKED_REPROCESS_BATCH);
 
       for (const execution of batch) {
@@ -179,7 +196,10 @@ export class ProviderRuleBlockedReprocessService {
         // In the window but not retried now: number still not live, paused
         // on purpose at the time, not a QR number, or not eligible on the
         // dry run.
-        stillBlocked: counts.stillBlocked + Math.max(0, inWindow - ready.length),
+        stillBlocked:
+          counts.stillBlocked +
+          Math.max(0, inWindow - ready.length - alreadyConverted.length),
+        alreadyConverted: alreadyConverted.length,
         skipped: counts.skipped,
         failed: counts.failed,
         expired,

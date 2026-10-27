@@ -19,6 +19,7 @@ import {
 } from "../integrations/unnichat-setup";
 import {
   disableLegacyUrlConfirmText,
+  isSalesPlatform,
   singleUrlLicenseLockedNote,
   singleUrlSetupSteps,
 } from "../integrations/single-url/single-url-copy";
@@ -35,11 +36,15 @@ const platformNames: Partial<Record<ProviderConversionRuleOriginDto, string>> = 
   automation_umbler: "Umbler Talk",
   automation_unnichat: "Unnichat",
   automation_payt: "Payt",
+  automation_braip: "Braip",
+  automation_roichat: "ROI Chat",
+  automation_yampi: "Yampi",
 };
 
 // Artigo por plataforma: "na Umbler Talk", "na Payt", mas "no Unnichat".
 const platformLocatives: Partial<Record<ProviderConversionRuleOriginDto, string>> = {
   automation_unnichat: "no Unnichat",
+  automation_roichat: "no ROI Chat",
 };
 
 function inPlatform(origin: ProviderConversionRuleOriginDto): string {
@@ -105,6 +110,19 @@ function SetupSteps({
       />
     );
   }
+  if (origin === "automation_braip" || origin === "automation_yampi") {
+    // Fase 6.5/6.7: só pela URL única da Braip ou da Yampi (uma para a conta
+    // toda).
+    return (
+      <ol className="integration-steps">
+        {singleUrlSetupSteps(
+          origin === "automation_yampi" ? "yampi" : "braip",
+        ).map((step) => (
+          <li key={step}>{step}</li>
+        ))}
+      </ol>
+    );
+  }
   if (origin === "automation_umbler") {
     return (
       <>
@@ -131,6 +149,8 @@ const singleUrlProviders: Partial<
   Record<ProviderConversionRuleOriginDto, IntegrationEndpointProviderDto>
 > = {
   automation_payt: "payt",
+  automation_braip: "braip",
+  automation_yampi: "yampi",
   automation_unnichat: "unnichat",
   automation_umbler: "umbler",
 };
@@ -146,6 +166,7 @@ function SingleUrlSection({
   licenseLocked,
   integrationEndpoint,
   actions,
+  onReadyChange,
 }: {
   rule: ProviderConversionRuleDto;
   origin: ProviderConversionRuleOriginDto;
@@ -153,20 +174,24 @@ function SingleUrlSection({
   licenseLocked: boolean;
   integrationEndpoint: IntegrationEndpointDto | null;
   actions: SingleUrlActions;
+  /** Fase 6.1a (#160): whether the event URL exists (copy of the old URL). */
+  onReadyChange?: (ready: boolean) => void;
 }) {
   const provider = singleUrlProviders[origin]!;
   const [created, setCreated] = useState<IntegrationEndpointDto | null>(null);
   const [removed, setRemoved] = useState(false);
   const endpoint = removed ? null : (created ?? integrationEndpoint);
   const eventName = rule.conversionRule.eventName;
-  const label =
-    provider === "payt"
-      ? "URL única da Payt (todas as regras e números)"
-      : `URL do evento “${ruleEventLabelForOrigin(origin, eventName)}” (todos os números)`;
+  // Fase 6.1a (#159): a URL do evento vale para todos os números do
+  // provedor, de todas as conexões.
+  const sales = isSalesPlatform(provider);
+  const label = sales
+    ? `URL única da ${provider === "braip" ? "Braip" : provider === "yampi" ? "Yampi" : "Payt"} (todas as regras e números)`
+    : `URL do evento “${ruleEventLabelForOrigin(origin, eventName)}” (todos os números ${provider === "umbler" ? "da Umbler" : "do Unnichat"}, de todas as conexões)`;
 
   return (
     <section className="conversion-endpoint-single-url" aria-label="URL nova">
-      <h3>{provider === "payt" ? "URL única" : "URL por evento"}</h3>
+      <h3>{sales ? "URL única" : "URL por evento"}</h3>
       {endpoint ? (
         <IntegrationUrlBox
           key={endpoint.id}
@@ -178,19 +203,21 @@ function SingleUrlSection({
           onRemoved={() => {
             setCreated(null);
             setRemoved(true);
+            onReadyChange?.(false);
           }}
         />
       ) : canManage ? (
         <>
           <EnsureUrlButton
             provider={provider}
-            eventName={provider === "payt" ? null : eventName}
+            eventName={sales ? null : eventName}
             ensure={actions.ensure}
-            label={provider === "payt" ? "Gerar URL única" : "Gerar URL do evento"}
+            label={sales ? "Gerar URL única" : "Gerar URL do evento"}
             disabled={licenseLocked}
             onReady={(next) => {
               setRemoved(false);
               setCreated(next);
+              onReadyChange?.(true);
             }}
           />
           {licenseLocked ? (
@@ -216,6 +243,7 @@ function SingleUrlSection({
 function LegacyUrlSwitch({
   ruleId,
   provider,
+  eventUrlReady = true,
   disabled,
   lastDeliveryAt,
   canManage,
@@ -225,6 +253,8 @@ function LegacyUrlSwitch({
 }: {
   ruleId: string;
   provider: IntegrationEndpointProviderDto;
+  /** Fase 6.1a (#160): the event URL of this rule already exists. */
+  eventUrlReady?: boolean;
   disabled: boolean;
   lastDeliveryAt: string | null;
   canManage: boolean;
@@ -235,7 +265,9 @@ function LegacyUrlSwitch({
   const [confirming, setConfirming] = useState(false);
   const [pending, setPending] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
-  const sameThing = provider === "payt" ? "uma venda" : "um evento";
+  const sameThing = isSalesPlatform(provider) ? "uma venda" : "um evento";
+  const automation = provider === "unnichat" || provider === "umbler";
+  const inProvider = provider === "umbler" ? "na Umbler" : "no Unnichat";
 
   async function apply(next: boolean) {
     setPending(true);
@@ -254,7 +286,11 @@ function LegacyUrlSwitch({
       <p className="action-note">
         {disabled
           ? "A URL antiga desta regra está desativada: a regra só recebe pela URL nova."
-          : `A URL antiga desta regra ainda funciona (último recebimento por ela: ${formatDateTime(lastDeliveryAt)}). Depois de colar a URL nova na plataforma, apague a antiga lá e desative aqui; ${sameThing} que chegue pelas duas é enviado à Meta uma vez só.`}
+          : automation
+            ? eventUrlReady
+              ? `Esta regra ainda recebe pela URL antiga desta conexão (último recebimento por ela: ${formatDateTime(lastDeliveryAt)}). Depois de colar a URL do evento ${inProvider} em todos os números, desative a antiga aqui; ${sameThing} que chegue pelas duas é enviado à Meta uma vez só.`
+              : `Esta regra ainda recebe pela URL antiga desta conexão (último recebimento por ela: ${formatDateTime(lastDeliveryAt)}). Gere a URL do evento acima, cole ${inProvider} em todos os números e depois desative a antiga.`
+            : `A URL antiga desta regra ainda funciona (último recebimento por ela: ${formatDateTime(lastDeliveryAt)}). Depois de colar a URL nova na plataforma, apague a antiga lá e desative aqui; ${sameThing} que chegue pelas duas é enviado à Meta uma vez só.`}
       </p>
       {canManage && confirming ? (
         <div className="conversion-inline-confirm" role="alert">
@@ -349,6 +385,9 @@ export function RuleEndpoint({
   const [legacyClosed, setLegacyClosed] = useState(
     Boolean(endpoint?.publicUrlDisabledAt),
   );
+  const [eventUrlReady, setEventUrlReady] = useState(
+    Boolean(integrationEndpoint),
+  );
   // Regra criada já para a URL nova (URL própria fechada e nunca chamada): não
   // há URL antiga que valha mencionar.
   const legacyNeverUsed =
@@ -377,47 +416,23 @@ export function RuleEndpoint({
     }
   }
 
-  return (
-    <div className="conversion-endpoint">
-      {singleUrl && singleUrlActions ? (
-        <SingleUrlSection
-          rule={rule}
-          origin={origin}
-          canManage={urlsCanManage}
-          licenseLocked={licenseLocked}
-          integrationEndpoint={integrationEndpoint}
-          actions={singleUrlActions}
-        />
-      ) : null}
-      {singleUrl && singleUrlActions && singleUrlProvider && endpoint && !legacyNeverUsed ? (
-        <section
-          className="conversion-endpoint-legacy-section"
-          aria-label="URL antiga desta regra"
-        >
-          <h3>URL antiga desta regra</h3>
-          <LegacyUrlSwitch
-            ruleId={rule.id}
-            provider={singleUrlProvider}
-            disabled={legacyClosed}
-            lastDeliveryAt={endpoint.lastDeliveryAt}
-            canManage={urlsCanManage}
-            licenseLocked={licenseLocked}
-            setPublicUrl={singleUrlActions.setPublicUrl}
-            onChanged={setLegacyClosed}
-          />
-        </section>
-      ) : null}
-      {singleUrl && (legacyClosed || legacyNeverUsed) && !newUrl ? null : (
-      <>
+  // Endereço DESTA regra (a URL antiga, por regra/conexão): o último
+  // recebimento dela e, sem URL única/por evento, a troca do endereço com o
+  // novo exibido uma vez. Fase 6.1a (porte do #159/#160): com a URL nova ativa,
+  // ele fica dentro da seção "URL antiga", sem botão de gerar URL antiga.
+  const ruleUrlDetails = (
+    <>
       <dl className="conversion-flow-summary">
         <div>
-          <dt>Último evento recebido</dt>
+          <dt>{singleUrl ? "Último evento recebido nela" : "Último evento recebido"}</dt>
           <dd>{formatDateTime(endpoint?.lastDeliveryAt ?? null)}</dd>
         </div>
-        <div>
-          <dt>Endereço gerado de novo em</dt>
-          <dd>{endpoint?.rotatedAt ? formatDateTime(endpoint.rotatedAt) : "nunca foi trocado"}</dd>
-        </div>
+        {singleUrl ? null : (
+          <div>
+            <dt>Endereço gerado de novo em</dt>
+            <dd>{endpoint?.rotatedAt ? formatDateTime(endpoint.rotatedAt) : "nunca foi trocado"}</dd>
+          </div>
+        )}
       </dl>
 
       {newUrl ? (
@@ -443,7 +458,7 @@ export function RuleEndpoint({
             Já copiei
           </button>
         </div>
-      ) : (
+      ) : singleUrl ? null : (
         <p className="action-note">
           Por segurança, o endereço só aparece uma vez, quando é criado. Se você
           perdeu, gere um novo e cole de novo {where}.
@@ -456,7 +471,7 @@ export function RuleEndpoint({
         </p>
       ) : null}
 
-      {canManage && endpoint && !newUrl ? (
+      {canManage && endpoint && !newUrl && !singleUrl ? (
         confirming ? (
           <div className="conversion-inline-confirm" role="alert">
             <p>{rotateConfirmText(origin)}</p>
@@ -486,11 +501,55 @@ export function RuleEndpoint({
           </button>
         )
       ) : null}
+    </>
+  );
+  const automationOrigin =
+    origin === "automation_unnichat" || origin === "automation_umbler";
 
-      {!endpoint ? (
-        <p className="action-note warn">Esta regra não tem um endereço ativo.</p>
+  return (
+    <div className="conversion-endpoint">
+      {singleUrl && singleUrlActions ? (
+        <SingleUrlSection
+          rule={rule}
+          origin={origin}
+          canManage={urlsCanManage}
+          licenseLocked={licenseLocked}
+          integrationEndpoint={integrationEndpoint}
+          actions={singleUrlActions}
+          onReadyChange={setEventUrlReady}
+        />
       ) : null}
-      </>
+      {singleUrl && singleUrlActions && singleUrlProvider ? (
+        // A URL nova acima é a ativa; o endereço da própria regra aparece à
+        // parte, com o seu estado, só quando existe e já foi usado (nunca
+        // "sem endereço ativo" ao lado de uma URL ativa).
+        endpoint && !legacyNeverUsed ? (
+          <section
+            className="conversion-endpoint-legacy-section"
+            aria-label={automationOrigin ? "URL antiga desta conexão" : "URL antiga desta regra"}
+          >
+            <h3>{automationOrigin ? "URL antiga (desta conexão)" : "URL antiga desta regra"}</h3>
+            <LegacyUrlSwitch
+              ruleId={rule.id}
+              provider={singleUrlProvider}
+              eventUrlReady={eventUrlReady}
+              disabled={legacyClosed}
+              lastDeliveryAt={endpoint.lastDeliveryAt}
+              canManage={urlsCanManage}
+              licenseLocked={licenseLocked}
+              setPublicUrl={singleUrlActions.setPublicUrl}
+              onChanged={setLegacyClosed}
+            />
+            {ruleUrlDetails}
+          </section>
+        ) : null
+      ) : (
+        <>
+          {ruleUrlDetails}
+          {!endpoint ? (
+            <p className="action-note warn">Esta regra não tem um endereço ativo.</p>
+          ) : null}
+        </>
       )}
 
       <section className="conversion-endpoint-setup" aria-label={`Como configurar ${where}`}>

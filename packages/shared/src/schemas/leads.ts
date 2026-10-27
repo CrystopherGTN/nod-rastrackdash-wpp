@@ -11,6 +11,7 @@ export const leadStatuses = [
 export const leadBases = ["new", "returning", "repeat"] as const;
 
 export const leadListQuerySchema = z.object({
+  whatsappInstanceId: z.string().trim().min(1).max(191).optional(),
   search: z.string().trim().min(1).max(120).optional(),
   status: z.enum(leadStatuses).optional(),
   eventName: z.string().trim().min(1).max(120).optional(),
@@ -113,6 +114,18 @@ export const leadDetailConversionEventSchema = z.object({
   occurredAt: z.string().datetime(),
   sentAt: z.string().datetime().nullable(),
   createdAt: z.string().datetime(),
+  /** Conversao registrada manualmente no lead (tarefa 21). */
+  manual: z
+    .object({
+      createdByName: z.string().min(1).nullable(),
+      note: z.string().min(1).nullable(),
+      orderRef: z.string().min(1).nullable(),
+      canCancel: z.boolean(),
+      /** Onde foi registrada: detalhe do lead ou CRM Kanban. */
+      origin: z.enum(["lead_detail", "kanban"]).optional(),
+    })
+    .nullable()
+    .optional(),
 });
 
 export const leadDetailWebhookEventSchema = z.object({
@@ -135,6 +148,8 @@ export const leadDetailSchema = z.object({
     creative: z.object({
       thumbnailUrl: z.string().url().nullable(),
       destinationUrl: z.string().url().nullable(),
+      /** Set when a persisted thumbnail exists for the attributed ad. */
+      thumbnailVersion: z.string().min(1).nullable().optional(),
     }),
   }),
   conversionEvents: z.array(leadDetailConversionEventSchema),

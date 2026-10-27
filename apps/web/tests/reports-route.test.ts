@@ -12,6 +12,12 @@ vi.mock("next/navigation", async (importOriginal) => ({
 }));
 
 import ReportsPage from "../src/app/(app)/reports/page";
+import { logMetaReportingSyncEnqueueFailure } from "../src/app/(app)/reports/reports-error-logging";
+
+vi.mock("next/navigation", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("next/navigation")>()),
+  useRouter: () => ({ push: vi.fn() }),
+}));
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -255,6 +261,26 @@ const metaStructure = {
   ],
 };
 
+// nod: os números são as conexões WhatsApp (GET /integrations/whatsapp-connections).
+const whatsappInstances = [
+  {
+    id: "instance_active",
+    name: "Central vendas",
+    displayName: null,
+    provider: "uazapi_byo",
+    status: "active",
+    connectedPhone: "551199998888",
+  },
+  {
+    id: "instance_removed",
+    name: "Número removido",
+    displayName: null,
+    provider: "uazapi_byo",
+    status: "suspended",
+    connectedPhone: "551188887777",
+  },
+];
+
 function json(value: unknown, status = 200) {
   return new Response(JSON.stringify(value), {
     status,
@@ -297,6 +323,10 @@ function mockReportsApi(
       return json(options.assets ?? metaAssets);
     }
 
+    if (url.includes("/integrations/whatsapp-connections")) {
+      return json(whatsappInstances);
+    }
+
     if (url.includes("/reports/meta/structure")) {
       return json(metaStructure);
     }
@@ -330,6 +360,38 @@ async function renderReports(searchParams: Record<string, string> = {}) {
 }
 
 describe("reports route", () => {
+  it("sanitizes secrets before reporting a Meta sync enqueue failure", () => {
+    const secret = "EAA-secret-access-token";
+    const basicSecret = "basic-user:basic-password";
+    const cookieSecrets = ["session-one", "session-two"];
+    const payloadSecret = "arbitrary-payload-content";
+    const error = new Error(
+      `POST /reports/sync?access_token=${secret} https://graph.facebook.com/sync?access_token=${secret} Authorization: Basic ${basicSecret}; Cookie: first=${cookieSecrets[0]}; second=${cookieSecrets[1]} payload={"anything":"${payloadSecret}","access_token":"${secret}"}`,
+    );
+    error.name = `ApiRequestError-${secret}-${payloadSecret}`;
+    const logger = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+
+    logMetaReportingSyncEnqueueFailure(error);
+
+    expect(logger).toHaveBeenCalledWith("Meta reporting sync enqueue failed", {
+      type: "Error",
+      name: "UnknownError",
+      message: "Error message redacted",
+    });
+    const logged = JSON.stringify(logger.mock.calls);
+
+    for (const value of [secret, basicSecret, ...cookieSecrets, payloadSecret]) {
+      expect(logged).not.toContain(value);
+    }
+    expect(logged).not.toContain("/reports/sync?");
+    expect(logged).not.toContain("https://graph.facebook.com/sync?");
+    expect(logged).not.toContain("Authorization:");
+    expect(logged).not.toContain("Cookie:");
+    expect(logged).not.toContain("payload=");
+  });
+
   it("loads only campaigns in the default report view", async () => {
     const fetchMock = mockReportsApi();
     const html = await renderReports();
@@ -350,6 +412,40 @@ describe("reports route", () => {
     expect(urls.some((url) => url.includes("/reports/meta/structure"))).toBe(
       false,
     );
+  });
+
+  it("filters every report level by active WhatsApp instance and keeps Meta scope honest", async () => {
+    const fetchMock = mockReportsApi();
+
+    const campaignHtml = await renderReports({
+      whatsappInstanceId: "instance_active",
+    });
+    await renderReports({
+      view: "adsets",
+      whatsappInstanceId: "instance_active",
+    });
+    await renderReports({ view: "ads", whatsappInstanceId: "instance_active" });
+    const urls = fetchMock.mock.calls.map(([input]) => String(input));
+
+    for (const endpoint of ["campaigns", "adsets", "ads"]) {
+      expect(
+        urls.some(
+          (url) =>
+            url.includes(`/reports/${endpoint}`) &&
+            url.includes("whatsappInstanceId=instance_active"),
+        ),
+      ).toBe(true);
+    }
+    expect(campaignHtml).toContain("Número WhatsApp");
+    expect(campaignHtml).toContain("Todos os números");
+    expect(campaignHtml).toContain("Central vendas - •••• 8888");
+    expect(campaignHtml).not.toContain('value="instance_removed"');
+    expect(campaignHtml).toContain("Escopo do número WhatsApp");
+    expect(campaignHtml).toContain(
+      "Investimento, impressões e demais métricas Meta continuam no escopo da campanha ou conta, não por número.",
+    );
+    expect(campaignHtml).toContain('name="whatsappInstanceId"');
+    expect(campaignHtml).toContain("whatsappInstanceId=instance_active");
   });
 
   it("accepts a broader Meta sync period that covers the report", async () => {
@@ -408,6 +504,36 @@ describe("reports route", () => {
     });
 
     expect(html).toContain("Contas Meta com períodos diferentes");
+  });
+
+  it("does not mark matching persisted periods as mixed while account sync jobs are running", async () => {
+    const synchronizedAssets = metaAssetsWithSyncRange(
+      "2026-08-26",
+      "2026-09-01",
+    );
+    mockReportsApi({
+      assets: {
+        ...synchronizedAssets,
+        reportingAccounts: Array.from({ length: 3 }, (_, index) => ({
+          ...synchronizedAssets.reportingAccounts[0],
+          id: `reporting_${index + 1}`,
+          adAccountId: `act_${index + 1}`,
+          adAccountName: `Conta ${index + 1}`,
+          // This is a current queue state. The saved period remains the last
+          // completed import and must still be comparable by Reports.
+          syncStatus: "syncing" as const,
+        })),
+      },
+    });
+
+    const html = await renderReports({
+      since: "2026-08-26",
+      until: "2026-09-01",
+    });
+
+    expect(html).toContain("Meta: 26/08/2026 a 01/09/2026");
+    expect(html).not.toContain("Contas Meta com períodos diferentes");
+    expect(html).not.toContain("Período Meta diferente do relatório");
   });
 
   it("loads only the selected ad set view", async () => {
@@ -526,6 +652,19 @@ describe("reports route", () => {
     expect(tableIndex).toBeGreaterThan(resultsIndex);
     expect(html).toContain('class="report-analysis-switcher"');
     expect(html).toContain('class="report-period-context"');
+    expect(html).toContain('aria-label="Período"');
+    expect(html).toContain('aria-label="Escopo"');
+    expect(html).toContain('aria-label="Ações"');
+    // Periodo comes before escopo, which comes before acoes.
+    expect(html.indexOf('aria-label="Período"')).toBeLessThan(
+      html.indexOf('aria-label="Escopo"'),
+    );
+    expect(html.indexOf('aria-label="Escopo"')).toBeLessThan(
+      html.indexOf('aria-label="Ações"'),
+    );
+    // The Meta sync window is a hint on the sync action, not a floating tag.
+    expect(html).toContain('class="report-sync-hint"');
+    expect(html).toContain("Janela já sincronizada da Meta:");
     expect(html).not.toContain("Estrutura e filtros");
     expect(html).toContain('aria-label="Grupo de métricas"');
     expect(html).toContain('aria-label="Filtros avançados"');
@@ -557,20 +696,29 @@ describe("reports route", () => {
     );
   });
 
-  it("uses two compact desktop control rows with advanced filters on demand", () => {
+  it("groups the toolbar into periodo, escopo and acoes with advanced filters on demand", () => {
     const css = readFileSync(
       join(process.cwd(), "src/styles/layout-system.css"),
       "utf8",
     );
 
     expect(css).toMatch(
-      /\.report-command-body\s*{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s*auto[^}]*padding:\s*12px 14px/s,
+      /\.report-toolbar\s*{[^}]*grid-template-areas:\s*"period actions"\s*"scope scope"/s,
+    );
+    expect(css).toMatch(/\.report-toolbar-period\s*{[^}]*grid-area:\s*period/s);
+    expect(css).toMatch(/\.report-toolbar-scope\s*{[^}]*grid-area:\s*scope/s);
+    expect(css).toMatch(
+      /\.report-toolbar-actions\s*{[^}]*grid-area:\s*actions[^}]*justify-content:\s*flex-end/s,
+    );
+    // Narrow viewports must still read periodo -> escopo -> acoes.
+    expect(css).toMatch(
+      /@media \(max-width: 1280px\)\s*{\s*\.report-toolbar\s*{[^}]*grid-template-areas:\s*"period"\s*"scope"\s*"actions"/s,
     );
     expect(css).toMatch(
-      /\.report-analysis-controls\s*{[^}]*grid-template-columns:\s*auto minmax\(0,\s*1fr\)/s,
+      /\.report-period-range\s*{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(126px,\s*168px\)\)/s,
     );
     expect(css).toMatch(
-      /\.report-filter-primary\s*{[^}]*grid-template-columns:[^}]*auto\s*auto[^}]*padding:\s*10px 12px/s,
+      /\.report-filter-primary\s*{[^}]*grid-template-columns:[^}]*auto\s*auto[^}]*padding:\s*10px 14px/s,
     );
     expect(css).toMatch(
       /\.report-advanced-filters\[open\]\s*{[^}]*grid-column:\s*1\s*\/\s*-1/s,
@@ -712,6 +860,30 @@ describe("reports route", () => {
     expect(html).toContain("Não foi possível carregar campanhas");
     expect(html).not.toContain("Não foi possível carregar conjuntos");
     expect(html).not.toContain("Não foi possível carregar anúncios");
+  });
+
+  it("6.3b: a drill-down campaign outside the cut is an empty table, not API indisponível", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+
+      if (url.includes("/workspaces/current")) return json(workspace);
+      if (url.includes("/integrations/meta/assets")) return json(metaAssets);
+      if (url.includes("/integrations/whatsapp-connections")) {
+        return json(whatsappInstances);
+      }
+      if (url.includes("/reports/campaigns")) {
+        return json({ message: "Campanha não encontrada" }, 404);
+      }
+
+      return json({ message: "not found" }, 404);
+    });
+    const html = await renderReports({
+      campaignId: "cmp_other_account",
+      businessId: "business_1",
+    });
+
+    expect(html).not.toContain("API indisponível");
+    expect(html).not.toContain("Não foi possível carregar campanhas");
   });
 
   it("hides Meta synchronization from workspace members", async () => {

@@ -62,13 +62,35 @@ export const providerConversionRuleModeSchema = z.enum(
 /**
  * Plataforma externa que chama a URL da automacao. Ausente (null) mantem o
  * comportamento original, em que o proprio provedor WhatsApp (Umbler) envia o
- * callback. "payt" marca uma regra de venda vinda da Payt (Fase 4a): o valor
- * de cada venda chega em centavos no payload.
+ * callback. "payt"/"braip" marcam uma regra de venda vinda da plataforma (Payt
+ * na Fase 4a, Braip na 6.5, Yampi na 6.7): o valor de cada venda chega no
+ * payload. "roichat" (Fase 6.8) marca a regra "Compra no ROI Chat".
  */
-export const providerConversionAutomationSources = ["payt"] as const;
+export const providerConversionAutomationSources = [
+  "payt",
+  "braip",
+  "roichat",
+  "yampi",
+] as const;
 export const providerConversionAutomationSourceSchema = z.enum(
   providerConversionAutomationSources,
 );
+
+/**
+ * Fase 6.8 (porte do #183): ROI Chat (WhatsApp API Oficial). A compra chega
+ * na MESMA URL do numero que recebe a entrada do lead, com
+ * `event_name: "Purchase"`, `valor_venda` e `moeda`. Nao e plataforma de
+ * venda. A regra "Compra no ROI Chat" envia so Purchase; o valor vem da venda
+ * e o valor da regra e apenas reserva (opcional) para uma compra que chegar
+ * sem `valor_venda`.
+ */
+export const ROICHAT_PROVIDER = "roichat" as const;
+export const roichatEventNames = ["Purchase"] as const;
+export function isRoichatProvider(
+  provider: string | null | undefined,
+): provider is typeof ROICHAT_PROVIDER {
+  return provider === ROICHAT_PROVIDER;
+}
 
 /**
  * Fase 4a: eventos padrao que um postback da Payt pode virar. O evento vem do
@@ -82,6 +104,32 @@ export const paytSaleEventNames = [
 ] as const;
 /** Eventos ainda em beta na Payt (a tela mostra o selo "beta"). */
 export const paytBetaSaleEventNames = ["CartAbandoned"] as const;
+
+/**
+ * Plataformas de venda (checkout) com URL única por workspace: o evento vem
+ * do status de cada postback e a regra pode filtrar por produto. Fase 6.5:
+ * Braip e, na 6.7, Yampi, com o leitor `automation-v1` certificado (produção
+ * direta).
+ */
+export const salesPlatformProviders = ["payt", "braip", "yampi"] as const;
+export type SalesPlatformProviderDto = (typeof salesPlatformProviders)[number];
+export function isSalesPlatformProvider(
+  provider: string | null | undefined,
+): provider is SalesPlatformProviderDto {
+  return (salesPlatformProviders as readonly string[]).includes(
+    provider ?? "",
+  );
+}
+
+/** Nome exibido de cada plataforma de venda. */
+export const salesPlatformLabels: Record<SalesPlatformProviderDto, string> = {
+  payt: "Payt",
+  braip: "Braip",
+  yampi: "Yampi",
+};
+
+/** Mesmos eventos para toda plataforma de venda (Payt, Braip, Yampi). */
+export const salesPlatformEventNames = paytSaleEventNames;
 
 /** Fase 5.3: código de produto/oferta de uma plataforma de venda. */
 export const saleProductCodeSchema = z
@@ -118,7 +166,10 @@ export const providerConversionRuleScopeSchema = z.enum(
  * Origem normalizada de uma regra (usada na precedencia e no "Unificar").
  * whatsapp_label = etiqueta do WhatsApp (Uazapi); automation_umbler = callback
  * assinado da automacao Umbler; automation_payt = postback de venda da Payt;
- * automation_unnichat = fluxo do Unnichat chamando a URL da regra (Fase 4b).
+ * automation_unnichat = fluxo do Unnichat chamando a URL da regra (Fase 4b);
+ * automation_braip = postback de venda da Braip (6.5); automation_yampi =
+ * webhook de pedido/carrinho da Yampi (6.7);
+ * automation_roichat = compra do ROI Chat na URL do numero (6.8).
  * As automacoes por URL ficam sempre ligadas a uma conexao.
  */
 export const providerConversionRuleOrigins = [
@@ -128,6 +179,9 @@ export const providerConversionRuleOrigins = [
   "automation_umbler",
   "automation_payt",
   "automation_unnichat",
+  "automation_braip",
+  "automation_roichat",
+  "automation_yampi",
 ] as const;
 export const providerConversionRuleOriginSchema = z.enum(
   providerConversionRuleOrigins,
@@ -325,7 +379,10 @@ const providerConversionRuleBaseSchema = z.object({
   scope: providerConversionRuleScopeSchema.optional(),
   // Vazio somente quando scope = "all_numbers".
   channelIds: uniqueChannelIdsSchema.default([]),
-  mode: providerConversionRuleModeSchema.default("observation"),
+  // Fase 6.1c (produção direta): ausente = a API decide. Regra de uma
+  // integração validada nasce enviando ("production"); só um leitor ainda
+  // não validado (ou o envio desligado no servidor) nasce em observação.
+  mode: providerConversionRuleModeSchema.optional(),
 });
 
 const providerConversionRuleBaseShape = providerConversionRuleBaseSchema.shape;
@@ -393,6 +450,8 @@ type ValuedRuleInput = {
 function refineEventValueFields(
   input: ValuedRuleInput,
   context: z.RefinementCtx,
+  /** ROI Chat: the sale carries its value; the rule's is only a fallback. */
+  options: { valueOptional?: boolean } = {},
 ): void {
   if (!conversionEventCarriesValue(input.eventName)) {
     if (input.defaultValueCents != null) {
@@ -420,6 +479,7 @@ function refineEventValueFields(
   }
 
   if (
+    !options.valueOptional &&
     conversionEventRequiresValue(input.eventName) &&
     input.valueMode !== "message_extracted" &&
     !input.defaultValueCents
@@ -496,18 +556,43 @@ const providerAutomationCreateSchema = z
     ...eventValueShape,
     triggerType: z.literal("provider_automation"),
     eventName: conversionEventNameSchema,
-    // Fase 4a: "payt" = regra de venda da Payt (URL propria da regra).
+    // Fase 4a: "payt" = regra de venda da Payt (URL propria da regra);
+    // 6.5: "braip" = regra de venda da Braip (só pela URL única); 6.7: "yampi",
+    // idem.
     automationSource: providerConversionAutomationSourceSchema.optional(),
-    // Fase 5.3: só plataformas de venda (Payt). Vazio = todos os produtos.
+    // Fase 5.3: só plataformas de venda (Payt, Braip, Yampi). Vazio = todos.
     productFilterCodes: saleProductFilterCodesSchema.optional(),
     // Fase 5.3: false = a regra recebe só pela URL única da integração (a URL
     // própria da regra nasce desativada). Ausente = comportamento histórico.
     perRuleUrl: z.boolean().optional(),
+    // Unnichat/Umbler: true = "Todos os numeros da <plataforma> (todas as
+    // conexoes)" (so com scope all_numbers). Ausente/false = numeros da
+    // conexao da regra (comportamento historico).
+    crossConnectionScope: z.boolean().optional(),
   })
   .superRefine((input, context) => {
     refineRuleScopeChannels(input, context);
-    if (input.automationSource !== "payt") {
-      refineEventValueFields(input, context);
+    if (isRoichatProvider(input.automationSource)) {
+      // ROI Chat: so compra; o valor vem da venda (valor da regra = reserva).
+      if (input.eventName !== "Purchase") {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "O ROI Chat envia somente compra",
+          path: ["eventName"],
+        });
+      }
+      if (input.triggerPhrases || input.triggerLabels) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "A compra do ROI Chat não usa etiquetas",
+          path: ["triggerPhrases"],
+        });
+      }
+    }
+    if (!isSalesPlatformProvider(input.automationSource)) {
+      refineEventValueFields(input, context, {
+        valueOptional: isRoichatProvider(input.automationSource),
+      });
       if (input.productFilterCodes && input.productFilterCodes.length > 0) {
         context.addIssue({
           code: z.ZodIssueCode.custom,
@@ -517,19 +602,21 @@ const providerAutomationCreateSchema = z
       }
       return;
     }
-    // A Payt traz o valor real de cada venda; o evento vem do status.
-    if (!(paytSaleEventNames as readonly string[]).includes(input.eventName)) {
+    // A plataforma de venda traz o valor real; o evento vem do status.
+    const platform = salesPlatformLabels[input.automationSource];
+    if (
+      !(salesPlatformEventNames as readonly string[]).includes(input.eventName)
+    ) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
-        message:
-          "A Payt envia compra aprovada, Pix/boleto gerado ou carrinho abandonado",
+        message: `A ${platform} envia compra aprovada, Pix/boleto gerado ou carrinho abandonado`,
         path: ["eventName"],
       });
     }
     if (input.triggerPhrases || input.triggerLabels) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
-        message: "A automação da Payt não usa etiquetas",
+        message: `A automação da ${platform} não usa etiquetas`,
         path: ["triggerPhrases"],
       });
     }
@@ -686,6 +773,8 @@ export const providerConversionRuleUpdateInputSchema = z
     // confirmPublicUrlDisable: true, porque a plataforma pode ainda postar ali.
     publicUrlDisabled: z.boolean().optional(),
     confirmPublicUrlDisable: z.literal(true).optional(),
+    // Unnichat/Umbler: true = "Ampliar para todas as conexoes" (all_numbers).
+    crossConnectionScope: z.boolean().optional(),
   })
   .refine((input) => Object.keys(input).length > 0, {
     message: "Informe ao menos um campo para atualizar",
@@ -933,8 +1022,16 @@ export const providerConversionRuleSchema = z.object({
     .optional(),
   // Regra global que substituiu esta via "Unificar" (historico preservado).
   unifiedIntoRuleId: idSchema.nullable().optional(),
-  // Somente "all_numbers" ativa: números cobertos cuja conexão não está em
-  // produção ou cujo canal não está ativo, com o motivo. Opcional para
+  // O numero da regra foi removido (automacao: a conexao da URL foi
+  // removida; especifica: todos os numeros escolhidos foram removidos). A
+  // regra nao recebe mais nada; a tela mostra "Numero removido" com as
+  // acoes. Opcional para aceitar respostas anteriores ao campo.
+  numberRemoved: z.boolean().optional(),
+  // Unnichat/Umbler "Todos os numeros da <plataforma> (todas as conexoes)".
+  // Ausente/false em all_numbers = numeros da conexao da regra.
+  crossConnectionScope: z.boolean().optional(),
+  // Somente "all_numbers" ativa: numeros cobertos cuja conexao nao esta em
+  // producao ou cujo canal nao esta ativo, com o motivo. Opcional para
   // aceitar respostas anteriores ao campo (ausente = nenhum pendente).
   pendingNumbers: z.array(providerConversionRulePendingNumberSchema).optional(),
   triggerPhrases: z.array(messageTriggerPhraseSchema),
@@ -1020,7 +1117,9 @@ export const providerConversionRuleUnifyCandidateSchema = z.object({
   mode: providerConversionRuleModeSchema,
   name: z.string().min(1),
   triggerPhrases: z.array(z.string()),
-  ruleIds: z.array(idSchema).min(2),
+  // Automacoes Umbler/Unnichat: 1 regra basta quando ja existe a regra para
+  // todos os numeros (existingGlobalRuleId); as demais origens pedem 2+.
+  ruleIds: z.array(idSchema).min(1),
   // Numeros hoje cobertos pelas regras do grupo.
   channelIds: z.array(idSchema),
   // Numeros compativeis que passariam a ser cobertos pela regra global.
@@ -1032,6 +1131,27 @@ export const providerConversionRuleUnifyCandidateSchema = z.object({
   observationCanonicalChannels: observationCanonicalChannelsSchema.optional(),
   // Regra global identica ja existente, que sera reaproveitada.
   existingGlobalRuleId: idSchema.nullable(),
+  // Automacoes Unnichat/Umbler (mesmo evento): cada regra com valor e modo,
+  // a regra cujos valores e modo vao valer e o que difere entre elas
+  // (com diferencas, "Unificar" exige acknowledgeDifferences).
+  members: z
+    .array(
+      z.object({
+        ruleId: idSchema,
+        name: z.string(),
+        connectionId: idSchema.nullable(),
+        scope: providerConversionRuleScopeSchema,
+        crossConnectionScope: z.boolean(),
+        mode: providerConversionRuleModeSchema,
+        defaultValueCents: z.number().int().nullable(),
+        defaultCurrency: z.string().nullable(),
+        defaultContentName: z.string().nullable(),
+        numberRemoved: z.boolean(),
+      }),
+    )
+    .optional(),
+  targetRuleId: idSchema.nullable().optional(),
+  differences: z.array(z.enum(["mode", "value", "currency", "contentName"])).optional(),
 });
 
 export const providerConversionRuleUnifyCandidatesSchema = z.object({
@@ -1041,13 +1161,55 @@ export const providerConversionRuleUnifyCandidatesSchema = z.object({
 export const providerConversionRuleUnifyInputSchema = z.object({
   ruleIds: z
     .array(idSchema)
-    .min(2)
+    // A API exige 2+, exceto automacoes com regra para todos os numeros.
+    .min(1)
     .max(100)
     .refine((ids) => new Set(ids).size === ids.length, {
       message: "Cada regra deve ser informada uma única vez",
     }),
   name: z.string().trim().min(2).max(120).optional(),
+  // Automacoes: confirma que os valores/modo da regra alvo vao valer.
+  acknowledgeDifferences: z.boolean().optional(),
 });
+
+/**
+ * Exclusão em lote de regras (lista de Conversões; Fase 6.1a, porte do #161).
+ * Uma regra que é o destino de outras unificadas só sai se estiver em
+ * confirmTargetRuleIds.
+ */
+export const providerConversionRuleBulkRemoveInputSchema = z.object({
+  ruleIds: z
+    .array(idSchema)
+    .min(1)
+    .max(100)
+    .refine((ids) => new Set(ids).size === ids.length, {
+      message: "Cada regra deve ser informada uma única vez",
+    }),
+  confirmTargetRuleIds: z.array(idSchema).max(100).optional(),
+});
+
+export const providerConversionRuleBulkRemoveResultSchema = z.object({
+  results: z.array(
+    z.object({
+      ruleId: idSchema,
+      status: z.enum([
+        "removed",
+        "not_found",
+        "needs_target_confirmation",
+        "failed",
+      ]),
+      message: z.string().max(300).nullable(),
+    }),
+  ),
+  removedCount: z.number().int().min(0),
+});
+
+export type ProviderConversionRuleBulkRemoveInputDto = z.infer<
+  typeof providerConversionRuleBulkRemoveInputSchema
+>;
+export type ProviderConversionRuleBulkRemoveResultDto = z.infer<
+  typeof providerConversionRuleBulkRemoveResultSchema
+>;
 
 export const providerConversionRuleUnifyResultSchema = z.object({
   // created: nova regra global; reused_existing: regra global identica ja
@@ -1117,7 +1279,41 @@ export const providerConversionRuleCapabilitiesSchema = z.object({
   globalPrecedence: z.literal(providerConversionRuleGlobalPrecedence),
   origins: z.array(providerConversionRuleOriginCapabilitySchema),
   unsupportedWhatsappProviders: z.array(z.string().min(1)),
+  /**
+   * Espelha LEAD_SUBMITTED_RULE_OVERRIDE_ENABLED (ligada por padrão nesta
+   * edição): uma regra "Lead recebido" ativa e enviando substitui o envio do
+   * Lead recebido na entrada da conversa nos números que ela cobre.
+   * Opcional: APIs anteriores não enviam (tratado como desligado).
+   */
+  leadSubmittedRuleOverrideEnabled: z.boolean().optional(),
+  /**
+   * INBOUND_CONVERSION_PRODUCTION_ENABLED=false na API: nenhuma regra envia
+   * (nem Kommo e Pipedrive), mesmo as que aparecem enviando. Opcional: APIs
+   * anteriores não enviam (tratado como ligado).
+   */
+  conversionSendingOff: z.boolean().optional(),
 });
+
+/** Código do recibo de entrada cujo Lead recebido foi adiado para a regra. */
+export const LEAD_SUBMITTED_DEFERRED_TO_RULE_CODE =
+  "lead_submitted_deferred_to_rule";
+
+/**
+ * A regra substitui o envio do Lead recebido na entrada: evento
+ * LeadSubmitted, ativa e enviando (produção). Mesma condição do selo
+ * "Substitui envio na entrada" da lista de regras.
+ */
+export function providerRuleReplacesEntryLeadSubmitted(rule: {
+  eventName: string;
+  active: boolean;
+  mode: string;
+}): boolean {
+  return (
+    rule.eventName === "LeadSubmitted" &&
+    rule.active &&
+    rule.mode === "production"
+  );
+}
 
 /**
  * Regra antiga (palavra-chave ou etiqueta sem configuracao de provedor),
@@ -1154,6 +1350,33 @@ export const providerConversionAutomationAuditStatusSchema = z.enum([
   "invalid_payload",
 ]);
 
+/**
+ * Por que um evento reconhecido ficou EM OBSERVAÇÃO (nada enviado à Meta),
+ * gravado no momento da decisão (porte do SaaS, #171: tudo aparecia só como
+ * "Reconhecido em observação"):
+ *  - rule_observation_at_receipt: a regra estava em observação quando o
+ *    evento chegou (reprocessar com a regra em envio ativo envia);
+ *  - production_sending_disabled: envio de conversões desligado no servidor;
+ *  - lead_number_legacy_engine: o número do lead ainda usa o motor antigo de
+ *    conversões (reprocessar não envia);
+ *  - rule_not_activated: a regra não tem data de ativação do envio;
+ *  - received_before_rule_activation: chegou antes do envio ativo da regra
+ *    (reprocessar envia);
+ *  - lead_number_not_production: o número do lead não está em produção na
+ *    própria conexão (ativar envio neste número e depois reprocessar);
+ *  - received_before_number_activation: chegou antes do envio ativo do
+ *    número do lead (reprocessar envia).
+ */
+export const providerConversionObservationDetailSchema = z.enum([
+  "rule_observation_at_receipt",
+  "production_sending_disabled",
+  "lead_number_legacy_engine",
+  "rule_not_activated",
+  "received_before_rule_activation",
+  "lead_number_not_production",
+  "received_before_number_activation",
+]);
+
 export const providerConversionAutomationAuditItemSchema = z.object({
   deliveryId: idSchema,
   executionId: idSchema.nullable(),
@@ -1177,6 +1400,10 @@ export const providerConversionAutomationAuditItemSchema = z.object({
   payloadAvailable: z.boolean(),
   payloadExpiresAt: z.string().datetime(),
   reprocessable: z.boolean(),
+  /** Motivo da observação (só para status observed; opcional: versões antigas). */
+  observationDetail: providerConversionObservationDetailSchema
+    .nullable()
+    .optional(),
 });
 
 export const providerConversionAutomationAuditSchema = z.object({
@@ -1279,9 +1506,26 @@ export const providerConversionRuleExecutionAuditSchema = z.object({
       ready: z.number().int().nonnegative(),
       stillBlocked: z.number().int().nonnegative(),
       expired: z.number().int().nonnegative(),
+      // Dentro da janela, mas o lead já converteu este evento "uma vez por
+      // lead" para o mesmo destino Meta em outro número ou pela entrada do
+      // anúncio: não é reenviada (fica como está). Opcional (respostas antigas).
+      alreadyConverted: z.number().int().nonnegative().optional(),
       // false: a regra está pausada, em observação ou unificada; nada é
       // reenviado (ready = 0) até o envio automático da regra ser ligado.
       ruleSendsNow: z.boolean().optional(),
+    })
+    .optional(),
+  /**
+   * Tarefa 20 (LEAD_SUBMITTED_RULE_OVERRIDE_ENABLED): leads cuja entrada
+   * adiou o Lead recebido para esta regra ha mais de `olderThanDays` dias e
+   * que a regra ainda nao enviou ("N leads aguardando a regra"). So leitura:
+   * nada e enviado sozinho. capped: contagem limitada (ha pelo menos isso).
+   */
+  leadsAwaitingRule: z
+    .object({
+      count: z.number().int().nonnegative(),
+      olderThanDays: z.number().int().positive(),
+      capped: z.boolean(),
     })
     .optional(),
 });
@@ -1295,6 +1539,9 @@ export const providerConversionRuleBlockedReprocessResultSchema = z.object({
   stillBlocked: z.number().int().nonnegative(),
   // Mais antigas que a janela da Meta: mostradas como expiradas, nunca reenviadas.
   expired: z.number().int().nonnegative(),
+  // Lead já convertido (evento "uma vez por lead", mesmo destino Meta) por
+  // outro número ou pela entrada do anúncio: não reenviadas.
+  alreadyConverted: z.number().int().nonnegative().optional(),
   // Origem sem reprocessamento por aqui (ex.: não QR) ou erro técnico.
   skipped: z.number().int().nonnegative(),
   failed: z.number().int().nonnegative(),
@@ -1565,6 +1812,9 @@ export type ProviderConversionAutomationAuditStatusDto = z.infer<
 >;
 export type ProviderConversionAutomationAuditItemDto = z.infer<
   typeof providerConversionAutomationAuditItemSchema
+>;
+export type ProviderConversionObservationDetailDto = z.infer<
+  typeof providerConversionObservationDetailSchema
 >;
 export type ProviderConversionAutomationAuditDto = z.infer<
   typeof providerConversionAutomationAuditSchema

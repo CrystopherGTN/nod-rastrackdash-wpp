@@ -1,4 +1,8 @@
 import {
+  CONVERSION_PRODUCTION_DISABLED_CODE,
+  conversionSendingSwitchedOff,
+} from "../config/deployment-config";
+import {
   BadRequestException,
   ConflictException,
   HttpException,
@@ -233,7 +237,12 @@ export class PipedriveWebhookService {
     actor: PipedriveActor,
     input: PipedriveConversionRuleCreateInputDto,
   ) {
-    const data = this.parseRule(input);
+    const parsed = this.parseRule(input);
+    // Fase 6.1c (produção direta): sem modo pedido, a regra nasce enviando.
+    // Se a conexão ainda não tem o que o envio exige (credencial, webhook e
+    // números autorizados), ela nasce sem envio e "Ativar envio" diz o motivo.
+    const modeDefaulted = parsed.mode === undefined;
+    const data = { ...parsed, mode: parsed.mode ?? "production" };
     return this.transaction(async (tx) => {
       const live = await this.connections.lockConnection(
         tx,
@@ -242,8 +251,17 @@ export class PipedriveWebhookService {
       );
       await this.requireStage(tx, live, data.pipelineId, data.stageId);
       await this.requireUniqueWonRule(tx, live, data);
-      if (data.mode === "production" && data.active)
-        await this.requireProduction(tx, live);
+      if (data.mode === "production" && data.active) {
+        if (!modeDefaulted) await this.requireProduction(tx, live);
+        else {
+          try {
+            await this.requireProduction(tx, live);
+          } catch (error) {
+            if (!(error instanceof ConflictException)) throw error;
+            data.mode = "observation";
+          }
+        }
+      }
       const rule = await tx.pipedriveConversionRule.create({
         data: {
           workspaceId,
@@ -1054,6 +1072,10 @@ export class PipedriveWebhookService {
   ) {
     if (!this.conversions || !this.conversionQueue)
       return "pipedrive_production_disabled";
+    // Interruptor do servidor: INBOUND_CONVERSION_PRODUCTION_ENABLED=false
+    // desliga o envio de todas as regras, também as do Pipedrive.
+    if (conversionSendingSwitchedOff())
+      return CONVERSION_PRODUCTION_DISABLED_CODE;
     const activated = rule.productionActivatedAt;
     if (
       !activated ||

@@ -19,7 +19,7 @@ import {
   Plus,
   Send,
   Settings2,
-  Undo2,
+  Trash2,
 } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -53,6 +53,7 @@ import {
   UnattributedSalesList,
   type SingleUrlActions,
 } from "../integrations/single-url/single-url-panels";
+import { BulkDeleteModal, cleanupCandidateIds } from "./bulk-delete";
 import { LegacyRules, type LegacyRuleActions } from "./legacy-rules";
 import { NewRuleFlow } from "./new-rule-flow";
 import { PendingNumbersWarning } from "./pending-numbers";
@@ -65,6 +66,12 @@ import {
   type RuleManageTab,
 } from "./rule-manage";
 import { RuleLogo } from "./rule-logo";
+import {
+  activateRuleCopy,
+  conversionSendingOffCopy,
+  LeadSubmittedOverrideBadge,
+  replacesEntryLeadSubmitted,
+} from "./lead-submitted-override";
 import { UnifyBanner, UnifyReviewModal } from "./unify-review";
 
 type ScreenAction = (formData: FormData) => Promise<ConversionScreenActionResult>;
@@ -90,6 +97,8 @@ export type ConversionsScreenProps = {
   createAction: ScreenAction;
   confirmCreateAction: ScreenAction;
   unifyAction: ScreenAction;
+  /** "Excluir selecionadas": absent, the list has no checkboxes. */
+  bulkRemoveAction?: ScreenAction;
   updateRuleAction: RuleAction;
   loadExecutionsAction: RuleAction;
   /** "Ativar envio neste número" de uma regra para todos os números. */
@@ -110,6 +119,12 @@ export type ConversionsSingleUrl = {
   endpoints: IntegrationEndpointDto[];
   paytProducts: IntegrationDetectedProductDto[];
   paytUnattributed: IntegrationUnattributedEventListDto | null;
+  /** Fase 6.5: produtos e vendas sem atribuição da Braip. */
+  braipProducts?: IntegrationDetectedProductDto[];
+  braipUnattributed?: IntegrationUnattributedEventListDto | null;
+  /** Fase 6.7: produtos e vendas sem atribuição da Yampi. */
+  yampiProducts?: IntegrationDetectedProductDto[];
+  yampiUnattributed?: IntegrationUnattributedEventListDto | null;
   actions: SingleUrlActions;
 };
 
@@ -138,6 +153,7 @@ const statusTone: Record<ConversionRuleRow["status"], string> = {
   observation: " neutral",
   paused: " warn",
   unified: " neutral",
+  number_removed: " warn",
 };
 
 function formatDateTime(value: string): string {
@@ -166,6 +182,7 @@ export function ConversionsScreen({
   createAction,
   confirmCreateAction,
   unifyAction,
+  bulkRemoveAction,
   updateRuleAction,
   loadExecutionsAction,
   activateNumberAction,
@@ -229,6 +246,25 @@ export function ConversionsScreen({
   const [notice, setNotice] = useState<Notice | null>(null);
 
   const visibleRows = useMemo(() => filterRuleRows(rows, filters), [rows, filters]);
+
+  // Bulk selection: only provider rules, only for people who can manage.
+  // nod: with the license locked the list stays read-only (no selection).
+  const bulkEnabled = Boolean(canManage && bulkRemoveAction && !licenseLocked);
+  const [selectedIds, setSelectedIds] = useState<ReadonlySet<string>>(new Set());
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const selectedRows = useMemo(
+    () =>
+      rows.filter((row) => row.kind === "provider" && selectedIds.has(row.id)),
+    [rows, selectedIds],
+  );
+  const cleanupIds = useMemo(() => cleanupCandidateIds(visibleRows), [visibleRows]);
+
+  function toggleSelected(id: string, checked: boolean) {
+    const next = new Set(selectedIds);
+    if (checked) next.add(id);
+    else next.delete(id);
+    setSelectedIds(next);
+  }
   const filterCount = activeFilterCount(filters);
   const origins = useMemo(
     () => [...new Set(rows.map((row) => row.origin))],
@@ -306,7 +342,7 @@ export function ConversionsScreen({
             {liveCount} com envio automático
           </span>
           <span className="status-chip neutral">
-            {observationCount} em observação
+            {observationCount} com envio desligado
           </span>
           <span className="conversions-summary-total">
             {rows.length} {rows.length === 1 ? "regra" : "regras"} no total
@@ -347,6 +383,17 @@ export function ConversionsScreen({
               ? "Ligue INBOUND_WEBHOOKS_ENABLED e INBOUND_CONVERSION_RULES_ENABLED no .env da API (veja docs/setup/environment.md); depois as regras aparecem aqui."
               : "Atualize a página em alguns instantes. Nenhuma regra foi alterada."}
           </span>
+        </div>
+      ) : null}
+
+      {rulesState === "real" && capabilities?.conversionSendingOff === true ? (
+        <div
+          className="feedback-banner warn"
+          role="alert"
+          data-conversion-sending-off="true"
+        >
+          <strong>{conversionSendingOffCopy.title}</strong>
+          <span>{conversionSendingOffCopy.body}</span>
         </div>
       ) : null}
 
@@ -431,10 +478,20 @@ export function ConversionsScreen({
           >
             <option value="all">Todos</option>
             <option value="production">Envio automático</option>
-            <option value="observation">Observação</option>
-            <option value="paused">Pausadas</option>
+            <option value="observation">Envio desligado</option>
+            <option value="paused">Pausadas ou sem número</option>
             <option value="unified">Unificadas</option>
           </select>
+        </label>
+        <label className="conversion-check conversions-hide-unified">
+          <input
+            type="checkbox"
+            checked={filters.hideUnified}
+            onChange={(event) =>
+              setFilters({ ...filters, hideUnified: event.target.checked })
+            }
+          />
+          <span>Ocultar regras unificadas</span>
         </label>
         {filterCount > 0 ? (
           <button
@@ -490,6 +547,49 @@ export function ConversionsScreen({
           </div>
         ) : visibleRows.length > 0 ? (
           <>
+            {bulkEnabled ? (
+              <div
+                className="conversion-bulk-toolbar"
+                role="toolbar"
+                aria-label="Seleção de regras"
+              >
+                {cleanupIds.length > 0 ? (
+                  <button
+                    className="button ghost compact-button"
+                    type="button"
+                    onClick={() =>
+                      setSelectedIds(new Set([...selectedIds, ...cleanupIds]))
+                    }
+                  >
+                    Selecionar unificadas e de número removido ({cleanupIds.length})
+                  </button>
+                ) : null}
+                {selectedRows.length > 0 ? (
+                  <>
+                    <span className="conversion-bulk-count" aria-live="polite">
+                      {selectedRows.length}{" "}
+                      {selectedRows.length === 1 ? "selecionada" : "selecionadas"}
+                    </span>
+                    <button
+                      className="button ghost compact-button"
+                      type="button"
+                      onClick={() => setSelectedIds(new Set())}
+                    >
+                      Limpar seleção
+                    </button>
+                    <button
+                      className="button danger compact-button"
+                      type="button"
+                      onClick={() => setBulkOpen(true)}
+                      aria-haspopup="dialog"
+                    >
+                      <Trash2 size={14} aria-hidden="true" />
+                      Excluir selecionadas ({selectedRows.length})
+                    </button>
+                  </>
+                ) : null}
+              </div>
+            ) : null}
             <div className="conversion-rule-head" aria-hidden="true">
               <span>Regra</span>
               <span>Evento</span>
@@ -502,10 +602,16 @@ export function ConversionsScreen({
                 <li key={row.key} className="conversion-rule-row" data-origin={row.origin}>
                   <RuleRow
                     row={row}
+                    leadSubmittedOverrideEnabled={
+                      capabilities?.leadSubmittedRuleOverrideEnabled === true
+                    }
                     canManage={canManage}
                     licenseLocked={licenseLocked}
                     numbers={numbers}
                     activateNumberAction={activateNumberAction}
+                    selectable={bulkEnabled && row.kind === "provider"}
+                    selected={selectedIds.has(row.id)}
+                    onSelect={(checked) => toggleSelected(row.id, checked)}
                     onChanged={() => router.refresh()}
                     manageTabs={
                       manageActions && rulesById.has(row.id)
@@ -547,12 +653,60 @@ export function ConversionsScreen({
           className="conversions-list-section conversions-unattributed"
           aria-labelledby="conversions-unattributed-title"
         >
-          <h2 id="conversions-unattributed-title">Vendas sem atribuição</h2>
+          <h2 id="conversions-unattributed-title">
+            {(singleUrl.braipUnattributed &&
+              singleUrl.braipUnattributed.total > 0) ||
+            (singleUrl.yampiUnattributed &&
+              singleUrl.yampiUnattributed.total > 0)
+              ? "Vendas sem atribuição (Payt)"
+              : "Vendas sem atribuição"}
+          </h2>
           <UnattributedSalesList
             list={singleUrl.paytUnattributed}
             canManage={canManage}
             licenseLocked={licenseLocked}
             retry={singleUrl.actions.retry}
+            loadPayload={singleUrl.actions.loadPayload}
+          />
+        </section>
+      ) : null}
+
+      {singleUrl &&
+      singleUrl.braipUnattributed &&
+      singleUrl.braipUnattributed.total > 0 ? (
+        <section
+          className="conversions-list-section conversions-unattributed"
+          aria-labelledby="conversions-unattributed-braip-title"
+        >
+          <h2 id="conversions-unattributed-braip-title">
+            Vendas sem atribuição (Braip)
+          </h2>
+          <UnattributedSalesList
+            list={singleUrl.braipUnattributed}
+            canManage={canManage}
+            licenseLocked={licenseLocked}
+            retry={singleUrl.actions.retry}
+            loadPayload={singleUrl.actions.loadPayload}
+          />
+        </section>
+      ) : null}
+
+      {singleUrl &&
+      singleUrl.yampiUnattributed &&
+      singleUrl.yampiUnattributed.total > 0 ? (
+        <section
+          className="conversions-list-section conversions-unattributed"
+          aria-labelledby="conversions-unattributed-yampi-title"
+        >
+          <h2 id="conversions-unattributed-yampi-title">
+            Vendas sem atribuição (Yampi)
+          </h2>
+          <UnattributedSalesList
+            list={singleUrl.yampiUnattributed}
+            canManage={canManage}
+            licenseLocked={licenseLocked}
+            retry={singleUrl.actions.retry}
+            loadPayload={singleUrl.actions.loadPayload}
           />
         </section>
       ) : null}
@@ -573,7 +727,7 @@ export function ConversionsScreen({
         open={newRuleOpen}
         onClose={closeNewRule}
         title="Nova regra"
-        description="Origem, evento, alcance e detalhes. Toda regra começa em observação."
+        description="Origem, evento, alcance e detalhes. A regra já começa enviando para a Meta."
         size="wide"
         id="conversion-new-rule"
       >
@@ -596,8 +750,11 @@ export function ConversionsScreen({
             createAction={createAction}
             confirmAction={confirmCreateAction}
             paytProducts={singleUrl?.paytProducts}
+            braipProducts={singleUrl?.braipProducts}
+            yampiProducts={singleUrl?.yampiProducts}
             integrationEndpoints={singleUrl?.endpoints}
             singleUrlActions={singleUrl?.actions}
+            numbersUnavailable={numbersPartial}
             onBusyChange={setFlowBusy}
             onFinished={() => {
               setCloseBlocked(false);
@@ -607,6 +764,23 @@ export function ConversionsScreen({
           />
         ) : null}
       </Modal>
+
+      {bulkOpen && bulkRemoveAction ? (
+        <BulkDeleteModal
+          open
+          rows={selectedRows}
+          action={bulkRemoveAction}
+          onClose={() => setBulkOpen(false)}
+          onDone={(removedIds, message, allRemoved) => {
+            setSelectedIds(
+              new Set([...selectedIds].filter((id) => !removedIds.includes(id))),
+            );
+            setNotice({ tone: allRemoved ? "success" : "warn", message });
+            if (allRemoved) setBulkOpen(false);
+            router.refresh();
+          }}
+        />
+      ) : null}
 
       <UnifyReviewModal
         key={unifyGroup?.key ?? "none"}
@@ -687,7 +861,10 @@ export function ConversionsScreen({
             actions={manageActions}
             integrationEndpoints={singleUrl?.endpoints}
             paytProducts={singleUrl?.paytProducts}
+            braipProducts={singleUrl?.braipProducts}
+            yampiProducts={singleUrl?.yampiProducts}
             singleUrlActions={singleUrl?.actions}
+            numbersUnavailable={numbersPartial}
             initialTab={manage.tab}
             freshUrl={freshUrl}
             onFreshUrl={(webhookUrl) => setFreshEndpoint({ ruleId: manage.row.id, webhookUrl })}
@@ -750,19 +927,23 @@ function confirmSuccess(confirm: PendingConfirm): string {
     return `“${confirm.row.name}” agora envia o evento para a Meta automaticamente.`;
   }
   if (confirm.patch.mode === "observation") {
-    return `“${confirm.row.name}” voltou para observação: nada é enviado à Meta.`;
+    return `“${confirm.row.name}” está com o envio desligado: nada é enviado à Meta.`;
   }
   return confirm.patch.active
-    ? `“${confirm.row.name}” voltou a reconhecer conversas, em observação.`
+    ? `“${confirm.row.name}” foi retomada.`
     : `“${confirm.row.name}” foi pausada.`;
 }
 
 function RuleRow({
   row,
+  leadSubmittedOverrideEnabled = false,
   canManage,
   licenseLocked,
   numbers,
   activateNumberAction,
+  selectable = false,
+  selected = false,
+  onSelect,
   onChanged,
   manageTabs,
   onExecutions,
@@ -770,10 +951,16 @@ function RuleRow({
   onConfirm,
 }: {
   row: ConversionRuleRow;
+  /** "Lead recebido pela regra" ligado na API (selo da lista). */
+  leadSubmittedOverrideEnabled?: boolean;
   canManage: boolean;
   licenseLocked: boolean;
   numbers: ConversionNumber[];
   activateNumberAction?: ScreenAction;
+  /** Bulk delete: show the checkbox of this row. */
+  selectable?: boolean;
+  selected?: boolean;
+  onSelect?: (checked: boolean) => void;
   onChanged: () => void;
   /** Tabs of "Gerenciar" (empty: the rule cannot be managed here). */
   manageTabs: RuleManageTab[];
@@ -783,7 +970,16 @@ function RuleRow({
 }) {
   return (
     <article className="conversion-rule" aria-label={row.name}>
-      <div className="conversion-rule-main">
+      <div className={`conversion-rule-main${selectable ? " has-select" : ""}`}>
+        {selectable ? (
+          <input
+            type="checkbox"
+            className="conversion-rule-select"
+            checked={selected}
+            onChange={(event) => onSelect?.(event.target.checked)}
+            aria-label={`Selecionar ${row.name}`}
+          />
+        ) : null}
         <RuleLogo logo={row.logo} origin={row.origin} />
         <div className="conversion-rule-identity">
           <span className="conversion-rule-origin">
@@ -810,6 +1006,9 @@ function RuleRow({
             </>
           ) : null}
         </span>
+        {leadSubmittedOverrideEnabled && !licenseLocked && replacesEntryLeadSubmitted(row) ? (
+          <LeadSubmittedOverrideBadge />
+        ) : null}
       </div>
 
       <div className="conversion-rule-cell" data-label="Alcance">
@@ -881,9 +1080,21 @@ function RuleRow({
           </button>
         ) : null}
         {row.kind === "provider" && canManage ? (
-          <RuleStateButtons row={row} onConfirm={onConfirm} disabled={licenseLocked} />
+          <RuleStateButtons
+            row={row}
+            onConfirm={onConfirm}
+            disabled={licenseLocked}
+            leadSubmittedOverrideEnabled={leadSubmittedOverrideEnabled}
+          />
         ) : null}
       </div>
+
+      {row.warning ? (
+        <div className="feedback-banner warn conversion-rule-warning" role="status">
+          <strong>{row.warning.title}</strong>
+          <span>{row.warning.body}</span>
+        </div>
+      ) : null}
 
       {row.warnings.length > 0 ? (
         <ul className="conversion-rule-notes conversion-rule-warnings" role="list">
@@ -922,76 +1133,93 @@ function RuleStateButtons({
   row,
   onConfirm,
   disabled,
+  leadSubmittedOverrideEnabled = false,
 }: {
   row: ConversionRuleRow;
   onConfirm: (confirm: PendingConfirm) => void;
   disabled: boolean;
+  leadSubmittedOverrideEnabled?: boolean;
 }) {
+  const activate = activateRuleCopy({
+    name: row.name,
+    eventName: row.eventName,
+    leadSubmittedOverrideEnabled,
+  });
   if (!row.active) {
     return (
       <button
         className="button ghost compact-button"
         type="button"
         disabled={disabled}
-        aria-label={`Retomar observação de ${row.name}`}
+        aria-label={`Retomar ${row.name}`}
         onClick={() =>
           onConfirm({
             row,
-            title: "Retomar observação",
+            title: "Retomar regra",
             body:
               row.status === "unified"
-                ? "Esta regra foi unificada. Ela volta a reconhecer conversas nos números dela, no lugar da regra para todos os números, em observação: nada é enviado à Meta até você ativar o envio."
-                : "A regra volta a reconhecer conversas em observação: nada é enviado à Meta até você ativar o envio automático de novo.",
-            confirmLabel: "Retomar observação",
+                ? "Esta regra foi unificada. Ela volta a reconhecer conversas nos números dela, no lugar da regra para todos os números, e a enviar para a Meta."
+                : "A regra volta a reconhecer as conversas e a enviar para a Meta. Números e conexões que você pausou continuam pausados.",
+            confirmLabel: "Retomar",
             patch: { active: true },
           })
         }
       >
         <Play size={14} aria-hidden="true" />
-        Retomar observação
+        Retomar
+      </button>
+    );
+  }
+
+  // The rule's number was removed: it can no longer send anything, so the
+  // only switch offered is the safe one (pause, reversible, history kept).
+  // Excluir is in Gerenciar; "Unificar" moves it into the all-numbers rule.
+  if (row.status === "number_removed") {
+    return (
+      <button
+        className="button ghost compact-button"
+        type="button"
+        disabled={disabled}
+        aria-label={`Pausar ${row.name}, cujo número foi removido`}
+        onClick={() =>
+          onConfirm({
+            row,
+            title: "Pausar regra de número removido",
+            body: "O número desta regra foi removido, então ela já não recebe eventos. Pausar tira a regra dos envios ativos; o histórico continua salvo e você pode excluir a regra em Gerenciar.",
+            confirmLabel: "Pausar",
+            patch: { active: false },
+          })
+        }
+      >
+        <Pause size={14} aria-hidden="true" />
+        Pausar
       </button>
     );
   }
 
   return (
     <>
-      {row.mode === "production" ? (
+      {/* Fase 6.1c (produção direta): sem "voltar para observação"; para
+          parar o envio, Pausar. "Ativar envio" só aparece para uma regra com
+          o envio desligado. */}
+      {row.mode === "production" ? null : (
         <button
           className="button ghost compact-button"
           type="button"
           disabled={disabled}
-          aria-label={`Voltar ${row.name} para observação`}
+          aria-label={activate.ariaLabel}
           onClick={() =>
             onConfirm({
               row,
-              title: "Voltar para observação",
-              body: "A regra continua reconhecendo as conversas, mas nada é enviado à Meta.",
-              confirmLabel: "Voltar para observação",
-              patch: { mode: "observation" },
-            })
-          }
-        >
-          <Undo2 size={14} aria-hidden="true" />
-          Observar
-        </button>
-      ) : (
-        <button
-          className="button ghost compact-button"
-          type="button"
-          disabled={disabled}
-          aria-label={`Ativar envio automático de ${row.name}`}
-          onClick={() =>
-            onConfirm({
-              row,
-              title: "Ativar envio automático",
-              body: "Cada conversão reconhecida por esta regra passa a ser enviada para a Meta, pelo destino de cada número.",
-              confirmLabel: "Ativar envio",
+              title: activate.title,
+              body: activate.body,
+              confirmLabel: activate.confirmLabel,
               patch: { mode: "production" },
             })
           }
         >
           <Send size={14} aria-hidden="true" />
-          Ativar envio
+          {activate.label}
         </button>
       )}
       <button

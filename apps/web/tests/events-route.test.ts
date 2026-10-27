@@ -8,6 +8,11 @@ import { initialBackofficeActionState } from "../src/components/backoffice-actio
 
 vi.mock("next/cache", () => ({ revalidatePath: vi.fn() }));
 
+vi.mock("next/navigation", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("next/navigation")>()),
+  useRouter: () => ({ push: vi.fn() }),
+}));
+
 afterEach(() => {
   vi.restoreAllMocks();
 });
@@ -111,6 +116,7 @@ function auditResponse(events: unknown[]) {
       shadowObserved: 0,
       historical: 0,
       discarded: 0,
+      metaAuthRetryable: 0,
     },
     pagination: {
       page: 1,
@@ -203,6 +209,121 @@ describe("events route", () => {
     expect(html).toContain('name="source"');
     expect(html).not.toContain("phone_hash");
     expect(html).not.toContain("access_token");
+  });
+
+  it("auto-applies filters without a visible Aplicar button", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(auditResponse([auditEvent({})])), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    const element = await EventsPage({
+      searchParams: Promise.resolve({
+        since: "2026-07-06",
+        until: "2026-07-12",
+        status: "failed",
+        page: "3",
+        pageSize: "50",
+      }),
+    });
+    const html = renderToStaticMarkup(createElement("div", null, element));
+
+    expect(html).not.toContain("Aplicar");
+    expect(html).toContain(
+      '<button class="sr-only" type="submit" tabindex="-1">Atualizar auditoria</button>',
+    );
+    expect(html).toContain('role="status" aria-live="polite"');
+    expect(html).toContain('class="audit-filter-form" action="/events">');
+    expect(html).toContain('name="pageSize" value="50"');
+    expect(html).toContain('name="since" value="2026-07-06"');
+    expect(html).toContain('name="until" value="2026-07-12"');
+    expect(html).toContain(
+      '<option value="failed" selected="">Falhas</option>',
+    );
+    expect(html).toContain('<details class="audit-advanced-filters" open="">');
+    expect(html).toContain(
+      '<a class="button ghost" data-event-filters-clear="true" href="/events?since=2026-07-06&amp;until=2026-07-12&amp;pageSize=50">Limpar filtros</a>',
+    );
+  });
+
+  it("keeps the advanced filters folded and Limpar hidden without filters", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(auditResponse([auditEvent({})])), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    const element = await EventsPage({
+      searchParams: Promise.resolve({
+        since: "2026-07-06",
+        until: "2026-07-12",
+      }),
+    });
+    const html = renderToStaticMarkup(createElement("div", null, element));
+
+    expect(html).toContain('<details class="audit-advanced-filters">');
+    expect(html).not.toContain("data-event-filters-clear");
+    expect(html).not.toContain("Limpar filtros");
+    expect(html).not.toContain("Aplicar");
+  });
+
+  it("fills the default seven-day period when the URL has none", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-07-12T15:00:00.000Z"));
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(auditResponse([])), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    try {
+      const element = await EventsPage({ searchParams: Promise.resolve({}) });
+      const html = renderToStaticMarkup(createElement("div", null, element));
+
+      expect(globalThis.fetch).toHaveBeenCalledWith(
+        "http://localhost:3333/reports/conversions/audit?since=2026-07-06&until=2026-07-12&page=1&pageSize=25",
+        expect.objectContaining({ credentials: "include" }),
+      );
+      expect(html).toContain('name="since" value="2026-07-06"');
+      expect(html).toContain('name="until" value="2026-07-12"');
+      expect(html).toContain('name="pageSize" value="25"');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps filters and page size on pagination links", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          ...auditResponse([auditEvent({})]),
+          pagination: { page: 2, pageSize: 50, totalItems: 120, totalPages: 3 },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    const element = await EventsPage({
+      searchParams: Promise.resolve({
+        since: "2026-07-06",
+        until: "2026-07-12",
+        source: "system",
+        page: "2",
+        pageSize: "50",
+      }),
+    });
+    const html = renderToStaticMarkup(createElement("div", null, element));
+
+    expect(html).toContain(
+      'href="/events?since=2026-07-06&amp;until=2026-07-12&amp;page=1&amp;pageSize=50&amp;source=system"',
+    );
+    expect(html).toContain(
+      'href="/events?since=2026-07-06&amp;until=2026-07-12&amp;page=3&amp;pageSize=50&amp;source=system"',
+    );
   });
 
   it("shows safe failure copy without raw provider details", async () => {
@@ -375,7 +496,43 @@ describe("events route", () => {
     expect(form).toContain('name="source" value="external_integration"');
     expect(form).not.toContain('name="page"');
     expect(form).not.toContain("disabled");
-    expect(html).toContain("Eventos já enviados não são reenviados.");
+    expect(html).toContain(
+      "Eventos já enviados não são reenviados; os com mais de 7 dias ficam de fora.",
+    );
+  });
+
+  it("enables the bulk retry for Meta login failures alone and explains it in the tooltip (#181)", async () => {
+    const failed = auditEvent({
+      id: "event_auth",
+      deliveryState: "failed",
+      statusLabel: "Falhou",
+      status: "error",
+      sentAt: null,
+      canRetry: true,
+      errorCode: "MetaCapiRejected",
+      errorMessage:
+        "A Meta recusou por falha de login da conexão; reconecte a Meta e reenvie",
+    });
+    const audit = auditResponse([failed]);
+    mockAuditApi({
+      audit: {
+        ...audit,
+        summary: { ...audit.summary, sent: 0, failed: 1, metaAuthRetryable: 1 },
+      },
+      role: "owner",
+    });
+
+    const element = await EventsPage({
+      searchParams: Promise.resolve({ since: "2026-07-06", until: "2026-07-12" }),
+    });
+    const html = renderToStaticMarkup(createElement("div", null, element));
+    const formStart = html.indexOf('class="audit-retry-blocked-form"');
+    const form = html.slice(formStart, html.indexOf("</form>", formStart));
+
+    expect(form).toContain("Reenviar bloqueados e falhas de login da Meta");
+    expect(form).not.toContain("disabled");
+    expect(form).toContain("Use depois de reconectar a Meta.");
+    expect(html).toContain("falha de login da conexão; reconecte a Meta");
   });
 
   it("disables the bulk retry when the period has no blocked events", async () => {
@@ -394,6 +551,28 @@ describe("events route", () => {
     expect(formStart).toBeGreaterThan(-1);
     expect(form).toContain("Reenviar bloqueados");
     expect(form).toContain('disabled=""');
+    expect(form).toContain(
+      "Nenhum evento bloqueado ou com falha de login da Meta neste período",
+    );
+  });
+
+  it("reports events skipped for being older than Meta's 7-day window (#181)", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      json({ claimed: 2, enqueued: 2, skipped: 3, expired: 2, failed: 0 }),
+    );
+    const formData = new FormData();
+    formData.set("since", "2026-07-06");
+    formData.set("until", "2026-07-12");
+
+    const state = await retryBlockedMetaEventsAction(
+      initialBackofficeActionState,
+      formData,
+    );
+
+    expect(state.status).toBe("success");
+    expect(state.message).toBe(
+      "2 eventos enfileirados para nova tentativa. 1 já não estava bloqueado e ficou de fora. 2 eventos ficaram de fora por ter mais de 7 dias: a Meta não aceita mais.",
+    );
   });
 
   it("posts retry-blocked with the submitted filters and reports the returned counts", async () => {
@@ -479,6 +658,88 @@ describe("events route", () => {
     expect(html).toContain("API indisponível");
     expect(html).toContain("Não foi possível carregar a auditoria");
     expect(html).not.toContain("Mariana Alves");
+  });
+
+  it("offers every event configured in the workspace in the filter", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          ...auditResponse([auditEvent({})]),
+          availableEvents: [
+            { eventName: "LeadSubmitted", label: "Conversas reais iniciadas" },
+            { eventName: "QualifiedLead", label: "Lead qualificado" },
+            { eventName: "InitiateCheckout", label: "Checkout iniciado" },
+            { eventName: "Purchase", label: "Compras" },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    const element = await EventsPage({
+      searchParams: Promise.resolve({
+        since: "2026-07-06",
+        until: "2026-07-12",
+      }),
+    });
+    const html = renderToStaticMarkup(createElement("div", null, element));
+
+    expect(html).toContain('value="InitiateCheckout"');
+    expect(html).toContain("Checkout iniciado");
+    // Ordem do funil preservada: checkout antes de compra.
+    expect(html.indexOf('value="InitiateCheckout"')).toBeLessThan(
+      html.indexOf('value="Purchase"'),
+    );
+  });
+
+  it("falls back to the events on the page when the API omits the list", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify(
+          auditResponse([
+            auditEvent({
+              id: "event_checkout",
+              eventName: "InitiateCheckout",
+              eventLabel: "Checkout iniciado",
+            }),
+          ]),
+        ),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    const element = await EventsPage({
+      searchParams: Promise.resolve({
+        since: "2026-07-06",
+        until: "2026-07-12",
+      }),
+    });
+    const html = renderToStaticMarkup(createElement("div", null, element));
+
+    expect(html).toContain('value="InitiateCheckout"');
+    // Nada inventado: eventos ausentes do periodo nao viram opcao.
+    expect(html).not.toContain('value="QualifiedLead"');
+  });
+
+  it("keeps the selected event in the filter when the API is unavailable", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ message: "unavailable" }), {
+        status: 503,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    const element = await EventsPage({
+      searchParams: Promise.resolve({
+        since: "2026-07-06",
+        until: "2026-07-12",
+        eventName: "InitiateCheckout",
+      }),
+    });
+    const html = renderToStaticMarkup(createElement("div", null, element));
+
+    expect(html).toContain('value="InitiateCheckout"');
+    expect(html).toContain("Checkout iniciado");
   });
 
   it("replaces the desktop audit table with readable event cards on mobile", () => {

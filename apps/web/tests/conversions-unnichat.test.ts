@@ -143,12 +143,13 @@ describe("Unnichat: origem", () => {
     );
   });
 
-  it("é presa à conexão, sem lista de eventos (vale todo o catálogo)", () => {
+  it("guarda a conexão só como âncora, sem lista de eventos (vale todo o catálogo)", () => {
     const definition = ruleOriginDefinition("automation_unnichat");
+    // Fase 6.1a (#159): a regra pode valer para todas as conexões.
     expect(definition).toMatchObject({
       label: "Automação do Unnichat",
       logoProvider: "unnichat",
-      connection: "same_provider",
+      connection: "provider_anchor",
     });
     expect(definition.allowedEvents).toBeUndefined();
     expect(definition.lockedEvent).toBeUndefined();
@@ -231,7 +232,6 @@ describe("Unnichat: rascunho e payload", () => {
           connectionId: "conn_unnichat",
           scope: "all_numbers",
           channelIds: [],
-          mode: "observation",
           triggerType: "provider_automation",
           eventName,
         },
@@ -270,9 +270,12 @@ describe("Unnichat: rascunho e payload", () => {
     expect(built.value).not.toHaveProperty("perRuleUrl");
   });
 
-  it("exige a conexão e só aceita números dela", () => {
-    expect(scopeIssue(draft({ connectionId: null }), context)).toBe(
-      "Escolha a conexão que vai chamar o endereço desta regra.",
+  it("não pede a conexão (âncora automática) e só aceita números do Unnichat", () => {
+    // Fase 6.1a (#159): sem "Conexão que chama o endereço"; a âncora de uma
+    // regra para todos os números é escolhida sozinha.
+    expect(scopeIssue(draft({ connectionId: null }), context)).toBeNull();
+    expect(resolveRuleConnectionId(draft({ connectionId: null }), context)).toBe(
+      "conn_unnichat",
     );
     expect(
       scopeIssue(
@@ -370,7 +373,7 @@ describe("Unnichat: Nova regra", () => {
       ruleId: "rule_unnichat",
       webhookUrl: "https://api.example.test/webhooks/inbound/conversions/e1?token=t",
       message:
-        "Regra criada em observação. Copie o endereço agora: ele não é exibido de novo.",
+        "Regra criada e enviando. Copie o endereço agora: ele não é exibido de novo.",
     }));
     renderFlow(createAction);
 
@@ -388,8 +391,14 @@ describe("Unnichat: Nova regra", () => {
     await user.selectOptions(select, "Purchase");
     await user.click(screen.getByRole("button", { name: /Continuar/ }));
 
-    // Alcance: a conexão do Unnichat já vem escolhida (é a única).
-    expect(screen.getByText("Conexão que chama o endereço")).toBeTruthy();
+    // Alcance (Fase 6.1a, #159): sem escolher conexão; a regra nova já vale
+    // para todos os números do Unnichat, de todas as conexões.
+    expect(screen.queryByText("Conexão que chama o endereço")).toBeNull();
+    expect(
+      (screen.getByRole("radio", {
+        name: /Todos os números do Unnichat \(todas as conexões\)/,
+      }) as HTMLInputElement).checked,
+    ).toBe(true);
     await user.click(screen.getByRole("button", { name: /Continuar/ }));
 
     // Detalhes: valor e aviso da URL única.
@@ -406,7 +415,7 @@ describe("Unnichat: Nova regra", () => {
       eventName: "Purchase",
       connectionId: "conn_unnichat",
       scope: "all_numbers",
-      mode: "observation",
+      crossConnectionScope: true,
       defaultValueCents: 19700,
     });
     expect(

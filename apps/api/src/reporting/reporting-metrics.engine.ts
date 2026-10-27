@@ -1,5 +1,8 @@
 import type { FunnelStageConfigurationDto } from "@wpptrack/shared";
-import { repeatConversationLeadIds } from "../leads/lead-cohort";
+import {
+  isRuleOriginatedTrigger,
+  repeatConversationLeadIds,
+} from "../leads/lead-cohort";
 
 export type ReportingMetricScope = {
   adId?: string | null;
@@ -37,6 +40,8 @@ export type ReportingMetricEvent = {
   adId: string | null;
   ctwaClid?: string | null;
   eventName: string;
+  /** Origin of the log; a provider-rule LeadSubmitted is not a conversation. */
+  sourceTrigger?: string | null;
   eventOccurredAt: Date;
   status: string;
   valueCents: number | null;
@@ -315,6 +320,31 @@ export class ReportingMetricsEngine {
     return this.countByDay(days);
   }
 
+  /**
+   * Conversas iniciadas reais per day: every paid conversation started (the
+   * ENTRY LeadSubmitted of each CTWA conversation, leads novos and returning
+   * alike), on the day it started. The same rule and events as
+   * `adConversationEvents` ("Conversas por anuncio"), so the days add up to
+   * it. Like Meta's "conversations started", a person who starts two
+   * conversations counts twice. Entry receipts deferred to a provider rule
+   * (not_eligible) count on the day they arrived; the LeadSubmitted the rule
+   * sends later never does.
+   */
+  dailyAdConversationCounts(
+    input: Pick<ReportingMetricsCalculationInput, "events" | "returningEvents">,
+    dateKey: (date: Date) => string,
+  ): Map<string, number> {
+    const dayById = new Map<string, string>();
+
+    for (const event of [...input.events, ...(input.returningEvents ?? [])]) {
+      if (this.isPaidConversation(event) && !dayById.has(event.id)) {
+        dayById.set(event.id, dateKey(event.eventOccurredAt));
+      }
+    }
+
+    return this.countByDay(dayById.values());
+  }
+
   private countByDay(days: Iterable<string>): Map<string, number> {
     const counts = new Map<string, number>();
 
@@ -362,12 +392,18 @@ export class ReportingMetricsEngine {
     return ids;
   }
 
-  /** A paid conversation: LeadSubmitted sent to Meta (not skipped, not organic). */
+  /**
+   * A paid conversation: the ENTRY LeadSubmitted of a CTWA conversation (not
+   * skipped, not organic). Entry receipts deferred to a provider rule
+   * (not_eligible) still count; the LeadSubmitted the rule sends later does
+   * not, so a conversation is never counted twice (tarefa 20).
+   */
   private isPaidConversation(event: ReportingMetricEvent): boolean {
     return (
       event.eventName === "LeadSubmitted" &&
       this.isCountableEvent(event) &&
-      this.isPaidLeadEvent(event)
+      this.isPaidLeadEvent(event) &&
+      !isRuleOriginatedTrigger(event.sourceTrigger)
     );
   }
 

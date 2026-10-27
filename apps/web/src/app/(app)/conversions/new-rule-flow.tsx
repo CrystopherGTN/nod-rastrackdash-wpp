@@ -26,10 +26,13 @@ import {
 import {
   accentEventCopy,
   paytBetaBadge,
+  braipEventExplanations,
   paytEventExplanations,
+  yampiEventExplanations,
   paytEventLabel,
   ruleEventLabelForOrigin,
 } from "./event-copy";
+import { LeadSubmittedOverrideNotice } from "./lead-submitted-override";
 import { conversionsLicenseLockedNote } from "./license-lock";
 import { NumbersWithoutRules } from "./numbers-without-rules";
 import { MessagePhraseFields } from "./message-phrase-fields";
@@ -38,7 +41,10 @@ import { PaytSetupPanel } from "./payt-setup";
 import { UmblerAutomationPayloadPanel } from "./umbler-automation-payload";
 import { UnnichatAutomationSetupPanel } from "../integrations/unnichat-setup";
 import { UazapiLabelPicker } from "../integrations/uazapi-label-picker";
-import { findEventEndpoint } from "../integrations/single-url/single-url-copy";
+import {
+  findEventEndpoint,
+  isSalesPlatform,
+} from "../integrations/single-url/single-url-copy";
 import {
   EnsureUrlButton,
   IntegrationUrlBox,
@@ -47,6 +53,7 @@ import {
 } from "../integrations/single-url/single-url-panels";
 import type { ConversionScreenActionResult } from "./actions";
 import {
+  automationPlatformOf,
   contactMessageProviders,
   crmManageHref,
   hubProviderForInbound,
@@ -66,10 +73,12 @@ import {
 } from "./conversion-rules-view";
 import type { ComingSoonNumber } from "./conversions-data";
 import {
+  automationSingleConnectionNote,
   buildRulePayload,
   emptyRuleDraft,
   mintRequestKey,
   paytSingleConnectionNote,
+  salesSingleConnectionNote,
   resolveRuleConnectionId,
   scopeIssue,
   type RuleDraft,
@@ -111,11 +120,21 @@ export type NewRuleFlowProps = {
   onFinished: () => void;
   /** Fase 5.3: produtos vistos nas vendas da Payt (filtro opcional). */
   paytProducts?: IntegrationDetectedProductDto[];
+  /** Fase 6.5: produtos vistos nas vendas da Braip (filtro opcional). */
+  braipProducts?: IntegrationDetectedProductDto[];
+  /** Fase 6.7: produtos vistos nas vendas da Yampi (filtro opcional). */
+  yampiProducts?: IntegrationDetectedProductDto[];
   /** Fase 5.3: URLs únicas/por evento já geradas (sem a chave). */
   integrationEndpoints?: IntegrationEndpointDto[];
   /** Presente quando a URL única está ativa no workspace. */
   singleUrlActions?: SingleUrlActions;
+  /** GET /channels de alguma conexão falhou: a lista de números está incompleta. */
+  numbersUnavailable?: boolean;
 };
+
+/** Porte do #165: números que não puderam ser lidos não viram "sem número". */
+export const numbersUnavailableNote =
+  "Não deu para carregar os números de alguma conexão agora. Recarregue a página em instantes antes de escolher números.";
 
 /** Plataforma da URL única/por evento de uma origem de automação. */
 export function singleUrlProviderFor(
@@ -124,6 +143,10 @@ export function singleUrlProviderFor(
   switch (origin) {
     case "automation_payt":
       return "payt";
+    case "automation_braip":
+      return "braip";
+    case "automation_yampi":
+      return "yampi";
     case "automation_unnichat":
       return "unnichat";
     case "automation_umbler":
@@ -155,8 +178,11 @@ export function NewRuleFlow({
   onBusyChange,
   onFinished,
   paytProducts = [],
+  braipProducts = [],
+  yampiProducts = [],
   integrationEndpoints = [],
   singleUrlActions,
+  numbersUnavailable = false,
 }: NewRuleFlowProps) {
   const startOrigin =
     initialOrigin && offeredOrigins.includes(initialOrigin) ? initialOrigin : null;
@@ -381,9 +407,16 @@ export function NewRuleFlow({
             ruleId={result.ruleId}
             pendingNumbers={result.pendingNumbers}
             numbers={numbers}
-            mode={result.ruleMode ?? "observation"}
+            mode={result.ruleMode ?? "production"}
             canManage
           />
+        ) : null}
+        {origin === "automation_roichat" ? (
+          <p className="action-note">
+            Pronto para receber: as compras chegam pela URL de cada número do
+            ROI Chat (a mesma da entrada do lead). Peça ao ROI Chat para enviar
+            a compra com event_name &quot;Purchase&quot;, valor_venda e moeda.
+          </p>
         ) : null}
         {singleUrlProvider && draft && singleUrlActions && !result.webhookUrl ? (
           <SingleUrlAfterCreate
@@ -503,6 +536,7 @@ export function NewRuleFlow({
           comingSoonNumbers={comingSoonNumbers}
           onChange={patch}
           disabled={locked || licenseLocked}
+          numbersUnavailable={numbersUnavailable}
         />
       ) : null}
 
@@ -514,7 +548,13 @@ export function NewRuleFlow({
           capabilities={capabilities}
           onChange={patch}
           disabled={locked || licenseLocked}
-          paytProducts={paytProducts}
+          paytProducts={
+            draft.origin === "automation_braip"
+              ? braipProducts
+              : draft.origin === "automation_yampi"
+                ? yampiProducts
+                : paytProducts
+          }
           singleUrl={Boolean(singleUrlActions)}
         />
       ) : null}
@@ -673,13 +713,27 @@ function PaytEventStep({
   const eventNames =
     originEventNames(draft.origin, capabilities) ?? definition.allowedEvents ?? [];
   const beta = originBetaEvents(draft.origin, capabilities);
+  // Fase 6.5/6.7: a Braip e a Yampi usam o mesmo passo, com os seus rótulos.
+  const braip = draft.origin === "automation_braip";
+  const yampi = draft.origin === "automation_yampi";
+  const platform = braip ? "Braip" : yampi ? "Yampi" : "Payt";
+  const explanations = braip
+    ? braipEventExplanations
+    : yampi
+      ? yampiEventExplanations
+      : paytEventExplanations;
 
   return (
     <fieldset className="conversion-flow-fieldset">
-      <legend>Qual venda da Payt vai para a Meta?</legend>
+      <legend>Qual venda da {platform} vai para a Meta?</legend>
       <p className="muted">
-        O evento vem do status de cada venda e o valor vem da própria venda da
-        Payt. Crie uma regra para cada evento que quiser enviar.
+        O evento vem do status de cada venda e o valor vem da própria venda da{" "}
+        {platform}. Crie uma regra para cada evento que quiser enviar.
+        {braip
+          ? " Reembolso, chargeback e cancelamento são recebidos e ignorados."
+          : yampi
+            ? " Cancelamento, reembolso e pagamento recusado são recebidos e ignorados."
+            : ""}
       </p>
       <div className="conversion-origin-grid">
         {eventNames.map((eventName) => (
@@ -689,14 +743,14 @@ function PaytEventStep({
           >
             <input
               type="radio"
-              name="payt-event"
+              name={braip ? "braip-event" : yampi ? "yampi-event" : "payt-event"}
               value={eventName}
               checked={draft.eventName === eventName}
               onChange={() => onChange(eventName)}
             />
             <span>
               <strong>
-                {paytEventLabel(eventName)}
+                {ruleEventLabelForOrigin(draft.origin, eventName)}
                 {beta.includes(eventName) ? (
                   <>
                     {" "}
@@ -706,7 +760,7 @@ function PaytEventStep({
                   </>
                 ) : null}
               </strong>
-              <small>{paytEventExplanations[eventName] ?? ""}</small>
+              <small>{explanations[eventName] ?? ""}</small>
             </span>
           </label>
         ))}
@@ -725,7 +779,11 @@ function EventStep({
   onChange: (eventName: ConversionEventNameDto) => void;
 }) {
   const definition = ruleOriginDefinition(draft.origin);
-  if (draft.origin === "automation_payt") {
+  if (
+    draft.origin === "automation_payt" ||
+    draft.origin === "automation_braip" ||
+    draft.origin === "automation_yampi"
+  ) {
     return (
       <PaytEventStep
         draft={draft}
@@ -749,8 +807,9 @@ function EventStep({
       <legend>Qual evento vai para a Meta?</legend>
       {definition.lockedEvent ? (
         <p className="muted">
-          Pedidos do catálogo sempre viram Compra realizada, com o valor
-          calculado pelo catálogo.
+          {draft.origin === "automation_roichat"
+            ? "O ROI Chat avisa a compra com event_name Purchase, então o evento é sempre Compra realizada, com o valor e a moeda de cada compra."
+            : "Pedidos do catálogo sempre viram Compra realizada, com o valor calculado pelo catálogo."}
         </p>
       ) : null}
       <label className="conversion-field">
@@ -779,6 +838,12 @@ function EventStep({
         <span className="micro-label">{accentEventCopy(metadata.label)}</span>
         <small>{accentEventCopy(metadata.description)}</small>
       </div>
+      {/* Produção direta: toda regra nova já nasce enviando. */}
+      <LeadSubmittedOverrideNotice
+        enabled={capabilities?.leadSubmittedRuleOverrideEnabled === true}
+        eventName={definition.lockedEvent ?? draft.eventName}
+        mode="production"
+      />
       {draft.origin === "automation_umbler" ? (
         <p className="action-note">
           A automação da Umbler reconhece Lead qualificado e Compra realizada.
@@ -809,7 +874,9 @@ export function ScopeStep({
   onChange,
   disabled,
   connectionLocked = false,
+  initialCrossConnection = true,
   legend = "Em quais números esta regra vale?",
+  numbersUnavailable = false,
 }: {
   draft: RuleDraft;
   numbers: ConversionNumber[];
@@ -820,20 +887,26 @@ export function ScopeStep({
   disabled: boolean;
   /** Edição: a conexão de uma automação por endereço não muda. */
   connectionLocked?: boolean;
+  /** Editing: whether the saved rule already spans every connection. */
+  initialCrossConnection?: boolean;
   legend?: string;
+  /**
+   * The numbers of some connection could not be read (GET /channels failed):
+   * an empty list must not read as "no number" or "number removed".
+   */
+  numbersUnavailable?: boolean;
 }) {
   const definition = ruleOriginDefinition(draft.origin);
-  const connectionOptions = connectionsForOrigin(
-    draft.origin,
-    connections,
-    capabilities,
-  );
-  const connectionBound = definition.connection === "same_provider";
+  // Umbler/Unnichat (Fase 6.1a, porte do #159): "Todos os números" pode
+  // valer para todas as conexões do provedor; números específicos vêm de UMA
+  // conexão (a da própria regra ao editar).
+  const automation = definition.connection === "provider_anchor";
+  const platformOf = automationPlatformOf(draft.origin);
   const connection = connections.find((item) => item.id === draft.connectionId);
   const available = numbersForOrigin(
     draft.origin,
     numbers,
-    connectionBound ? (draft.connectionId ?? "__none__") : null,
+    automation && connectionLocked ? (draft.connectionId ?? "__none__") : null,
     capabilities,
     draft.messageAuthorScope,
   );
@@ -843,10 +916,23 @@ export function ScopeStep({
   const wrongAuthor = numbersForOrigin(
     draft.origin,
     numbers,
-    connectionBound ? (draft.connectionId ?? "__none__") : null,
+    automation && connectionLocked ? (draft.connectionId ?? "__none__") : null,
     capabilities,
     "both",
   ).filter((number) => !availableIds.has(number.id));
+  // Umbler/Unnichat "Todos os números": só a conexão da regra (formato
+  // antigo) ou todas as conexões do provedor (explícito).
+  const allOfConnection =
+    automation && draft.scope === "all_numbers" && !draft.crossConnection;
+  const allOfProvider =
+    draft.scope === "all_numbers" && (!automation || draft.crossConnection);
+  const legacyCross = initialCrossConnection;
+  // Números específicos de uma automação ficam numa conexão só: depois do
+  // primeiro número, os das outras conexões ficam desabilitados.
+  const lockedConnectionId = automation
+    ? (numbers.find((number) => draft.channelIds.includes(number.id))
+        ?.connectionId ?? null)
+    : null;
   const grouped = new Map<string, ConversionNumber[]>();
   for (const number of available) {
     grouped.set(number.connectionId, [...(grouped.get(number.connectionId) ?? []), number]);
@@ -863,56 +949,72 @@ export function ScopeStep({
     <fieldset className="conversion-flow-fieldset" disabled={disabled}>
       <legend>{legend}</legend>
 
-      {connectionBound && connectionLocked ? (
+      {automation && draft.origin === "automation_roichat" ? (
         <p className="action-note">
-          Conexão que chama o endereço:{" "}
-          <strong>{connection?.displayName ?? "conexão removida"}</strong>
+          Cada número do ROI Chat tem a própria URL, que já recebe a entrada e
+          a compra: a compra de um número nunca vale para outro.
         </p>
-      ) : connectionBound ? (
-        <label className="conversion-field">
-          <span className="field-label">Conexão que chama o endereço</span>
-          <select
-            value={draft.connectionId ?? ""}
-            onChange={(event) =>
-              onChange({
-                connectionId: event.target.value || null,
-                channelIds: [],
-              })
-            }
-          >
-            <option value="">Escolha a conexão</option>
-            {connectionOptions.map((option) => (
-              <option key={option.id} value={option.id}>
-                {option.displayName}
-              </option>
-            ))}
-          </select>
-          <small className="action-note">
-            Automações por endereço ficam ligadas à conexão que as chama.
-          </small>
-        </label>
+      ) : automation ? (
+        <p className="action-note">
+          Uma regra serve para todos os números {platformOf}: a mesma URL
+          vale em todos os fluxos, de qualquer conexão.
+        </p>
       ) : null}
 
       <div className="conversion-scope-options" role="radiogroup" aria-label="Alcance">
+        {automation && connectionLocked ? (
+          // Editing an Umbler/Unnichat rule: its own connection only (the
+          // historical "Todos os números"), or widened to every connection.
+          <label
+            className={`conversion-scope-option${allOfConnection ? " is-selected" : ""}`}
+          >
+            <input
+              type="radio"
+              name="conversion-scope"
+              value="all_numbers_connection"
+              checked={allOfConnection}
+              onChange={() =>
+                onChange({ scope: "all_numbers", crossConnection: false, channelIds: [] })
+              }
+            />
+            <span>
+              <strong>
+                Todos os números de {connection?.displayName ?? "conexão removida"}
+              </strong>
+              <small>
+                {allOfConnection
+                  ? "Vale só para os números desta conexão. Os números das outras conexões ficam de fora."
+                  : "Só os números desta conexão."}
+              </small>
+            </span>
+          </label>
+        ) : null}
         <label
-          className={`conversion-scope-option${draft.scope === "all_numbers" ? " is-selected" : ""}`}
+          className={`conversion-scope-option${allOfProvider ? " is-selected" : ""}`}
         >
           <input
             type="radio"
             name="conversion-scope"
             value="all_numbers"
-            checked={draft.scope === "all_numbers"}
-            onChange={() => onChange({ scope: "all_numbers", channelIds: [] })}
+            checked={allOfProvider}
+            onChange={() =>
+              onChange({ scope: "all_numbers", crossConnection: true, channelIds: [] })
+            }
           />
           <span>
             <strong>
-              {connectionBound && connection
-                ? `Todos os números de ${connection.displayName}`
+              {automation
+                ? `Todos os números ${platformOf} (todas as conexões)`
                 : "Todos os números"}
             </strong>
             <small>
-              Vale para todos os números que funcionam com esta origem,
-              inclusive os que você conectar depois.
+              {automation && connectionLocked && !legacyCross
+                ? allOfProvider
+                  ? `Ampliar para todas as conexões: passa a valer para todos os números ${platformOf}, inclusive os que você conectar depois.`
+                  : "Ampliar para todas as conexões."
+                : automation
+                  ? `Vale para todos os números ${platformOf} conectados aqui, de todas as conexões, inclusive os que você conectar depois.`
+                  : "Vale para todos os números que funcionam com esta origem, inclusive os que você conectar depois."}
             </small>
           </span>
         </label>
@@ -929,19 +1031,26 @@ export function ScopeStep({
           <span>
             <strong>Números específicos</strong>
             <small>
-              {connectionBound
-                ? "Escolha um ou mais números desta conexão."
-                : draft.origin === "automation_payt"
-                  ? "Escolha um ou mais números de uma mesma conexão."
-                  : "Escolha um ou mais números, de qualquer conexão."}
+              {draft.scope !== "specific_numbers"
+                ? "Escolha um ou mais números."
+                : automation && connectionLocked
+                  ? `Escolha um ou mais números de ${connection?.displayName ?? "conexão removida"}, a conexão desta regra.`
+                  : automation ||
+                      draft.origin === "automation_payt" ||
+                      draft.origin === "automation_braip" ||
+                      draft.origin === "automation_yampi"
+                    ? "Escolha um ou mais números de uma mesma conexão."
+                    : "Escolha um ou mais números, de qualquer conexão."}
             </small>
           </span>
         </label>
       </div>
 
-      {draft.origin === "automation_payt" ? (
+      {draft.origin === "automation_payt" ||
+      draft.origin === "automation_braip" ||
+      draft.origin === "automation_yampi" ? (
         <p className="action-note conversion-scope-note">
-          {paytSingleConnectionNote}
+          {salesSingleConnectionNote(draft.origin)}
         </p>
       ) : null}
 
@@ -950,14 +1059,26 @@ export function ScopeStep({
           Em “Todos os números”, a etiqueta é reconhecida pelo nome em todas as
           instâncias Uazapi: escreva o nome igual ao da etiqueta no WhatsApp.
         </p>
+      ) : automation && draft.scope === "specific_numbers" && !connectionLocked ? (
+        <p className="action-note conversion-scope-note">
+          {automationSingleConnectionNote(draft.origin)}
+        </p>
+      ) : null}
+
+      {draft.scope === "specific_numbers" &&
+      numbersUnavailable &&
+      available.length > 0 ? (
+        <p className="action-note warn">{numbersUnavailableNote}</p>
       ) : null}
 
       {draft.scope === "specific_numbers" ? (
         available.length === 0 ? (
           <p className="action-note warn">
-            {connectionBound && !draft.connectionId
-              ? "Escolha a conexão para ver os números."
-              : "Nenhum número conectado funciona com esta origem."}
+            {numbersUnavailable
+              ? numbersUnavailableNote
+              : automation && connectionLocked
+                ? "O número da conexão desta regra foi removido. Use “Todos os números” ou crie uma regra nova."
+                : "Nenhum número conectado funciona com esta origem."}
           </p>
         ) : (
           <div className="conversion-number-picker">
@@ -969,6 +1090,10 @@ export function ScopeStep({
                     <input
                       type="checkbox"
                       checked={draft.channelIds.includes(number.id)}
+                      disabled={
+                        lockedConnectionId !== null &&
+                        number.connectionId !== lockedConnectionId
+                      }
                       onChange={() => toggle(number.id)}
                     />
                     <RuleLogo
@@ -1357,6 +1482,14 @@ function DetailsStep({
         </>
       ) : null}
 
+      {draft.origin === "automation_roichat" ? (
+        <RoichatPurchaseFields
+          draft={draft}
+          onChange={onChange}
+          disabled={disabled}
+        />
+      ) : null}
+
       {draft.origin === "automation_payt" ? (
         <>
           {singleUrl ? (
@@ -1371,6 +1504,42 @@ function DetailsStep({
             {singleUrl
               ? "O valor de cada venda vem da própria Payt. As vendas chegam pela URL única da Payt (uma para a conta toda)."
               : "Depois de criar, você recebe a URL de postback para colar na Payt, em Postback. O valor de cada venda vem da própria Payt."}
+          </p>
+        </>
+      ) : null}
+
+      {draft.origin === "automation_braip" ? (
+        <>
+          <ProductFilterPicker
+            provider="braip"
+            products={paytProducts}
+            selected={draft.productCodes}
+            onChange={(productCodes) => onChange({ productCodes })}
+            disabled={disabled}
+          />
+          <p className="action-note">
+            O valor de cada venda vem da própria Braip. As vendas chegam pela
+            URL única da Braip (uma para a conta toda), que você cola na Braip
+            em Ferramentas → Postback.
+          </p>
+        </>
+      ) : null}
+
+      {draft.origin === "automation_yampi" ? (
+        <>
+          <ProductFilterPicker
+            provider="yampi"
+            products={paytProducts}
+            selected={draft.productCodes}
+            onChange={(productCodes) => onChange({ productCodes })}
+            disabled={disabled}
+          />
+          <p className="action-note">
+            O valor de cada venda vem da própria Yampi: só os produtos, sem
+            frete e sem os juros do parcelamento (no carrinho abandonado, o
+            subtotal). Moeda: real (BRL). Os itens do pedido (com order bump)
+            vão junto para a Meta. As vendas chegam pela URL única da Yampi
+            (uma para a conta toda), cadastrada no webhook da loja.
           </p>
         </>
       ) : null}
@@ -1402,7 +1571,19 @@ function DetailsStep({
           <dt>Alcance</dt>
           <dd>{scopeSummary}</dd>
         </div>
-        {draft.origin === "automation_payt" && singleUrl ? (
+        {draft.origin === "automation_roichat" ? (
+          <div>
+            <dt>Valor enviado</dt>
+            <dd>
+              {draft.averageValue.trim()
+                ? `O valor de cada compra (reserva: ${draft.currency || "moeda da conta"} ${draft.averageValue.trim()})`
+                : "O valor de cada compra (valor_venda)"}
+            </dd>
+          </div>
+        ) : null}
+        {(draft.origin === "automation_payt" && singleUrl) ||
+        draft.origin === "automation_braip" ||
+        draft.origin === "automation_yampi" ? (
           <div>
             <dt>Produtos</dt>
             <dd>
@@ -1413,8 +1594,11 @@ function DetailsStep({
           </div>
         ) : null}
         <div>
-          <dt>Começa em</dt>
-          <dd>Observação: nada é enviado à Meta até você ativar o envio.</dd>
+          <dt>Envio</dt>
+          <dd>
+            Já começa enviando: cada conversão reconhecida vai para a Meta pelo
+            destino (pixel e página) de cada número.
+          </dd>
         </div>
       </dl>
     </fieldset>
@@ -1436,17 +1620,23 @@ function SingleUrlAfterCreate({
   const existing = findEventEndpoint(endpoints, provider, eventName);
   const [created, setCreated] = useState<IntegrationEndpointDto | null>(null);
   const endpoint = created ?? existing;
-  const label =
-    provider === "payt"
-      ? "URL única da Payt (cole em Postback)"
-      : `URL do evento “${ruleEventLabelForOrigin(`automation_${provider}`, eventName)}”`;
+  const sales = isSalesPlatform(provider);
+  const platform =
+    provider === "braip" ? "Braip" : provider === "yampi" ? "Yampi" : "Payt";
+  const label = sales
+    ? provider === "braip"
+      ? "URL única da Braip (cole em Ferramentas → Postback)"
+      : provider === "yampi"
+        ? "URL única da Yampi (cadastre no webhook da loja)"
+        : "URL única da Payt (cole em Postback)"
+    : `URL do evento “${ruleEventLabelForOrigin(`automation_${provider}`, eventName)}”`;
 
   return (
     <div className="integration-modal-note single-url-after-create">
-      <strong>{provider === "payt" ? "URL única da Payt" : "URL do evento"}</strong>
+      <strong>{sales ? `URL única da ${platform}` : "URL do evento"}</strong>
       <p className="muted">
-        {provider === "payt"
-          ? "A mesma URL vale para todas as regras e números da Payt. Se ela já está na Payt, não precisa fazer nada."
+        {sales
+          ? `A mesma URL vale para todas as regras e números da ${platform}. Se ela já está na ${platform}, não precisa fazer nada.`
           : "A mesma URL vale para todos os números da conta. Cole na automação que marca este evento."}
       </p>
       {endpoint ? (
@@ -1460,9 +1650,9 @@ function SingleUrlAfterCreate({
       ) : (
         <EnsureUrlButton
           provider={provider}
-          eventName={provider === "payt" ? null : eventName}
+          eventName={sales ? null : eventName}
           ensure={actions.ensure}
-          label={provider === "payt" ? "Gerar URL única" : "Gerar URL do evento"}
+          label={sales ? "Gerar URL única" : "Gerar URL do evento"}
           onReady={setCreated}
         />
       )}
@@ -1471,8 +1661,55 @@ function SingleUrlAfterCreate({
 }
 
 /** O que a moeda da regra significa em cada origem. */
+/**
+ * Fase 6.8 (porte do #183): ROI Chat. O valor de cada compra vem do payload;
+ * a regra guarda só um valor de reserva opcional, usado quando a compra chega
+ * sem valor_venda.
+ */
+function RoichatPurchaseFields({
+  draft,
+  onChange,
+  disabled,
+}: {
+  draft: RuleDraft;
+  onChange: (update: Partial<RuleDraft>) => void;
+  disabled: boolean;
+}) {
+  return (
+    <>
+      <label className="conversion-field">
+        <span className="field-label">Valor de reserva (opcional)</span>
+        <input
+          value={draft.averageValue}
+          onChange={(event) => onChange({ averageValue: event.target.value })}
+          inputMode="decimal"
+          placeholder="Ex.: 20,00"
+          disabled={disabled}
+        />
+      </label>
+      <small className="action-note">
+        Usado só quando a compra chegar sem valor_venda. Com o valor na compra,
+        vai o valor da compra.
+      </small>
+      <p className="action-note">
+        As compras chegam pela URL de cada número do ROI Chat, a mesma que
+        recebe a entrada do lead: não há URL nova para cadastrar. A mesma
+        pessoa pode comprar mais de uma vez; a mesma compra (mesmo lead, número,
+        valor e moeda) repetida em até 12 horas conta uma vez só.
+      </p>
+    </>
+  );
+}
+
 export function ruleCurrencyHint(origin: string): string {
-  if (origin === "automation_payt") {
+  if (origin === "automation_roichat") {
+    return "A moeda da compra vence; esta só vale quando a compra não informa a moeda.";
+  }
+  if (
+    origin === "automation_payt" ||
+    origin === "automation_braip" ||
+    origin === "automation_yampi"
+  ) {
     return "A moeda da venda vence; esta só vale quando a venda não informa a moeda.";
   }
   if (origin === "structured_catalog") {

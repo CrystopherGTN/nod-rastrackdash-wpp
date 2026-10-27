@@ -15,6 +15,7 @@ import {
   Post,
   Query,
   RawBody,
+  ServiceUnavailableException,
   UnauthorizedException,
 } from "@nestjs/common";
 import { safeErrorName } from "../common/errors/safe-error-name";
@@ -23,6 +24,12 @@ import { PrismaService } from "../common/prisma/prisma.service";
 import { hashPhoneIdentity } from "../common/phone/phone-identity";
 import { ConversionEventsService } from "../conversion-events/conversion-events.service";
 import { ConversionRulesService } from "../conversion-rules/conversion-rules.service";
+import {
+  leadSubmittedRuleOverrideEnabled,
+  resolveLeadSubmittedRuleOverride,
+} from "../conversion-rules/lead-submitted-rule-override";
+import { RUNTIME_ENV, type RuntimeEnv } from "../common/runtime/runtime.module";
+import { LicenseClientService } from "../licensing-client/license-client.service";
 import { DiagnosticsService } from "../diagnostics/diagnostics.service";
 import type {
   InboundWebhookParserResult,
@@ -44,6 +51,8 @@ import { parseZapiV1Webhook } from "../inbound-webhooks/providers/zapi/zapi-v1.p
 import { mapWahaSessionStatus } from "../integrations/whatsapp-providers/waha-session-status";
 import { UazapiProviderConversionService } from "../inbound-webhooks/uazapi-provider-conversion.service";
 import { LeadsService } from "../leads/leads.service";
+import { parseLeadgenPayload } from "../meta-lead-forms/meta-leadgen";
+import { MetaLeadFormsService } from "../meta-lead-forms/meta-lead-forms.service";
 import {
   parseUazapiWebhook,
   type ParsedUazapiWebhook,
@@ -125,6 +134,15 @@ export class WebhooksController {
     @Optional()
     @Inject(WahaLidResolverService)
     private readonly wahaLidResolver?: WahaLidResolverService,
+    @Optional()
+    @Inject(LicenseClientService)
+    private readonly license?: LicenseClientService,
+    @Optional()
+    @Inject(RUNTIME_ENV)
+    private readonly env: RuntimeEnv = process.env,
+    @Optional()
+    @Inject(MetaLeadFormsService)
+    private readonly metaLeadForms?: MetaLeadFormsService,
   ) {}
 
   @Get("meta")
@@ -354,6 +372,72 @@ export class WebhooksController {
     @Headers("x-workspace-id") workspaceId?: string,
   ) {
     this.assertMetaWebhookSignature(rawBody, signature);
+
+    // Fase 6.9 (PR #91 do nod): instant-form leads of a Page with an active
+    // lead form connection become leads. Other Pages keep the diagnostic-only
+    // path below.
+    // Only the leadgen changes of those Pages are ingested; whatever else the
+    // delivery carries (other Pages, other fields) still goes to the
+    // diagnostic path. Only a TRANSIENT Graph read failure (network, 5xx,
+    // usage limit) answers 503 so Meta redelivers; a permanent one (dead
+    // token, missing permission) is saved as fetch_failed and answered 2xx:
+    // redelivering cannot fix it, and hours of 503 may make Meta disable the
+    // app subscription that feeds this whole endpoint. The connection screen
+    // asks to reconnect the Page or grant the permission.
+    // A Page whose connection was deactivated (it already received forms, so
+    // it can only be deactivated, not removed) is answered 2xx and ignored:
+    // nothing is read or saved and Meta does not redeliver.
+    const leadgen = parseLeadgenPayload(body);
+    if (leadgen && leadgen.changes.length > 0 && this.metaLeadForms) {
+      const pageIds = leadgen.changes.map((change) => change.page_id);
+      const pages = await this.metaLeadForms.activeConnectionPages(
+        pageIds,
+        workspaceId,
+      );
+      const routable = leadgen.changes.filter((change) =>
+        pages.has(change.page_id),
+      );
+      const inactive =
+        routable.length < leadgen.changes.length
+          ? await this.metaLeadForms.inactiveConnectionPages(
+              pageIds.filter((pageId) => !pages.has(pageId)),
+              workspaceId,
+            )
+          : new Set<string>();
+      const ignored = leadgen.changes.filter(
+        (change) => !pages.has(change.page_id) && inactive.has(change.page_id),
+      ).length;
+      if (routable.length > 0 || ignored > 0) {
+        const result =
+          routable.length > 0
+            ? await this.metaLeadForms.ingestLeadgen(routable, { workspaceId })
+            : { received: 0, saved: 0, duplicates: 0, unrouted: 0, fetchFailed: 0 };
+        if (routable.length + ignored < leadgen.total) {
+          try {
+            const context = await this.resolveMetaContext(body);
+            await this.recordMetaWebhook(body, context);
+          } catch (error) {
+            this.logger.warn(
+              `meta webhook: parte sem conexão de formulário não registrada (${
+                error instanceof Error ? error.message : "erro"
+              })`,
+            );
+          }
+        }
+        if (result.fetchFailed > 0)
+          throw new ServiceUnavailableException(
+            "Leitura do lead na Graph API falhou; a Meta vai reenviar",
+          );
+        if (ignored > 0) {
+          this.logger.log(
+            `meta webhook: ${ignored} leadgen de Página com conexão desativada ignorado(s)`,
+          );
+          return { ...result, ignoredInactive: ignored };
+        }
+        return result;
+      }
+    }
+
     const context = await this.resolveMetaContext(body);
 
     if (workspaceId && workspaceId !== context.workspaceId) {
@@ -688,6 +772,11 @@ export class WebhooksController {
       ctwaSourceUrl: parsed.ctwaSourceUrl,
       occurredAt: new Date(),
     });
+    const deferToProviderRule = await this.bridgedLeadSubmittedOverride(
+      "uazapi",
+      resolvedContext,
+      attribution.adId,
+    );
     const automatic =
       await this.conversionEventsService.recordAutomaticLeadSubmitted({
         workspaceId: resolvedContext.workspaceId,
@@ -697,6 +786,7 @@ export class WebhooksController {
         adSetId: attribution.adSetId,
         adId: attribution.adId,
         ctwaClid: parsed.ctwaClid,
+        deferToProviderRule,
       });
     const conversion = await this.conversionEventsService.recordRuleMatches({
       workspaceId: resolvedContext.workspaceId,
@@ -1047,6 +1137,16 @@ export class WebhooksController {
       ctwaSourceUrl: event.ad?.sourceUrl ?? undefined,
       occurredAt: event.occurredAt,
     });
+    // nod: the WAHA bridge number follows the same "Lead recebido pela
+    // regra" as Uazapi (Z-API has no bridge, so it never defers).
+    const deferToProviderRule =
+      provider === "waha"
+        ? await this.bridgedLeadSubmittedOverride(
+            "waha",
+            context,
+            attribution.adId,
+          )
+        : null;
     const automatic =
       await this.conversionEventsService.recordAutomaticLeadSubmitted({
         workspaceId: context.workspaceId,
@@ -1056,6 +1156,7 @@ export class WebhooksController {
         adSetId: attribution.adSetId,
         adId: attribution.adId,
         ctwaClid: event.ctwaClid,
+        deferToProviderRule,
       });
     const conversion = await this.conversionEventsService.recordRuleMatches({
       workspaceId: context.workspaceId,
@@ -1315,6 +1416,69 @@ export class WebhooksController {
    * old connection that stopped receiving. At most one write per minute per
    * number; best-effort (never fails the delivery).
    */
+  /**
+   * Porte do SaaS #155 ("Lead recebido pela regra"): an active production
+   * LeadSubmitted provider rule covering this bridged number (Uazapi BYO or
+   * WAHA, connected by server URL + token) sends the LeadSubmitted instead of
+   * the entry. Read-only: uses the existing bridge channel and never creates
+   * one (no bridge means no rule can cover the number yet, so the entry
+   * sends as today). The rule send needs the lead's ad route, a usable
+   * license and the WhatsApp connection active (checked by the resolver).
+   */
+  private async bridgedLeadSubmittedOverride(
+    provider: "uazapi" | "waha",
+    context: { workspaceId: string; whatsappInstanceId: string },
+    adId: string | null | undefined,
+  ): Promise<{
+    ruleIds: string[];
+    provider: "uazapi" | "waha";
+    channelId: string;
+    connectionId: string;
+  } | null> {
+    if (!leadSubmittedRuleOverrideEnabled(this.env)) return null;
+    if (!adId || !this.license) return null;
+    try {
+      const channel = await this.prisma.inboundWebhookChannel.findUnique({
+        where: { whatsappInstanceId: context.whatsappInstanceId },
+        select: {
+          id: true,
+          workspaceId: true,
+          connectionId: true,
+          connection: { select: { provider: true } },
+        },
+      });
+      if (
+        !channel ||
+        channel.workspaceId !== context.workspaceId ||
+        channel.connection?.provider !== provider
+      )
+        return null;
+      const override = await resolveLeadSubmittedRuleOverride(
+        this.prisma,
+        {
+          workspaceId: context.workspaceId,
+          channel: {
+            id: channel.id,
+            connectionId: channel.connectionId,
+            provider,
+          },
+          destination: { kind: "ad_route", adId },
+        },
+        { env: this.env, license: this.license },
+      );
+      return override
+        ? {
+            ruleIds: override.ruleIds,
+            provider,
+            channelId: channel.id,
+            connectionId: channel.connectionId,
+          }
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
   private async touchBridgedChannel(context: {
     workspaceId: string;
     whatsappInstanceId: string;

@@ -1,3 +1,4 @@
+import { conversionSendingSwitchedOff } from "../config/deployment-config";
 import { effectiveInboundParserStatus } from "../inbound-webhooks/inbound-webhook-parser-eligibility";
 import { createHash, randomBytes } from "node:crypto";
 import {
@@ -14,14 +15,17 @@ import { Prisma } from "@prisma/client";
 import {
   conversionEventCarriesValue,
   conversionEventNameSchema,
+  isSalesPlatformProvider,
   messagePhraseConfigKind,
-  paytSaleEventNames,
+  salesPlatformEventNames,
+  salesPlatformLabels,
   providerConversionRuleIdempotentCreateInputSchema,
   providerConversionTechnicalDeliveryStateSchema,
   providerRuleCreateRequestKeySchema,
   readMessagePhraseConfig,
 } from "@wpptrack/shared";
 import type {
+  SalesPlatformProviderDto,
   MessagePhraseConfigDto,
   MessagePhraseValueModeDto,
   ProviderConversionCatalogDto,
@@ -36,6 +40,7 @@ import type {
   ProviderConversionRuleExecutionAuditQueryDto,
   ProviderConversionRuleCapabilitiesDto,
   ProviderConversionRuleDto,
+  ProviderConversionRuleBulkRemoveResultDto,
   ProviderConversionRuleIdempotentCreateResultDto,
   ProviderConversionRuleNumberActivationResultDto,
   ProviderConversionRulePendingNumberDto,
@@ -82,8 +87,11 @@ import {
   blockedReprocessCutoff,
   blockedReprocessWhere,
   findReprocessableExecutions,
+  partitionAlreadyConverted,
   ruleAcceptsReprocess,
 } from "./provider-rule-blocked-reprocess";
+import { InboundWebhookMetaRouteReaderService } from "../inbound-webhooks/inbound-webhook-meta-route-reader.service";
+import { isBridgedWhatsappProvider } from "../inbound-webhooks/bridged-whatsapp-providers";
 import {
   listWorkspaceScopeChannels,
   PROVIDER_RULE_GLOBAL_PRECEDENCE,
@@ -91,6 +99,9 @@ import {
   providerRuleChannelProviders,
   scanWorkspaceScopeChannels,
   providerRuleCoversChannel,
+  providerRuleGateConnectionId,
+  providerRuleIsSalesPlatform,
+  providerRuleNumberGateConnectionId,
   providerRuleOrigin,
   providerRuleOriginRequiresConnection,
   providerRuleOriginUnifiable,
@@ -101,6 +112,12 @@ import {
   type ScopedChannel,
   type ScopedProviderRule,
 } from "./provider-rule-scope";
+import {
+  LEAD_SUBMITTED_AWAITING_RULE_DAYS,
+  LEAD_SUBMITTED_AWAITING_RULE_SCAN,
+  LEAD_SUBMITTED_DEFERRED_TO_RULE,
+  leadSubmittedRuleOverrideEnabled,
+} from "./lead-submitted-rule-override";
 
 const ruleNotFoundMessage = "Regra de conversao do provedor nao encontrada";
 const connectionNotFoundMessage = "Conexao nao encontrada";
@@ -112,6 +129,17 @@ const providerRuleInclude = {
   parserRelease: true,
   channels: {
     orderBy: { createdAt: "asc" },
+    // "Número removido": whether the chosen number still exists (its
+    // connection, and in the nod the WhatsApp connection of a Uazapi/WAHA
+    // bridge, which Integrations "removes" by suspending it).
+    include: {
+      channel: {
+        select: {
+          connection: { select: { removedAt: true } },
+          whatsappInstance: { select: { status: true } },
+        },
+      },
+    },
   },
   endpoint: true,
   catalog: {
@@ -142,12 +170,161 @@ type ScopeInfo = {
   observationCanonicalChannels: Array<{ canonicalChannelId: string; productionChannelIds: string[] }>;
 };
 
+/** Umbler/Unnichat automations: "Unificar" folds them per provider + event. */
+function isUnifiableAutomationOrigin(
+  origin: ProviderRuleOrigin | null | undefined,
+): boolean {
+  return origin === "automation_unnichat" || origin === "automation_umbler";
+}
+
+/**
+ * Origins that may take "Todos os numeros da <plataforma> (todas as
+ * conexoes)": the unifiable automations plus the ROI Chat purchase (one
+ * connection per number). ROI Chat is new, so it has no legacy per-connection
+ * duplicates to "Unificar".
+ */
+function supportsCrossConnectionScope(
+  origin: ProviderRuleOrigin | null | undefined,
+): boolean {
+  return isUnifiableAutomationOrigin(origin) || origin === "automation_roichat";
+}
+
+/**
+ * "Numero removido": the rule can no longer receive anything because the
+ * number it belongs to was removed. Endpoint automations: their connection
+ * (anchor of the URL) was removed. Specific rules: every chosen number's
+ * connection was removed. Read-only: the rule itself is never changed here.
+ */
+export function providerRuleNumberRemoved(rule: {
+  scope?: string | null;
+  connectionId: string | null;
+  connection?: { provider: string; removedAt: Date | null } | null;
+  conversionRule: { triggerType: string; eventName: string };
+  parserRelease?: { provider: string } | null;
+  channels: ReadonlyArray<{
+    channel?: {
+      connection?: { removedAt: Date | null } | null;
+      whatsappInstance?: { status: string } | null;
+    } | null;
+  }>;
+}): boolean {
+  const origin = providerRuleOrigin({
+    conversionRule: rule.conversionRule,
+    parserRelease: rule.parserRelease ?? null,
+    connection: rule.connection ?? null,
+  });
+  if (
+    origin &&
+    providerRuleOriginRequiresConnection(origin) &&
+    rule.connectionId &&
+    rule.connection?.removedAt
+  )
+    return true;
+  if (providerRuleScope(rule) !== "specific_numbers") return false;
+  return (
+    rule.channels.length > 0 &&
+    rule.channels.every(
+      (scope) =>
+        Boolean(scope.channel?.connection?.removedAt) ||
+        // nod: a Uazapi/WAHA number deleted in Integrations (suspended).
+        scope.channel?.whatsappInstance?.status === "suspended",
+    )
+  );
+}
+
+/** The rule's own connection (anchor of its deliveries and URL) is live. */
+function unifyTargetAnchorLive(rule: PersistedProviderRule): boolean {
+  return Boolean(rule.connectionId && rule.connection && !rule.connection.removedAt);
+}
+
+/** An existing automation rule "todas as conexoes" that can be the target. */
+function unifyAutomationTargetEligible(rule: PersistedProviderRule): boolean {
+  return (
+    providerRuleScope(rule) === "all_numbers" &&
+    rule.crossConnectionScope === true &&
+    unifyTargetAnchorLive(rule) &&
+    Boolean(rule.endpoint)
+  );
+}
+
+/**
+ * Automation "Unificar" without a target yet: the requested rule that will
+ * become "todas as conexoes" (keeps its URL, history, value and mode). A
+ * live connection and URL first; an "all numbers" rule before a specific
+ * one; then the oldest.
+ */
+function automationPromotionTarget(
+  rules: readonly PersistedProviderRule[],
+): PersistedProviderRule | null {
+  return (
+    [...rules]
+      .filter((rule) => unifyTargetAnchorLive(rule) && rule.endpoint)
+      .sort((left, right) => {
+        const leftCross = left.crossConnectionScope === true ? 0 : 1;
+        const rightCross = right.crossConnectionScope === true ? 0 : 1;
+        if (leftCross !== rightCross) return leftCross - rightCross;
+        const leftGlobal = providerRuleScope(left) === "all_numbers" ? 0 : 1;
+        const rightGlobal = providerRuleScope(right) === "all_numbers" ? 0 : 1;
+        if (leftGlobal !== rightGlobal) return leftGlobal - rightGlobal;
+        return left.createdAt.getTime() - right.createdAt.getTime();
+      })[0] ?? null
+  );
+}
+
+/** What differs between automation rules being unified. */
+function unifyDifferences(
+  rules: readonly PersistedProviderRule[],
+): Array<"mode" | "value" | "currency" | "contentName"> {
+  const distinct = (values: unknown[]) => new Set(values.map((v) => v ?? null)).size > 1;
+  const result: Array<"mode" | "value" | "currency" | "contentName"> = [];
+  if (distinct(rules.map((rule) => rule.mode))) result.push("mode");
+  if (distinct(rules.map((rule) => rule.conversionRule.defaultValueCents)))
+    result.push("value");
+  if (distinct(rules.map((rule) => rule.conversionRule.defaultCurrency)))
+    result.push("currency");
+  if (distinct(rules.map((rule) => rule.conversionRule.defaultContentName)))
+    result.push("contentName");
+  return result;
+}
+
+function unifyMemberDto(rule: PersistedProviderRule) {
+  return {
+    ruleId: rule.id,
+    name: rule.conversionRule.name,
+    connectionId: rule.connectionId,
+    scope: providerRuleScope(rule),
+    crossConnectionScope: rule.crossConnectionScope === true,
+    mode: rule.mode,
+    defaultValueCents: rule.conversionRule.defaultValueCents ?? null,
+    defaultCurrency: rule.conversionRule.defaultCurrency ?? null,
+    defaultContentName: rule.conversionRule.defaultContentName ?? null,
+    numberRemoved: providerRuleNumberRemoved(rule),
+  };
+}
+
 type GlobalNumberActivation = {
   channelId: string;
   outcome: "promoted" | "already_live" | "pending";
   reason: ProviderConversionRulePendingNumberReasonDto | null;
   errorCode?: string;
 };
+
+/**
+ * Fase 6.5/6.7: a Braip or Yampi rule has no per-rule URL to reopen or rotate
+ * (the platform receives only through the workspace single URL).
+ */
+type SingleUrlOnlyPlatform = "braip" | "yampi";
+function isSingleUrlOnlyPlatform(
+  platform: string | null,
+): platform is SingleUrlOnlyPlatform {
+  return platform === "braip" || platform === "yampi";
+}
+function singleUrlOnlyMessage(platform: SingleUrlOnlyPlatform): string {
+  const name = salesPlatformLabels[platform];
+  return `A ${name} recebe só pela URL única da conta: gere, mostre ou gire a URL em Integrações → ${name}`;
+}
+const roichatNumberUrlOnlyMessage =
+  "O ROI Chat manda a compra pela URL de cada número: confira em Integrações → ROI Chat";
 
 @Injectable()
 export class ProviderConversionRulesService {
@@ -247,12 +424,17 @@ export class ProviderConversionRulesService {
       workspaceId,
       rule,
     );
+    const leadsAwaitingRule = await this.leadsAwaitingRuleSummary(
+      workspaceId,
+      rule,
+    );
 
     return {
       providerRuleId,
       eventName: conversionEventNameSchema.parse(rule.conversionRule.eventName),
       summary,
       blockedReprocess,
+      ...(leadsAwaitingRule ? { leadsAwaitingRule } : {}),
       items: executions.map((execution) => {
         const lead = execution.leadId
           ? (leadsById.get(execution.leadId) ?? null)
@@ -302,6 +484,80 @@ export class ProviderConversionRulesService {
   }
 
   /**
+   * Tarefa 20 observability: entries deferred to THIS rule more than
+   * LEAD_SUBMITTED_AWAITING_RULE_DAYS ago whose lead still has no
+   * LeadSubmitted sent by a rule. Read-only (never sends anything); logged
+   * as `lead_submitted_awaiting_rule` for the backoffice. Flag off or another
+   * event: undefined, no query.
+   */
+  private async leadsAwaitingRuleSummary(
+    workspaceId: string,
+    rule: PersistedProviderRule,
+  ): Promise<ProviderConversionRuleExecutionAuditDto["leadsAwaitingRule"]> {
+    if (
+      !leadSubmittedRuleOverrideEnabled(this.env) ||
+      rule.conversionRule.eventName !== "LeadSubmitted"
+    )
+      return undefined;
+    const olderThanDays = LEAD_SUBMITTED_AWAITING_RULE_DAYS;
+    const before = new Date(Date.now() - olderThanDays * 24 * 3600_000);
+    const receipts = await this.prisma.conversionEventLog.findMany({
+      where: {
+        workspaceId,
+        eventName: "LeadSubmitted",
+        errorCode: LEAD_SUBMITTED_DEFERRED_TO_RULE,
+        leadId: { not: null },
+        eventOccurredAt: { lt: before },
+        sourcePayload: {
+          path: ["leadSubmittedDeferredToRuleIds"],
+          array_contains: [rule.id],
+        },
+      },
+      select: { leadId: true },
+      orderBy: { eventOccurredAt: "desc" },
+      take: LEAD_SUBMITTED_AWAITING_RULE_SCAN,
+    });
+    const leadIds = [
+      ...new Set(receipts.flatMap((row) => (row.leadId ? [row.leadId] : []))),
+    ];
+    if (leadIds.length === 0)
+      return { count: 0, olderThanDays, capped: false };
+    const sent = await this.prisma.conversionEventLog.findMany({
+      where: {
+        workspaceId,
+        eventName: "LeadSubmitted",
+        leadId: { in: leadIds },
+        status: { notIn: ["shadow_observed", "imported", "not_eligible", "skipped"] },
+        OR: [
+          { sourceTrigger: { endsWith: ":message_phrase" } },
+          { sourceTrigger: { endsWith: ":structured_catalog" } },
+          { sourceTrigger: { endsWith: ":provider_automation" } },
+          // nod: a Lead recebido registered manually on the lead (#158) also
+          // means the lead is no longer waiting for the rule.
+          { sourceTrigger: "manual_conversion" },
+        ],
+      },
+      select: { leadId: true },
+    });
+    const sentIds = new Set(sent.map((row) => row.leadId));
+    const count = leadIds.filter((id) => !sentIds.has(id)).length;
+    const capped = receipts.length >= LEAD_SUBMITTED_AWAITING_RULE_SCAN;
+    if (count > 0) {
+      this.logger.warn(
+        JSON.stringify({
+          event: "lead_submitted_awaiting_rule",
+          workspaceId,
+          providerRuleId: rule.id,
+          leadsAwaitingRule: count,
+          olderThanDays,
+          capped,
+        }),
+      );
+    }
+    return { count, olderThanDays, capped };
+  }
+
+  /**
    * Counts behind "Reprocessar bloqueadas": executions stopped only because
    * their number was not live yet. `ready` is what a reprocess would retry
    * now (number live, inside the Meta window); the button is enabled only
@@ -330,11 +586,26 @@ export class ProviderConversionRulesService {
         limit: BLOCKED_REPROCESS_SCAN_LIMIT,
       }),
     ]);
-    const readyCount = Math.min(ready.length, inWindow);
+    // Same split as the reprocess run: would-be duplicates are not "ready".
+    const split = await partitionAlreadyConverted(this.prisma, {
+      workspaceId,
+      executions: ready,
+      includeAutoLead: leadSubmittedRuleOverrideEnabled(this.env),
+      previewRoute: (route) =>
+        new InboundWebhookMetaRouteReaderService(this.prisma).previewRoute(
+          route,
+        ),
+    });
+    const readyCount = Math.min(split.ready.length, inWindow);
+    const alreadyConverted = Math.min(
+      split.alreadyConverted.length,
+      Math.max(0, inWindow - readyCount),
+    );
     return {
       windowDays: BLOCKED_REPROCESS_WINDOW_DAYS,
       ready: readyCount,
-      stillBlocked: Math.max(0, inWindow - readyCount),
+      stillBlocked: Math.max(0, inWindow - readyCount - alreadyConverted),
+      alreadyConverted,
       expired,
       ruleSendsNow: ruleAcceptsReprocess(rule),
     };
@@ -433,6 +704,7 @@ export class ProviderConversionRulesService {
         : providerRuleCreateIntentHash(workspaceId, input);
     this.assertUniqueCatalogVariants(input);
     let secret: string | null = null;
+    let ruleMode: "observation" | "production" = "observation";
     // Fase 5.3: a rule created for the workspace URL (perRuleUrl: false) keeps
     // its endpoint only as the internal anchor of the routed callbacks.
     let perRuleUrlDisabled = false;
@@ -485,23 +757,51 @@ export class ProviderConversionRulesService {
             }
           }
 
-          // Fase 4a: a Payt rule sits on a WhatsApp connection (the one of its
-          // numbers) only as the anchor of its signed URL; the parser release
-          // stored with the rule identifies the Payt contract.
-          const isPaytAutomation =
+          // Fase 4a: a sales-platform rule (Payt; Braip since 6.5) sits on a
+          // WhatsApp connection (the one of its numbers) only as the anchor
+          // of its signed URL; the parser release stored with the rule
+          // identifies the platform contract.
+          const salesPlatform =
             input.triggerType === "provider_automation" &&
-            input.automationSource === "payt";
+            isSalesPlatformProvider(input.automationSource)
+              ? input.automationSource
+              : null;
+          const isPaytAutomation = salesPlatform !== null;
           if (
-            isPaytAutomation &&
-            !(paytSaleEventNames as readonly string[]).includes(
+            salesPlatform &&
+            !(salesPlatformEventNames as readonly string[]).includes(
               input.eventName,
             )
           ) {
             // The HTTP schema enforces this too. Keep the invariant at the
             // service boundary for internal callers and future entry points.
             throw new BadRequestException(
-              "A Payt envia compra aprovada, Pix/boleto gerado ou carrinho abandonado",
+              `A ${salesPlatformLabels[salesPlatform]} envia compra aprovada, Pix/boleto gerado ou carrinho abandonado`,
             );
+          }
+          // Fase 6.8 (porte do #183): the ROI Chat purchase rule belongs to a
+          // ROI Chat connection (its numbers' URLs receive the purchase) and
+          // only sends Purchase. No private-integration gate in the nod.
+          const automationSource =
+            input.triggerType === "provider_automation"
+              ? input.automationSource
+              : undefined;
+          const roichatRule =
+            input.triggerType === "provider_automation" &&
+            (automationSource === "roichat" ||
+              connection?.provider === "roichat");
+          if (roichatRule) {
+            if (
+              connection?.provider !== "roichat" ||
+              automationSource !== "roichat"
+            ) {
+              throw new BadRequestException(
+                "A compra do ROI Chat pertence a uma conexão ROI Chat",
+              );
+            }
+            if (input.eventName !== "Purchase") {
+              throw new BadRequestException("O ROI Chat envia somente compra");
+            }
           }
 
           const productFilterCodes =
@@ -513,22 +813,33 @@ export class ProviderConversionRulesService {
               "Filtro de produto só existe para plataformas de venda",
             );
           }
+          // Fase 6.5/6.7: the Braip and the Yampi receive only through their
+          // workspace single URL: the per-rule URL is always born disabled
+          // (internal anchor).
           perRuleUrlDisabled =
             input.triggerType === "provider_automation" &&
-            input.perRuleUrl === false;
+            (input.perRuleUrl === false ||
+              isSingleUrlOnlyPlatform(salesPlatform) ||
+              // Fase 6.8: the ROI Chat purchase arrives on each number's own URL.
+              roichatRule);
 
           if (
             input.triggerType === "provider_automation" &&
             !isPaytAutomation &&
             connection &&
-            !["umbler", "uazapi", "unnichat"].includes(connection.provider)
+            !["umbler", "uazapi", "unnichat", "roichat"].includes(
+              connection.provider,
+            )
           ) {
             throw new BadRequestException(
               "Automação por tag ainda só está disponível para este provedor",
             );
           }
-          if (isPaytAutomation && connection?.provider === "payt") {
-            // A Payt connection has no WhatsApp number to activate: the rule
+          if (
+            isPaytAutomation &&
+            isSalesPlatformProvider(connection?.provider)
+          ) {
+            // A sales platform has no WhatsApp number to activate: the rule
             // is bound to the connection of its numbers (as in the SaaS).
             throw new BadRequestException(
               "Escolha a conexão de WhatsApp dos números desta regra",
@@ -537,7 +848,21 @@ export class ProviderConversionRulesService {
 
           const scope: ProviderConversionRuleScopeDto =
             input.scope ?? "specific_numbers";
-          const origin = this.createOrigin(input, connection, isPaytAutomation);
+          const origin = this.createOrigin(input, connection, salesPlatform);
+          // "Todos os numeros da <plataforma> (todas as conexoes)": explicit,
+          // only for Umbler/Unnichat automations (and, since 6.8, the ROI
+          // Chat purchase) for all numbers.
+          const crossConnectionScope =
+            input.triggerType === "provider_automation" &&
+            input.crossConnectionScope === true;
+          if (
+            crossConnectionScope &&
+            (!supportsCrossConnectionScope(origin) || scope !== "all_numbers")
+          ) {
+            throw new BadRequestException(
+              "Todas as conexões só existe para automações Unnichat/Umbler/ROI Chat em todos os números",
+            );
+          }
           if (!connection && providerRuleOriginRequiresConnection(origin)) {
             throw new BadRequestException(
               "Informe a conexao que recebe o webhook desta automacao",
@@ -558,15 +883,16 @@ export class ProviderConversionRulesService {
                   input.channelIds,
                 ))));
 
-          // Endpoint automations (signed URL of the rule): Umbler, Payt and,
-          // since Fase 4b, Unnichat.
+          // Endpoint automations (signed URL of the rule): Umbler, Payt (and
+          // Braip, 6.5) and, since Fase 4b, Unnichat.
           const endpointAutomationProvider =
             input.triggerType !== "provider_automation"
               ? null
-              : isPaytAutomation
-                ? "payt"
+              : salesPlatform
+                ? salesPlatform
                 : connection?.provider === "umbler" ||
-                    connection?.provider === "unnichat"
+                    connection?.provider === "unnichat" ||
+                    connection?.provider === "roichat"
                   ? connection.provider
                   : null;
           if (endpointAutomationProvider) {
@@ -578,7 +904,7 @@ export class ProviderConversionRulesService {
               transaction,
               workspaceId,
               connection.id,
-              isPaytAutomation ? "payt" : connection.provider,
+              salesPlatform ?? connection.provider,
               input.channelIds,
             );
           } else {
@@ -635,10 +961,15 @@ export class ProviderConversionRulesService {
             );
           }
 
-          this.assertModeAllowed(
-            input.mode,
-            parserRelease ? effectiveInboundParserStatus(parserRelease) : null,
-          );
+          // Fase 6.1c (produção direta): sem modo pedido, a regra de uma
+          // integração validada nasce enviando. Observação só para leitor
+          // ainda não validado (ou com o envio desligado no servidor).
+          const parserStatus = parserRelease
+            ? effectiveInboundParserStatus(parserRelease)
+            : null;
+          const modeDefaulted = input.mode === undefined;
+          ruleMode = input.mode ?? this.bornRuleMode(config, parserStatus);
+          this.assertModeAllowed(ruleMode, parserStatus);
           let defaultValueCents: number | null = null;
           let defaultCurrency: string | null = null;
           let defaultContentName: string | null = null;
@@ -699,7 +1030,8 @@ export class ProviderConversionRulesService {
                 connectionId: bound ? connection!.id : null,
                 parserReleaseId: bound ? parserRelease!.id : null,
                 scope,
-                mode: input.mode,
+                ...(crossConnectionScope ? { crossConnectionScope: true } : {}),
+                mode: ruleMode,
                 messageTriggerPhrases:
                   input.triggerType === "provider_automation"
                     ? automationTriggerPhrases
@@ -710,7 +1042,7 @@ export class ProviderConversionRulesService {
                     : input.messageAuthorScope,
                 productFilterCodes,
                 productionActivatedAt:
-                  input.mode === "production" ? new Date() : null,
+                  ruleMode === "production" ? new Date() : null,
                 createdByUserId: actorUserId,
               },
             });
@@ -747,9 +1079,16 @@ export class ProviderConversionRulesService {
             );
           }
 
-          if (input.mode === "production") {
+          // "Ativar envio" pedido explicitamente: a cascata estrita de sempre
+          // (promove números e conexão, ou recusa com o motivo). Nascendo em
+          // produção por padrão, os números de uma integração validada já
+          // nascem ativos; um número ou conexão que o operador pausou fica
+          // como está (nada é retomado implicitamente) e a regra mostra o
+          // motivo de cada número que ainda não envia.
+          if (ruleMode === "production" && !modeDefaulted) {
             await this.activateScopedProduction(transaction, {
               workspaceId,
+              providerRuleId: providerRule.id,
               boundConnectionId: bound ? connection!.id : null,
               scope,
               channelIds: input.channelIds,
@@ -762,7 +1101,7 @@ export class ProviderConversionRulesService {
             actorUserId,
             action: "provider_conversion_rule.created",
             targetId: providerRule.id,
-            resultStatus: input.mode,
+            resultStatus: ruleMode,
             afterSummary: {
               eventName: input.eventName,
               triggerType: input.triggerType,
@@ -770,7 +1109,10 @@ export class ProviderConversionRulesService {
               scope,
               origin,
               channelCount: input.channelIds.length,
-              mode: input.mode,
+              mode: ruleMode,
+              ...(modeDefaulted && ruleMode === "production"
+                ? { productionDirect: true }
+                : {}),
               endpointCreated: Boolean(secret),
               ...(productFilterCodes.length > 0
                 ? { productFilterCodes }
@@ -1054,7 +1396,16 @@ export class ProviderConversionRulesService {
           "Parser da conexao ainda nao esta disponivel",
         );
       }
-      this.assertModeAllowed("observation", connection.parserRelease.status);
+      // Fase 6.1c (produção direta): a regra adaptada de uma conexão
+      // validada já nasce enviando.
+      const adaptedMode = this.bornRuleMode(
+        this.requireRulesEnabled(),
+        effectiveInboundParserStatus(connection.parserRelease),
+      );
+      this.assertModeAllowed(
+        adaptedMode,
+        effectiveInboundParserStatus(connection.parserRelease),
+      );
 
       await transaction.conversionRule.update({
         where: { id: legacyRule.id },
@@ -1073,10 +1424,11 @@ export class ProviderConversionRulesService {
             conversionRuleId: legacyRule.id,
             connectionId: connection.id,
             parserReleaseId: connection.parserRelease.id,
-            mode: "observation",
+            mode: adaptedMode,
             messageTriggerPhrases: input.triggerPhrases,
             messageAuthorScope: input.messageAuthorScope,
-            productionActivatedAt: null,
+            productionActivatedAt:
+              adaptedMode === "production" ? new Date() : null,
             createdByUserId: actorUserId,
           },
         });
@@ -1094,7 +1446,7 @@ export class ProviderConversionRulesService {
         actorUserId,
         action: "provider_conversion_rule.adapted",
         targetId: providerRule.id,
-        resultStatus: "observation",
+        resultStatus: adaptedMode,
         afterSummary: {
           conversionRuleId: legacyRule.id,
           previousTriggerType: legacyRule.triggerType,
@@ -1102,7 +1454,7 @@ export class ProviderConversionRulesService {
           eventName: legacyRule.eventName,
           connectionId: connection.id,
           channelCount: input.channelIds.length,
-          mode: "observation",
+          mode: adaptedMode,
         },
       });
 
@@ -1126,6 +1478,16 @@ export class ProviderConversionRulesService {
       });
     }
 
+    // Fase 6.1a (#159): "Número removido" offers Pausar. A rule whose
+    // connection was removed is otherwise invisible to requireRule, so a
+    // pause-only patch (active: false and nothing else) may reach it.
+    const pauseOnly =
+      input.active === false &&
+      Object.entries(input).every(
+        ([key, value]) => key === "active" || value === undefined,
+      );
+    const lookup = { includeRemovedConnection: pauseOnly };
+
     let cascadeGlobal = false as boolean;
     const updated = await this.prisma.$transaction(async (transaction) => {
       cascadeGlobal = false;
@@ -1133,6 +1495,7 @@ export class ProviderConversionRulesService {
         transaction,
         workspaceId,
         providerRuleId,
+        lookup,
       );
 
       this.assertUpdateMatchesRule(current, input);
@@ -1179,6 +1542,21 @@ export class ProviderConversionRulesService {
               nextChannelIds,
             ))));
       const nextConnectionId = unbind ? null : current.connectionId;
+      // "Ampliar para todas as conexoes" (Umbler/Unnichat): explicit; going
+      // back to specific numbers (or asking false) returns to the rule's
+      // connection only.
+      const currentCross = current.crossConnectionScope === true;
+      const nextCross =
+        nextScope === "all_numbers" &&
+        (input.crossConnectionScope ?? currentCross);
+      if (input.crossConnectionScope === true) {
+        if (!supportsCrossConnectionScope(origin) || nextScope !== "all_numbers") {
+          throw new BadRequestException(
+            "Todas as conexões só existe para automações Unnichat/Umbler/ROI Chat em todos os números",
+          );
+        }
+      }
+      const crossChanged = nextCross !== currentCross;
 
       if (nextChannelIds && nextChannelIds.length > 0) {
         if (nextConnectionId !== null) {
@@ -1186,9 +1564,8 @@ export class ProviderConversionRulesService {
             transaction,
             workspaceId,
             nextConnectionId,
-            this.isPaytAutomationRule(current)
-              ? "payt"
-              : (current.connection?.provider ?? ""),
+            this.salesPlatformOfRule(current) ??
+              (current.connection?.provider ?? ""),
             nextChannelIds,
           );
         } else {
@@ -1205,7 +1582,25 @@ export class ProviderConversionRulesService {
         }
       }
 
-      const nextMode = input.active === false ? "observation" : input.mode;
+      // Fase 6.1c (produção direta): "Retomar" uma regra pausada de uma
+      // integração validada volta enviando (não existe mais a etapa de
+      // observação). Sem leitor validado ou com o envio desligado no
+      // servidor, ela volta como antes.
+      const resumeDefaultMode =
+        input.active === true &&
+        input.mode === undefined &&
+        !current.conversionRule.active
+          ? this.bornRuleMode(
+              this.requireRulesEnabled(),
+              unbind || !current.parserRelease
+                ? null
+                : effectiveInboundParserStatus(current.parserRelease),
+            )
+          : undefined;
+      const nextMode =
+        input.active === false
+          ? "observation"
+          : (input.mode ?? resumeDefaultMode);
       if (nextMode === "production") {
         this.assertModeAllowed(
           "production",
@@ -1265,6 +1660,7 @@ export class ProviderConversionRulesService {
 
       if (
         input.mode !== undefined ||
+        resumeDefaultMode !== undefined ||
         input.active === false ||
         input.triggerPhrases !== undefined ||
         input.triggerLabels !== undefined ||
@@ -1309,20 +1705,39 @@ export class ProviderConversionRulesService {
         if (!current.endpoint || current.endpoint.removedAt) {
           throw new NotFoundException(endpointNotFoundMessage);
         }
+        // Fase 6.5/6.7: the Braip and the Yampi receive only through the
+        // workspace single URL; the per-rule address (internal anchor) is
+        // never reopened.
+        const currentPlatform = this.salesPlatformOfRule(current);
+        if (
+          input.publicUrlDisabled === false &&
+          isSingleUrlOnlyPlatform(currentPlatform)
+        ) {
+          throw new ConflictException(singleUrlOnlyMessage(currentPlatform));
+        }
+        // Fase 6.8: the ROI Chat purchase arrives on each number's own URL;
+        // the rule's address (internal anchor) is never reopened either.
+        if (
+          input.publicUrlDisabled === false &&
+          this.isRoichatPurchaseRule(current)
+        ) {
+          throw new ConflictException(roichatNumberUrlOnlyMessage);
+        }
         const isDisabled = current.endpoint.publicUrlDisabledAt != null;
         if (input.publicUrlDisabled && !isDisabled) {
           // Never close the only way in: the workspace URL of this platform
           // (and event, for Unnichat/Umbler) must exist first.
           const provider = current.parserRelease?.provider;
           const workspaceUrl =
-            provider && ["payt", "unnichat", "umbler"].includes(provider)
+            provider &&
+            ["payt", "braip", "yampi", "unnichat", "umbler"].includes(provider)
               ? await transaction.integrationEndpoint.findFirst({
                   where: {
                     workspaceId,
                     provider,
                     removedAt: null,
                     eventName:
-                      provider === "payt"
+                      isSalesPlatformProvider(provider)
                         ? null
                         : current.conversionRule.eventName,
                   },
@@ -1350,11 +1765,12 @@ export class ProviderConversionRulesService {
       // again (it then overrides the global rule on its numbers).
       const reactivatesUnified =
         input.active === true && current.unifiedIntoProviderRuleId !== null;
-      if (scopeChanged || unbind || reactivatesUnified) {
+      if (scopeChanged || unbind || reactivatesUnified || crossChanged) {
         await transaction.providerConversionRuleConfig.update({
           where: { id: current.id },
           data: {
             scope: nextScope,
+            ...(crossChanged ? { crossConnectionScope: nextCross } : {}),
             ...(unbind ? { connectionId: null, parserReleaseId: null } : {}),
             ...(reactivatesUnified ? { unifiedIntoProviderRuleId: null } : {}),
           },
@@ -1429,12 +1845,15 @@ export class ProviderConversionRulesService {
         effectiveMode === "production" &&
         staysActive &&
         (input.mode !== undefined ||
-          input.active === true ||
+          (input.active === true && resumeDefaultMode === undefined) ||
           input.channelIds !== undefined ||
-          scopeChanged)
+          scopeChanged ||
+          // "Ampliar para todas as conexões" on a rule already sending.
+          crossChanged)
       ) {
         await this.activateScopedProduction(transaction, {
           workspaceId,
+          providerRuleId,
           boundConnectionId: nextConnectionId,
           scope: nextScope,
           channelIds:
@@ -1445,12 +1864,18 @@ export class ProviderConversionRulesService {
         // A global rule promotes its covered numbers after this commit, each
         // in its own transaction (see cascadeGlobalNumbers).
         cascadeGlobal = nextScope === "all_numbers";
+      } else if (resumeDefaultMode === "production" && staysActive) {
+        // Fase 6.1c: "Retomar" sem pedir modo não retoma números nem
+        // conexões que o operador pausou; os números que nunca enviaram de
+        // uma regra para todos os números seguem a cascata de sempre.
+        cascadeGlobal = nextScope === "all_numbers";
       }
 
       const result = await this.requireRule(
         transaction,
         workspaceId,
         providerRuleId,
+        lookup,
       );
       await this.createAudit(transaction, {
         workspaceId,
@@ -1510,6 +1935,12 @@ export class ProviderConversionRulesService {
       ) {
         throw new NotFoundException(endpointNotFoundMessage);
       }
+      // Fase 6.5/6.7: no per-rule URL for the Braip or the Yampi (the single
+      // URL is rotated in Integrações).
+      const rulePlatform = this.salesPlatformOfRule(rule);
+      if (isSingleUrlOnlyPlatform(rulePlatform)) {
+        throw new ConflictException(singleUrlOnlyMessage(rulePlatform));
+      }
 
       const rotatedAt = new Date();
       const updated = await transaction.providerConversionRuleEndpoint.update({
@@ -1555,10 +1986,14 @@ export class ProviderConversionRulesService {
     this.requireRulesEnabled();
 
     await this.prisma.$transaction(async (transaction) => {
+      // Porte do #161: rules whose number/connection was removed are still
+      // listed ("Número removido"), so they must still be deletable (they
+      // used to answer 404 here).
       const current = await this.requireRule(
         transaction,
         workspaceId,
         providerRuleId,
+        { includeRemovedConnection: true },
       );
       const removedAt = new Date();
 
@@ -1593,17 +2028,114 @@ export class ProviderConversionRulesService {
     });
   }
 
+  /**
+   * Porte do #161 (0f6e010d): bulk delete from the Conversions list. Each
+   * rule is removed (and audited) on its own, so a failure never blocks the
+   * others; the result reports every rule. A rule that other unified rules
+   * point to (the "all numbers" target) is only removed when explicitly
+   * confirmed, and only after the rules that point to it in the same batch.
+   */
+  async removeRules(
+    workspaceId: string,
+    input: { ruleIds: string[]; confirmTargetRuleIds?: string[] },
+    actorUserId: string,
+  ): Promise<ProviderConversionRuleBulkRemoveResultDto> {
+    this.requireRulesEnabled();
+    const confirmed = new Set(input.confirmTargetRuleIds ?? []);
+    const pointing = await this.prisma.providerConversionRuleConfig.findMany({
+      where: {
+        workspaceId,
+        removedAt: null,
+        unifiedIntoProviderRuleId: { in: input.ruleIds },
+      },
+      select: { unifiedIntoProviderRuleId: true },
+    });
+    const targetIds = new Set(
+      pointing.map((rule) => rule.unifiedIntoProviderRuleId!),
+    );
+    const ordered = [
+      ...input.ruleIds.filter((id) => !targetIds.has(id)),
+      ...input.ruleIds.filter((id) => targetIds.has(id)),
+    ];
+    const byId = new Map<
+      string,
+      ProviderConversionRuleBulkRemoveResultDto["results"][number]
+    >();
+
+    for (const ruleId of ordered) {
+      try {
+        if (targetIds.has(ruleId)) {
+          const remaining =
+            await this.prisma.providerConversionRuleConfig.count({
+              where: {
+                workspaceId,
+                removedAt: null,
+                unifiedIntoProviderRuleId: ruleId,
+              },
+            });
+          if (remaining > 0 && !confirmed.has(ruleId)) {
+            byId.set(ruleId, {
+              ruleId,
+              status: "needs_target_confirmation",
+              message:
+                "Esta regra recebe os eventos das URLs antigas de outras regras unificadas. Confirme a exclusão dela separadamente.",
+            });
+            continue;
+          }
+        }
+        await this.removeRule(workspaceId, ruleId, actorUserId);
+        byId.set(ruleId, { ruleId, status: "removed", message: null });
+      } catch (error) {
+        byId.set(
+          ruleId,
+          error instanceof NotFoundException
+            ? {
+                ruleId,
+                status: "not_found",
+                message:
+                  "A regra não foi encontrada (talvez já tenha sido excluída).",
+              }
+            : {
+                ruleId,
+                status: "failed",
+                message: "Não foi possível excluir esta regra.",
+              },
+        );
+      }
+    }
+
+    const results = input.ruleIds.map((id) => byId.get(id)!);
+    return {
+      results,
+      removedCount: results.filter((item) => item.status === "removed").length,
+    };
+  }
+
   /** Scope options and capability matrix read by the Conversions screen. */
   getCapabilities(): ProviderConversionRuleCapabilitiesDto {
     this.requireRulesEnabled();
-    return providerRuleCapabilities();
+    return {
+      ...providerRuleCapabilities(),
+      leadSubmittedRuleOverrideEnabled: leadSubmittedRuleOverrideEnabled(
+        this.env,
+      ),
+      // INBOUND_CONVERSION_PRODUCTION_ENABLED=false: as regras aparecem
+      // enviando, mas nada sai. A tela avisa em linguagem simples.
+      conversionSendingOff: conversionSendingSwitchedOff(this.env),
+    };
   }
 
   /**
    * "Unificar": groups of active specific rules that are identical in origin,
-   * event, trigger (phrases/labels/catalog), value and mode. The Umbler
-   * automation is never a candidate: unifying it would retire the webhook URL
-   * configured in Umbler.
+   * event, trigger (phrases/labels/catalog), value and mode. Sales platforms
+   * (Payt) are never candidates. Umbler/Unnichat automations are
+   * (21/10/2026): their per-connection rules of the same event fold into ONE
+   * rule for all numbers of the provider, and the OLD per-rule URLs keep
+   * working (forwarded to the unified rule), so nothing has to be
+   * reconfigured in the platform right away. For them a group may also hold
+   * extra "all numbers" rules (one per connection, from before the scope
+   * spanned connections) and rules whose number was removed; one existing
+   * rule for all numbers with a live connection is the target.
    */
   async listUnifyCandidates(
     workspaceId: string,
@@ -1619,16 +2151,29 @@ export class ProviderConversionRulesService {
     for (const rule of rules) {
       const signature = this.unifySignature(rule);
       if (!signature || !rule.conversionRule.active) continue;
+      const automation = isUnifiableAutomationOrigin(signature.origin);
       if (providerRuleScope(rule) === "all_numbers") {
-        if (!globalsByKey.has(signature.key))
+        // Automations: only a rule already "todas as conexoes" with a live
+        // connection is a target; per-connection "all numbers" rules (the
+        // historical shape) are members.
+        if (
+          !globalsByKey.has(signature.key) &&
+          (!automation || unifyAutomationTargetEligible(rule))
+        ) {
           globalsByKey.set(signature.key, rule);
-        continue;
+          continue;
+        }
+        if (!automation) continue;
       }
       if (rule.unifiedIntoProviderRuleId) continue;
       groups.set(signature.key, [...(groups.get(signature.key) ?? []), rule]);
     }
     const candidates = [...groups.entries()].filter(
-      ([, members]) => members.length >= 2,
+      ([key, members]) =>
+        members.length >= 2 ||
+        (members.length === 1 &&
+          isUnifiableAutomationOrigin(providerRuleOrigin(members[0]!)) &&
+          globalsByKey.has(key)),
     );
     if (candidates.length === 0) return { groups: [] };
 
@@ -1637,7 +2182,24 @@ export class ProviderConversionRulesService {
       groups: candidates.map(([key, members]) => {
         const first = members[0]!;
         const coverage = this.unifyCoverage(members, rules, channels);
+        const existingGlobal = globalsByKey.get(key) ?? null;
+        const automation = isUnifiableAutomationOrigin(providerRuleOrigin(first));
+        const target = automation
+          ? (existingGlobal ?? automationPromotionTarget(members))
+          : existingGlobal;
         return {
+          ...(automation
+            ? {
+                members: [...members, ...(existingGlobal ? [existingGlobal] : [])].map(
+                  (rule) => unifyMemberDto(rule),
+                ),
+                targetRuleId: target?.id ?? null,
+                differences: unifyDifferences([
+                  ...members,
+                  ...(existingGlobal ? [existingGlobal] : []),
+                ]),
+              }
+            : {}),
           key,
           origin: providerRuleOrigin(first)!,
           eventName: conversionEventNameSchema.parse(
@@ -1675,7 +2237,7 @@ export class ProviderConversionRulesService {
   ): Promise<ProviderConversionRuleUnifyResultDto> {
     this.requireRulesEnabled();
     const ruleIds = [...new Set(input.ruleIds)].sort();
-    if (ruleIds.length < 2) {
+    if (ruleIds.length < 1) {
       throw new BadRequestException("Selecione ao menos duas regras");
     }
 
@@ -1689,42 +2251,54 @@ export class ProviderConversionRulesService {
         throw new NotFoundException(ruleNotFoundMessage);
       }
 
-      const unifiedInto = new Set(
-        rules.map((rule) => rule.unifiedIntoProviderRuleId ?? null),
-      );
-      if (!unifiedInto.has(null)) {
-        if (unifiedInto.size !== 1) {
-          throw new ConflictException(
-            "Estas regras foram unificadas em regras diferentes",
-          );
-        }
-        const target = await this.requireRule(
-          transaction,
-          workspaceId,
-          [...unifiedInto][0]!,
+      const linked = rules.filter((rule) => rule.unifiedIntoProviderRuleId);
+      if (linked.length > 0) {
+        const targets = new Set(
+          linked.map((rule) => rule.unifiedIntoProviderRuleId!),
         );
-        return {
-          outcome: "replayed" as const,
-          target,
-          deactivatedRuleIds: ruleIds,
-          newlyCoveredChannelIds: [] as string[],
-        };
-      }
-      if (unifiedInto.size > 1) {
+        const unlinked = rules.filter(
+          (rule) => !rule.unifiedIntoProviderRuleId,
+        );
+        // Replay: every rule points to the same target (an automation
+        // "Unificar" may have promoted one of the requested rules itself).
+        if (
+          targets.size === 1 &&
+          unlinked.every((rule) => targets.has(rule.id))
+        ) {
+          const target = await this.requireRule(
+            transaction,
+            workspaceId,
+            [...targets][0]!,
+          );
+          return {
+            outcome: "replayed" as const,
+            target,
+            deactivatedRuleIds: linked.map((rule) => rule.id).sort(),
+            newlyCoveredChannelIds: [] as string[],
+          };
+        }
         throw new ConflictException(
-          "Algumas destas regras ja foram unificadas; atualize a lista",
+          unlinked.length === 0
+            ? "Estas regras foram unificadas em regras diferentes"
+            : "Algumas destas regras ja foram unificadas; atualize a lista",
         );
       }
 
       const signatures = rules.map((rule) => this.unifySignature(rule));
       const key = signatures[0]?.key;
+      const automation = isUnifiableAutomationOrigin(
+        signatures[0]?.origin ?? null,
+      );
+      // Requested rules that are already the target ("todas as conexoes")
+      // never pause themselves.
       if (
         !key ||
         signatures.some((signature) => signature?.key !== key) ||
         rules.some(
           (rule) =>
             !rule.conversionRule.active ||
-            providerRuleScope(rule) !== "specific_numbers",
+            // Automations may fold extra per-connection "all numbers" rules.
+            (!automation && providerRuleScope(rule) !== "specific_numbers"),
         )
       ) {
         throw new ConflictException(
@@ -1736,9 +2310,6 @@ export class ProviderConversionRulesService {
         (left, right) => left.createdAt.getTime() - right.createdAt.getTime(),
       )[0]!;
       const origin = providerRuleOrigin(first)!;
-      if (first.mode === "production") {
-        this.assertModeAllowed("production", null);
-      }
 
       const peers = await transaction.providerConversionRuleConfig.findMany({
         where: {
@@ -1752,11 +2323,47 @@ export class ProviderConversionRulesService {
         },
         include: providerRuleInclude,
       });
-      const existing = peers.find(
-        (peer) =>
-          providerRuleScope(peer) === "all_numbers" &&
-          this.unifySignature(peer)?.key === key,
-      );
+      const requested = new Set(ruleIds);
+      const existing = peers
+        .filter((peer) => !requested.has(peer.id))
+        .sort(
+          (left, right) => left.createdAt.getTime() - right.createdAt.getTime(),
+        )
+        .find(
+          (peer) =>
+            providerRuleScope(peer) === "all_numbers" &&
+            this.unifySignature(peer)?.key === key &&
+            (!automation || unifyAutomationTargetEligible(peer)),
+        );
+      if (ruleIds.length < 2 && !(automation && existing)) {
+        throw new BadRequestException("Selecione ao menos duas regras");
+      }
+      // Automations of one event may differ in value or mode: the target's
+      // prevail, so the operator must have seen and confirmed it.
+      if (automation) {
+        const differences = unifyDifferences([
+          ...rules,
+          ...(existing ? [existing] : []),
+        ]);
+        if (differences.length > 0 && input.acknowledgeDifferences !== true) {
+          throw new ConflictException({
+            statusCode: 409,
+            error: "Conflict",
+            code: "provider_rule_unify_differences",
+            differences,
+            message:
+              "As regras têm valores ou modos diferentes; confirme quais valores vão valer",
+          });
+        }
+      }
+      const targetMode = existing
+        ? existing.mode
+        : automation
+          ? (automationPromotionTarget(rules)?.mode ?? first.mode)
+          : first.mode;
+      if (targetMode === "production") {
+        this.assertModeAllowed("production", null);
+      }
       // Unificar cria uma regra global: com mais canais do que o limite de
       // avaliação a cobertura não é confiável, então recusa em vez de criar.
       const scan = await scanWorkspaceScopeChannels(transaction, workspaceId);
@@ -1767,8 +2374,22 @@ export class ProviderConversionRulesService {
       }
       const coverage = this.unifyCoverage(rules, peers, scan.channels);
 
+      // Automations keep their connection binding (anchor + signed URL), so
+      // without an existing rule for all numbers one of the requested rules
+      // becomes it (its URL, history and connection stay); never a new
+      // unbound rule without URL.
+      const promoted =
+        !existing && automation
+          ? await this.promoteUnifiedAutomation(transaction, {
+              workspaceId,
+              rules,
+              name: input.name ?? null,
+              actorUserId,
+            })
+          : null;
       const targetId =
         existing?.id ??
+        promoted?.id ??
         (await this.createUnifiedRule(transaction, {
           workspaceId,
           template: first,
@@ -1776,16 +2397,18 @@ export class ProviderConversionRulesService {
           name: input.name ?? first.conversionRule.name,
           actorUserId,
         }));
+      const pausedRules = rules.filter((rule) => rule.id !== targetId);
+      const pausedRuleIds = pausedRules.map((rule) => rule.id).sort();
 
       await transaction.conversionRule.updateMany({
         where: {
           workspaceId,
-          id: { in: rules.map((rule) => rule.conversionRuleId) },
+          id: { in: pausedRules.map((rule) => rule.conversionRuleId) },
         },
         data: { active: false },
       });
       await transaction.providerConversionRuleConfig.updateMany({
-        where: { workspaceId, id: { in: ruleIds } },
+        where: { workspaceId, id: { in: pausedRuleIds } },
         data: {
           mode: "observation",
           productionActivatedAt: null,
@@ -1798,19 +2421,34 @@ export class ProviderConversionRulesService {
         actorUserId,
         action: "provider_conversion_rule.unified",
         targetId,
-        resultStatus: existing ? "reused_existing" : "created",
+        resultStatus: existing
+          ? "reused_existing"
+          : promoted
+            ? "promoted_member"
+            : "created",
         afterSummary: {
           origin,
           eventName: first.conversionRule.eventName,
-          mode: first.mode,
-          sourceRuleIds: ruleIds,
+          mode: targetMode,
+          ...(automation
+            ? {
+                acknowledgedDifferences: unifyDifferences([
+                  ...rules,
+                  ...(existing ? [existing] : []),
+                ]),
+              }
+            : {}),
+          sourceRuleIds: pausedRuleIds,
+          ...(promoted
+            ? { previousChannelIds: promoted.previousChannelIds }
+            : {}),
           sourceChannelIds: coverage.channelIds,
           newlyCoveredChannelIds: coverage.newlyCoveredChannelIds,
           overriddenChannelIds: coverage.overriddenChannelIds,
           duplicatePhoneChannelIds: coverage.duplicatePhoneChannelIds,
         },
       });
-      for (const rule of rules) {
+      for (const rule of pausedRules) {
         await this.createAudit(transaction, {
           workspaceId,
           actorUserId,
@@ -1829,7 +2467,7 @@ export class ProviderConversionRulesService {
       return {
         outcome: existing ? ("reused_existing" as const) : ("created" as const),
         target: await this.requireRule(transaction, workspaceId, targetId),
-        deactivatedRuleIds: ruleIds,
+        deactivatedRuleIds: pausedRuleIds,
         newlyCoveredChannelIds: coverage.newlyCoveredChannelIds,
       };
     });
@@ -1852,6 +2490,47 @@ export class ProviderConversionRulesService {
       deactivatedRuleIds: result.deactivatedRuleIds,
       newlyCoveredChannelIds: result.newlyCoveredChannelIds,
     };
+  }
+
+  /**
+   * Automation "Unificar" without a rule for all numbers yet: the oldest
+   * requested rule whose connection is still live (an "all numbers" one
+   * first) becomes the rule for all numbers of the provider. Its chosen
+   * numbers are recorded in the audit before the scope rows go, exactly like
+   * switching a rule to "Todos os numeros" in Gerenciar.
+   */
+  private async promoteUnifiedAutomation(
+    transaction: Prisma.TransactionClient,
+    input: {
+      workspaceId: string;
+      rules: PersistedProviderRule[];
+      name: string | null;
+      actorUserId: string;
+    },
+  ): Promise<{ id: string; previousChannelIds: string[] }> {
+    const target = automationPromotionTarget(input.rules);
+    if (!target) {
+      throw new ConflictException(
+        "Nenhuma destas regras tem uma conexão ativa; conecte o número novo e crie a regra para todos os números",
+      );
+    }
+    const previousChannelIds = target.channels.map(
+      (channel) => channel.channelId,
+    );
+    await transaction.providerConversionRuleConfig.update({
+      where: { id: target.id },
+      data: { scope: "all_numbers", crossConnectionScope: true },
+    });
+    await transaction.providerConversionRuleChannel.deleteMany({
+      where: { workspaceId: input.workspaceId, providerRuleId: target.id },
+    });
+    if (input.name && input.name !== target.conversionRule.name) {
+      await transaction.conversionRule.updateMany({
+        where: { workspaceId: input.workspaceId, id: target.conversionRuleId },
+        data: { name: input.name },
+      });
+    }
+    return { id: target.id, previousChannelIds };
   }
 
   private async createUnifiedRule(
@@ -1946,8 +2625,25 @@ export class ProviderConversionRulesService {
     rule: PersistedProviderRule,
   ): { key: string; origin: ProviderRuleOrigin } | null {
     const origin = providerRuleOrigin(rule);
-    if (!origin || !providerRuleOriginUnifiable(origin) || rule.removedAt) {
+    if (
+      !origin ||
+      (!providerRuleOriginUnifiable(origin) &&
+        !isUnifiableAutomationOrigin(origin)) ||
+      rule.removedAt
+    ) {
       return null;
+    }
+    if (isUnifiableAutomationOrigin(origin)) {
+      // Umbler/Unnichat: one rule per provider and event. Value and mode may
+      // differ; the review shows them and which ones prevail.
+      const key = createHash("sha256")
+        .update(
+          JSON.stringify({ origin, eventName: rule.conversionRule.eventName }),
+          "utf8",
+        )
+        .digest("hex")
+        .slice(0, 32);
+      return { key, origin };
     }
     const normalize = (value: string) =>
       value.normalize("NFKC").trim().toLocaleLowerCase("pt-BR");
@@ -2039,6 +2735,8 @@ export class ProviderConversionRulesService {
       {
         ...first,
         scope: "all_numbers",
+        // Automations: the unified rule spans every connection.
+        crossConnectionScope: true,
         connectionId: null,
         parserRelease: null,
         connection: null,
@@ -2142,11 +2840,13 @@ export class ProviderConversionRulesService {
   private createOrigin(
     input: ProviderConversionRuleCreateInputDto,
     connection: { provider: string } | null,
-    isPaytAutomation: boolean,
+    salesPlatform: SalesPlatformProviderDto | null,
   ): ProviderRuleOrigin {
     if (input.triggerType === "message_phrase") return "message_phrase";
     if (input.triggerType === "structured_catalog") return "structured_catalog";
-    if (isPaytAutomation) return "automation_payt";
+    if (salesPlatform === "braip") return "automation_braip";
+    if (salesPlatform === "yampi") return "automation_yampi";
+    if (salesPlatform === "payt") return "automation_payt";
     // Without a connection, a provider automation can only be a WhatsApp
     // label rule (the Umbler automation always names its connection).
     const origin = providerRuleOrigin({
@@ -2214,6 +2914,8 @@ export class ProviderConversionRulesService {
           rule.origin === "whatsapp_label" ||
           rule.origin === "automation_umbler" ||
           rule.origin === "automation_payt" ||
+          rule.origin === "automation_braip" ||
+          rule.origin === "automation_yampi" ||
           rule.origin === "automation_unnichat"
             ? "provider_automation"
             : rule.origin,
@@ -2224,6 +2926,10 @@ export class ProviderConversionRulesService {
           ? { provider: "umbler" }
           : rule.origin === "automation_payt"
             ? { provider: "payt" }
+            : rule.origin === "automation_braip"
+              ? { provider: "braip" }
+            : rule.origin === "automation_yampi"
+              ? { provider: "yampi" }
             : rule.origin === "automation_unnichat"
               ? { provider: "unnichat" }
               : null,
@@ -2260,6 +2966,7 @@ export class ProviderConversionRulesService {
     transaction: Prisma.TransactionClient,
     input: {
       workspaceId: string;
+      providerRuleId: string;
       boundConnectionId: string | null;
       scope: ProviderConversionRuleScopeDto;
       channelIds: string[];
@@ -2273,6 +2980,7 @@ export class ProviderConversionRulesService {
     if (input.boundConnectionId !== null) {
       await this.cascadeProductionActivation(transaction, {
         workspaceId: input.workspaceId,
+        providerRuleId: input.providerRuleId,
         connectionId: input.boundConnectionId,
         channelIds: input.channelIds,
         actorUserId: input.actorUserId,
@@ -2281,10 +2989,45 @@ export class ProviderConversionRulesService {
     }
     const channels = await transaction.inboundWebhookChannel.findMany({
       where: { workspaceId: input.workspaceId, id: { in: input.channelIds } },
-      select: { id: true, connectionId: true },
+      select: {
+        id: true,
+        connectionId: true,
+        connection: { select: { removedAt: true } },
+        whatsappInstance: { select: { status: true } },
+      },
     });
+    // nod (porte do #66): a rule without a bound connection groups its
+    // numbers by connection. A number whose connection was removed (any
+    // removed inbound connection, including a Uazapi/WAHA bridge connection)
+    // used to send the whole activation to a 404 on that connection; its scope
+    // row is an orphan and is dropped here, the live numbers keep going.
+    const orphanIds = [
+      ...new Set([
+        ...input.channelIds.filter(
+          (channelId) => !channels.some((channel) => channel.id === channelId),
+        ),
+        ...channels
+          .filter((channel) => channel.connection.removedAt !== null)
+          .map((channel) => channel.id),
+      ]),
+    ];
+    if (orphanIds.length > 0) {
+      await this.dropOrphanChannelScopes(transaction, {
+        workspaceId: input.workspaceId,
+        providerRuleId: input.providerRuleId,
+        connectionId: null,
+        orphanIds,
+        remainingChannelIds: channels
+          .filter((channel) => channel.connection.removedAt === null)
+          .map((channel) => channel.id),
+        actorUserId: input.actorUserId,
+      });
+    }
     const byConnection = new Map<string, string[]>();
     for (const channel of channels) {
+      if (channel.connection.removedAt !== null) continue;
+      // nod: a Uazapi/WAHA number deleted in Integrations is never activated.
+      if (channel.whatsappInstance?.status === "suspended") continue;
       byConnection.set(channel.connectionId, [
         ...(byConnection.get(channel.connectionId) ?? []),
         channel.id,
@@ -2298,6 +3041,7 @@ export class ProviderConversionRulesService {
     for (const [connectionId, channelIds] of byConnection) {
       await this.cascadeProductionActivation(transaction, {
         workspaceId: input.workspaceId,
+        providerRuleId: input.providerRuleId,
         connectionId,
         channelIds,
         actorUserId: input.actorUserId,
@@ -2396,8 +3140,18 @@ export class ProviderConversionRulesService {
       select: pendingChannelSelect(),
     })) as PendingChannelRow[];
     const byId = new Map(rows.map((row) => [row.id, row]));
+    // Bound rules: their own connection. Unbound rules and Umbler/Unnichat
+    // rules for all numbers: the connection of each covered number. Payt
+    // (porte do #171): the anchor, then the number's own connection (a
+    // number live only on the anchor never sends).
     const gateOf = (rule: PersistedProviderRule, channel: PendingChannelRow) =>
-      rule.connectionId && rule.connection
+      rule.connectionId &&
+      rule.connection &&
+      providerRuleNumberGateConnectionId(
+        rule,
+        { connectionId: channel.connection.id },
+        rule.connection.status,
+      ) === rule.connectionId
         ? {
             id: rule.connection.id,
             provider: rule.connection.provider as string,
@@ -2491,7 +3245,8 @@ export class ProviderConversionRulesService {
         (number) =>
           number.activatable &&
           number.channelStatus !== "paused" &&
-          number.connectionStatus !== "paused",
+          number.connectionStatus !== "paused" &&
+          !this.salesNumberOwnConnectionGate(rule, number),
       );
       const results: GlobalNumberActivation[] = [];
       for (const number of candidates.slice(0, GLOBAL_RULE_CASCADE_LIMIT)) {
@@ -2556,6 +3311,31 @@ export class ProviderConversionRulesService {
   }
 
   /**
+   * A sales-platform number held back by its OWN connection (the anchor is
+   * live). Only the explicit "Ativar envio neste número" promotes that
+   * connection: it may carry other rules and numbers, so neither the save
+   * cascade nor the automatic activation touches it.
+   *
+   * Adaptação nod: a ponte Uazapi/WAHA é uma conexão por número (1:1 com a
+   * conexão WhatsApp do aluno), a mesma que a regra global de frase já ativa
+   * sozinha; ela segue o cascade e a ativação automática normais.
+   */
+  private salesNumberOwnConnectionGate(
+    rule: PersistedProviderRule,
+    number: Pick<
+      ProviderConversionRulePendingNumberDto,
+      "connectionId" | "provider"
+    >,
+  ): boolean {
+    return (
+      providerRuleIsSalesPlatform(rule) &&
+      rule.connectionId !== null &&
+      number.connectionId !== rule.connectionId &&
+      !isBridgedWhatsappProvider(number.provider)
+    );
+  }
+
+  /**
    * Promotes ONE covered number with the same activation the Integrations
    * buttons run (channel "Ativar envio", then the connection's "Ativar envios
    * automáticos"), inside its own transaction.
@@ -2578,11 +3358,26 @@ export class ProviderConversionRulesService {
           workspaceId,
           channelId,
         );
-        const gate = await requireInboundWebhookConnection(
+        const anchorGate = await requireInboundWebhookConnection(
           transaction,
           workspaceId,
-          input.rule.connectionId ?? channel.connectionId,
+          providerRuleGateConnectionId(input.rule, channel),
         );
+        // Payt: with the anchor live, the number's own connection is the
+        // gate that still holds the number back.
+        const numberGateId = providerRuleNumberGateConnectionId(
+          input.rule,
+          channel,
+          anchorGate.status,
+        );
+        const gate =
+          numberGateId === anchorGate.id
+            ? anchorGate
+            : await requireInboundWebhookConnection(
+                transaction,
+                workspaceId,
+                numberGateId,
+              );
         if (gate.status === "production" && channel.status === "active") {
           return { channelId, outcome: "already_live" as const, reason: null };
         }
@@ -2729,7 +3524,8 @@ export class ProviderConversionRulesService {
         if (
           !number.activatable ||
           number.channelStatus === "paused" ||
-          number.connectionStatus === "paused"
+          number.connectionStatus === "paused" ||
+          this.salesNumberOwnConnectionGate(rule, number)
         ) {
           continue;
         }
@@ -2760,13 +3556,19 @@ export class ProviderConversionRulesService {
       },
     });
     const channelById = new Map(channelRows.map((row) => [row.id, row]));
-    const gateOf = (target: {
-      rule: PersistedProviderRule;
-      channelId: string;
-    }) =>
-      target.rule.connectionId ??
-      channelById.get(target.channelId)?.connectionId ??
-      null;
+    // Payt (porte do #171): with the anchor live, the gate is the number's
+    // own connection (only the Uazapi/WAHA bridge reaches here; see
+    // salesNumberOwnConnectionGate).
+    const gateOf = (target: { rule: PersistedProviderRule; channelId: string }) => {
+      const channelConnectionId = channelById.get(target.channelId)?.connectionId;
+      return channelConnectionId
+        ? providerRuleNumberGateConnectionId(
+            target.rule,
+            { connectionId: channelConnectionId },
+            target.rule.connection?.status,
+          )
+        : (target.rule.connectionId ?? null);
+    };
     const gateIds = [
       ...new Set(
         [...targets.values()]
@@ -2816,9 +3618,10 @@ export class ProviderConversionRulesService {
     }) => {
       const channel = channelById.get(target.channelId);
       const gateId = gateOf(target);
-      const gateActivatedAt = target.rule.connectionId
-        ? (target.rule.connection?.productionActivatedAt ?? null)
-        : (channel?.connection.productionActivatedAt ?? null);
+      const gateActivatedAt =
+        target.rule.connectionId && gateId === target.rule.connectionId
+          ? (target.rule.connection?.productionActivatedAt ?? null)
+          : (channel?.connection.productionActivatedAt ?? null);
       return (
         channel !== undefined &&
         gateId !== null &&
@@ -3041,6 +3844,22 @@ export class ProviderConversionRulesService {
     return config;
   }
 
+  /**
+   * Fase 6.1c (produção direta): modo de nascimento de uma regra. Produção
+   * quando o envio de conversões está ligado no servidor e o leitor é
+   * validado (ou a regra abrange conexões: cada ocorrência é barrada pelo
+   * leitor da própria conexão). Do contrário, observação.
+   */
+  private bornRuleMode(
+    config: { conversionProductionEnabled: boolean },
+    parserStatus: "observation_only" | "certified" | "retired" | null,
+  ): "observation" | "production" {
+    return config.conversionProductionEnabled &&
+      (parserStatus === null || parserStatus === "certified")
+      ? "production"
+      : "observation";
+  }
+
   private assertModeAllowed(
     mode: "observation" | "production",
     /**
@@ -3082,6 +3901,7 @@ export class ProviderConversionRulesService {
     transaction: Prisma.TransactionClient,
     input: {
       workspaceId: string;
+      providerRuleId: string;
       connectionId: string;
       channelIds: string[];
       actorUserId: string;
@@ -3099,11 +3919,18 @@ export class ProviderConversionRulesService {
       connection.provider,
     );
     const seats = this.seatHook();
+    const channelIds = await this.pruneOrphanChannelScopes(transaction, {
+      workspaceId,
+      providerRuleId: input.providerRuleId,
+      connectionId,
+      channelIds: input.channelIds,
+      actorUserId,
+    });
 
     // Channels first: promoting the connection refuses to run without at least
     // one active channel, and it stamps productionActivatedAt on every channel
     // that is already active by then.
-    for (const channelId of [...new Set(input.channelIds)]) {
+    for (const channelId of channelIds) {
       const channel = await requireInboundWebhookChannel(
         transaction,
         workspaceId,
@@ -3116,14 +3943,14 @@ export class ProviderConversionRulesService {
         );
       }
 
-      // An already-active channel only needs a rewrite when the connection is
-      // production and its stamp was lost; otherwise the connection promote
-      // below stamps it.
-      if (
-        channel.status === "active" &&
-        (connection.status !== "production" ||
-          channel.productionActivatedAt !== null)
-      ) {
+      // Porte do #85 (ff28d8a1): a channel that is already active is already
+      // part of the connection's live input surface. Do not replay its
+      // activation just because a legacy row lacks productionActivatedAt:
+      // doing so re-runs the Meta-route guard while enabling an independent
+      // sibling rule. When a connection is promoted below it stamps all active
+      // channels; an already-production connection does not need this
+      // idempotent rewrite at all.
+      if (channel.status === "active") {
         continue;
       }
 
@@ -3149,6 +3976,214 @@ export class ProviderConversionRulesService {
       requireValidMetaRoute,
       seats,
       env: this.env,
+    });
+  }
+
+  /**
+   * Porte do #66 (3f59e2f7) e do #86 (71e69a95).
+   *
+   * A rule keeps its `ProviderConversionRuleChannel` rows when the channel they
+   * point at goes away with its connection: a bridge connection (Uazapi or
+   * WAHA) or any inbound connection removed in Integrations, a channel moved
+   * to another connection. The orphan is invisible in the builder but fatal
+   * on activation: the cascade used to walk it and fail with "Recurso de
+   * webhook não encontrado" (404) or "Um ou mais canais não pertencem a esta
+   * conexão e workspace", leaving the rule stuck in Observando with no way out
+   * from the UI.
+   *
+   * So drop the orphans here and keep going with the channels that are really
+   * on this rule's live connection. Only a rule left with no valid channel at
+   * all is a genuine dead end, and it says so instead of blaming the webhook.
+   *
+   * #86: discovery is keyed by provider channel + organization, not by phone,
+   * so a provider can rediscover a number under a new identity while its
+   * original channel is already the live input surface. The stale
+   * `discovered` row is remapped to its active sibling (same connection, same
+   * phone) instead of being promoted (which would demand a second Meta route).
+   */
+  private async pruneOrphanChannelScopes(
+    transaction: Prisma.TransactionClient,
+    input: {
+      workspaceId: string;
+      providerRuleId: string;
+      connectionId: string;
+      channelIds: string[];
+      actorUserId: string;
+    },
+  ): Promise<string[]> {
+    const { workspaceId, providerRuleId, connectionId } = input;
+    const requested = [...new Set(input.channelIds)];
+    const live = await transaction.inboundWebhookChannel.findMany({
+      where: {
+        workspaceId,
+        connectionId,
+        id: { in: requested },
+        connection: { is: { workspaceId, removedAt: null } },
+      },
+      select: {
+        id: true,
+        connectedPhone: true,
+        status: true,
+        whatsappInstance: { select: { status: true } },
+      },
+    });
+    // nod: a Uazapi/WAHA number deleted in Integrations keeps its bridge
+    // connection (only the WhatsappInstance is suspended). It is skipped here
+    // (never activated) but its scope row is kept: reconnecting the same
+    // WhatsApp connection brings it back.
+    const suspendedIds = new Set(
+      live
+        .filter((channel) => channel.whatsappInstance?.status === "suspended")
+        .map((channel) => channel.id),
+    );
+
+    const liveIds = new Set(live.map((channel) => channel.id));
+    const orphanIds = requested.filter((channelId) => !liveIds.has(channelId));
+
+    const discoveredPhones = [
+      ...new Set(
+        live
+          .filter(
+            (channel) =>
+              channel.status === "discovered" && channel.connectedPhone,
+          )
+          .map((channel) => channel.connectedPhone),
+      ),
+    ];
+    const activeSiblings =
+      discoveredPhones.length === 0
+        ? []
+        : await transaction.inboundWebhookChannel.findMany({
+            where: {
+              workspaceId,
+              connectionId,
+              status: "active",
+              connectedPhone: { in: discoveredPhones },
+              connection: { is: { workspaceId, removedAt: null } },
+            },
+            select: { id: true, connectedPhone: true },
+            orderBy: { id: "asc" },
+          });
+    const activeSiblingByPhone = new Map<string, string>();
+    for (const sibling of activeSiblings) {
+      if (!activeSiblingByPhone.has(sibling.connectedPhone)) {
+        activeSiblingByPhone.set(sibling.connectedPhone, sibling.id);
+      }
+    }
+    const replacements = new Map<string, string>();
+    for (const channel of live) {
+      const activeSibling =
+        channel.status === "discovered"
+          ? activeSiblingByPhone.get(channel.connectedPhone)
+          : undefined;
+      if (activeSibling && activeSibling !== channel.id) {
+        replacements.set(channel.id, activeSibling);
+      }
+    }
+    const resolvedIds = [
+      ...new Set(
+        requested
+          .filter(
+            (channelId) => liveIds.has(channelId) && !suspendedIds.has(channelId),
+          )
+          .map((channelId) => replacements.get(channelId) ?? channelId),
+      ),
+    ];
+
+    if (orphanIds.length > 0) {
+      await this.dropOrphanChannelScopes(transaction, {
+        workspaceId,
+        providerRuleId,
+        connectionId,
+        orphanIds,
+        remainingChannelIds: [...liveIds],
+        actorUserId: input.actorUserId,
+      });
+    }
+
+    if (replacements.size > 0) {
+      const staleIds = [...replacements.keys()];
+      await transaction.providerConversionRuleChannel.deleteMany({
+        where: {
+          workspaceId,
+          providerRuleId,
+          channelId: { in: staleIds },
+        },
+      });
+      const requestedSet = new Set(requested);
+      const replacementIds = [...new Set(replacements.values())].filter(
+        (channelId) => !requestedSet.has(channelId),
+      );
+      if (replacementIds.length > 0) {
+        await transaction.providerConversionRuleChannel.createMany({
+          data: replacementIds.map((channelId) => ({
+            workspaceId,
+            providerRuleId,
+            channelId,
+          })),
+          // nod: the sibling may already be on the rule without being in the
+          // requested list (an edit that sent a partial list).
+          skipDuplicates: true,
+        });
+      }
+      await this.createAudit(transaction, {
+        workspaceId,
+        actorUserId: input.actorUserId,
+        action: "provider_conversion_rule.channel_scope_remapped",
+        targetId: providerRuleId,
+        resultStatus: "remapped",
+        afterSummary: {
+          connectionId,
+          remappedChannels: [...replacements].map(
+            ([fromChannelId, toChannelId]) => ({
+              fromChannelId,
+              toChannelId,
+            }),
+          ),
+          remainingChannelIds: resolvedIds,
+        },
+      });
+    }
+
+    if (resolvedIds.length === 0) {
+      throw new ConflictException(
+        "Nenhum número válido na conexão da regra; reconecte o WhatsApp ou selecione outro número",
+      );
+    }
+
+    return resolvedIds;
+  }
+
+  /** Deletes orphan rule -> channel scope rows, audited (porte do #66). */
+  private async dropOrphanChannelScopes(
+    transaction: Prisma.TransactionClient,
+    input: {
+      workspaceId: string;
+      providerRuleId: string;
+      connectionId: string | null;
+      orphanIds: string[];
+      remainingChannelIds: string[];
+      actorUserId: string;
+    },
+  ): Promise<void> {
+    await transaction.providerConversionRuleChannel.deleteMany({
+      where: {
+        workspaceId: input.workspaceId,
+        providerRuleId: input.providerRuleId,
+        channelId: { in: input.orphanIds },
+      },
+    });
+    await this.createAudit(transaction, {
+      workspaceId: input.workspaceId,
+      actorUserId: input.actorUserId,
+      action: "provider_conversion_rule.channel_scope_pruned",
+      targetId: input.providerRuleId,
+      resultStatus: "pruned",
+      afterSummary: {
+        connectionId: input.connectionId,
+        prunedChannelIds: input.orphanIds,
+        remainingChannelIds: input.remainingChannelIds,
+      },
     });
   }
 
@@ -3211,7 +4246,7 @@ export class ProviderConversionRulesService {
   }
 
   /**
-   * A Payt callback is not itself a WhatsApp channel. Its automation rule may
+   * A sales-platform callback (Payt, Braip) is not itself a WhatsApp channel. Its automation rule may
    * scope any channel of the workspace; the selected channels still scope
    * lookup and observation. Other providers keep the stricter connection
    * ownership check.
@@ -3223,7 +4258,7 @@ export class ProviderConversionRulesService {
     provider: string,
     channelIds: string[],
   ): Promise<void> {
-    if (provider !== "payt") {
+    if (!isSalesPlatformProvider(provider)) {
       return this.assertChannelsBelongToConnection(
         transaction,
         workspaceId,
@@ -3243,11 +4278,30 @@ export class ProviderConversionRulesService {
     }
   }
 
-  private isPaytAutomationRule(rule: PersistedProviderRule): boolean {
+  /** Fase 6.8: ROI Chat purchase rule (its parser release names the provider). */
+  private isRoichatPurchaseRule(rule: {
+    conversionRule: { triggerType: string };
+    parserRelease?: { provider: string } | null;
+  }): boolean {
     return (
       rule.conversionRule.triggerType === "provider_automation" &&
-      rule.parserRelease?.provider === "payt"
+      rule.parserRelease?.provider === "roichat"
     );
+  }
+
+  /** Sales-platform rule (Payt, Braip): its parser release names it. */
+  private isPaytAutomationRule(rule: PersistedProviderRule): boolean {
+    return this.salesPlatformOfRule(rule) !== null;
+  }
+
+  private salesPlatformOfRule(
+    rule: PersistedProviderRule,
+  ): SalesPlatformProviderDto | null {
+    const provider = rule.parserRelease?.provider;
+    return rule.conversionRule.triggerType === "provider_automation" &&
+      isSalesPlatformProvider(provider)
+      ? provider
+      : null;
   }
 
   private messagePhraseConfig(input: {
@@ -3326,7 +4380,9 @@ export class ProviderConversionRulesService {
     if (
       isValuedRule &&
       input.defaultValueCents === null &&
-      nextValueMode !== "message_extracted"
+      nextValueMode !== "message_extracted" &&
+      // ROI Chat: the sale carries its value; the rule's is only a fallback.
+      !this.isRoichatPurchaseRule(current)
     ) {
       throw new BadRequestException(
         "Regras com valor fixo precisam manter um valor positivo",
@@ -3578,6 +4634,7 @@ export class ProviderConversionRulesService {
     client: Pick<Prisma.TransactionClient, "providerConversionRuleConfig">,
     workspaceId: string,
     providerRuleId: string,
+    options: { includeRemovedConnection?: boolean } = {},
   ): Promise<PersistedProviderRule> {
     const rule = await client.providerConversionRuleConfig.findFirst({
       where: {
@@ -3585,11 +4642,16 @@ export class ProviderConversionRulesService {
         workspaceId,
         removedAt: null,
         // Bound rules disappear with their connection; unbound rules belong
-        // to the workspace.
-        OR: [
-          { connectionId: null },
-          { connection: { is: { removedAt: null } } },
-        ],
+        // to the workspace. Deleting is the exception (#161): the list still
+        // shows "Número removido" rules and they must be deletable.
+        ...(options.includeRemovedConnection
+          ? {}
+          : {
+              OR: [
+                { connectionId: null },
+                { connection: { is: { removedAt: null } } },
+              ],
+            }),
       },
       include: providerRuleInclude,
     });
@@ -3660,6 +4722,8 @@ export class ProviderConversionRulesService {
       observationCanonicalChannels: effective.observationCanonicalChannels,
       globalPrecedence: PROVIDER_RULE_GLOBAL_PRECEDENCE,
       unifiedIntoRuleId: rule.unifiedIntoProviderRuleId ?? null,
+      numberRemoved: providerRuleNumberRemoved(rule),
+      crossConnectionScope: rule.crossConnectionScope === true,
       ...(scope === "all_numbers"
         ? { pendingNumbers: pendingNumbers ?? [] }
         : {}),
@@ -3669,7 +4733,9 @@ export class ProviderConversionRulesService {
       exampleMessage: messagePhrase.exampleMessage,
       // The parser release is stored with the rule, so this remains available
       // after a connection changes and does not require a new database column.
-      automationSource: this.isPaytAutomationRule(rule) ? "payt" : null,
+      automationSource:
+        this.salesPlatformOfRule(rule) ??
+        (this.isRoichatPurchaseRule(rule) ? "roichat" : null),
       productFilterCodes: rule.productFilterCodes ?? [],
       endpoint: rule.endpoint ? this.endpointToDto(rule.endpoint) : null,
       catalog: rule.catalog ? this.catalogToDto(rule.catalog) : null,
@@ -3826,6 +4892,7 @@ export class ProviderConversionRulesService {
       triggerType: rule.conversionRule.triggerType,
       connectionId: rule.connectionId,
       scope: providerRuleScope(rule),
+      crossConnectionScope: rule.crossConnectionScope === true,
       channelCount: rule.channels.length,
       mode: rule.mode,
       active: rule.conversionRule.active,

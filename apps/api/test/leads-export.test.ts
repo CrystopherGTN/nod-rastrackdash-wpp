@@ -413,6 +413,9 @@ function createPrisma(leads: PrismaLead[]) {
       findMany: vi.fn(async () => [
         { leadId: "lead_00001", eventName: "Purchase" },
       ]),
+      // Report mode lookup ("Lead recebido pela regra", on by default in the
+      // nod): no deferred receipt, so the export behaves as before.
+      findFirst: vi.fn(async () => null),
     },
     metaCampaign: {
       findMany: vi.fn(async () => [
@@ -499,6 +502,61 @@ describe("leads service export", () => {
         id: { in: expect.any(Array) },
       });
     }
+  });
+
+  it("6.3b: exports only the leads of the filtered WhatsApp number, like the list", async () => {
+    const prisma = {
+      ...createPrisma(createLeads(3)),
+      whatsappInstance: {
+        findFirst: vi.fn(async () => ({ id: "connection_1" })),
+      },
+    };
+    const service = new LeadsService(prisma as never);
+    const filters = {
+      whatsappInstanceId: "connection_1",
+      since: "2026-07-01",
+      until: "2026-07-02",
+    };
+
+    const { batches } = await service.prepareLeadExport("workspace_1", filters);
+    await drain(batches);
+    const exportWhere = (
+      prisma.lead.findMany.mock.calls[0] as unknown as [
+        { where: Record<string, unknown> },
+      ]
+    )[0].where;
+
+    await service.listLeadsPage("workspace_1", { ...filters, pageSize: 25 });
+    const listWhere = (
+      prisma.lead.findMany.mock.calls.at(-1) as unknown as [
+        { where: Record<string, unknown> },
+      ]
+    )[0].where;
+
+    expect(prisma.whatsappInstance.findFirst).toHaveBeenCalledWith({
+      where: { id: "connection_1", workspaceId: "workspace_1" },
+      select: { id: true },
+    });
+    expect(exportWhere).toMatchObject({
+      workspaceId: "workspace_1",
+      whatsappInstanceId: "connection_1",
+    });
+    expect(exportWhere).toEqual(listWhere);
+  });
+
+  it("6.3b: refuses to export a WhatsApp number of another workspace", async () => {
+    const prisma = {
+      ...createPrisma(createLeads(3)),
+      whatsappInstance: { findFirst: vi.fn(async () => null) },
+    };
+    const service = new LeadsService(prisma as never);
+
+    await expect(
+      service.prepareLeadExport("workspace_1", {
+        whatsappInstanceId: "foreign_connection",
+      }),
+    ).rejects.toThrow("Número WhatsApp não encontrado");
+    expect(prisma.lead.findMany).not.toHaveBeenCalled();
   });
 
   it("keeps the snapshot order and never repeats or loses a lead", async () => {
@@ -669,7 +727,7 @@ describe("GET /leads/export", () => {
 
     const response = await request(app.getHttpServer())
       .get(
-        "/leads/export?format=csv&search=mari&status=qualified&eventName=QualifiedLead&attribution=paid&since=2026-09-01&until=2026-09-24&campaignId=cmp_1&maskSensitive=1&page=3&pageSize=25",
+        "/leads/export?format=csv&search=mari&status=qualified&eventName=QualifiedLead&attribution=paid&since=2026-09-01&until=2026-09-24&campaignId=cmp_1&whatsappInstanceId=connection_1&maskSensitive=1&page=3&pageSize=25",
       )
       .set("Authorization", "Bearer refresh-token")
       .buffer(true)
@@ -699,6 +757,7 @@ describe("GET /leads/export", () => {
       since: "2026-09-01",
       until: "2026-09-24",
       campaignId: "cmp_1",
+      whatsappInstanceId: "connection_1",
       maskSensitive: true,
     });
 

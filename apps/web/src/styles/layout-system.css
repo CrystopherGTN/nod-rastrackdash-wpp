@@ -882,65 +882,56 @@ body {
   outline-offset: 2px;
 }
 
-/* Short definition under the label, inside the tile so it never overflows. */
+/*
+ * Short definition under the label, IN the tile flow: when open it pushes the
+ * number down instead of covering it, and wraps inside the tile width, so it
+ * never overlaps a value nor overflows the card edge (longer texts too).
+ */
+.overview-leads-block-item dt {
+  flex-wrap: wrap;
+}
+
 .overview-leads-hint-text {
-  position: absolute;
-  z-index: 5;
-  top: 40px;
-  right: 10px;
-  left: 10px;
+  display: none;
+  flex: 1 0 100%;
+  box-sizing: border-box;
+  max-width: 100%;
+  margin-top: 4px;
   padding: 10px 12px;
   border: 1px solid var(--border-strong);
   border-radius: 6px;
   background: var(--graphite-850);
-  box-shadow: var(--shadow);
   color: var(--ink-soft);
   font-family: var(--font-body);
   font-size: 12px;
   font-weight: 500;
   line-height: 1.45;
   text-transform: none;
-  opacity: 0;
-  pointer-events: none;
-  transform: translateY(-4px);
-  transition:
-    opacity 120ms ease,
-    transform 120ms ease;
+  overflow-wrap: anywhere;
 }
 
-.overview-leads-block-item:first-child .overview-leads-hint-text {
-  left: 0;
-}
-
+/* The wrapper only groups button + text for the outside-tap check. */
 .overview-leads-hint-wrap {
-  display: inline-flex;
-  flex: 0 0 auto;
+  display: contents;
 }
 
 /* Tap toggles aria-expanded (iOS never hovers/focuses a tapped button). */
 .overview-leads-hint[aria-expanded="true"] + .overview-leads-hint-text,
 .overview-leads-hint:focus-visible + .overview-leads-hint-text {
-  opacity: 1;
-  transform: none;
+  display: block;
 }
 
 @media (hover: hover) {
   .overview-leads-hint:hover + .overview-leads-hint-text {
-    opacity: 1;
-    transform: none;
+    display: block;
   }
 }
 
-.daily-comparison-legend i.returning,
-.daily-bar.returning {
-  fill: var(--cyan);
-  background: var(--cyan);
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .overview-leads-hint-text {
-    transition: none;
-  }
+/* Leads (evento Lead enviado): only with the Lead deferred to a rule. */
+.daily-comparison-legend i.lead,
+.daily-bar.lead {
+  fill: var(--amber);
+  background: var(--amber);
 }
 
 .conversion-funnel-heading {
@@ -1571,7 +1562,8 @@ body {
 
 .report-control-center {
   padding: 0;
-  overflow: hidden;
+  /* visible: the ad account popover opens over the panel edge, uncut. */
+  overflow: visible;
 }
 
 .report-results-heading {
@@ -1600,35 +1592,69 @@ body {
   gap: 3px;
 }
 
-.report-context-tags,
 .report-command-actions {
   display: flex;
   min-width: 0;
   flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
-  gap: 8px;
+  gap: 10px;
 }
 
-.report-command-body {
+/*
+ * Single control toolbar split into three labelled groups: periodo, escopo and
+ * acoes. Grid areas keep the acoes cluster right-aligned on desktop while the
+ * responsive stack still reads periodo -> escopo -> acoes.
+ */
+.report-toolbar {
   display: grid;
   min-width: 0;
   grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "period actions"
+    "scope scope";
+}
+
+.report-toolbar-group {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 14px;
+  gap: 12px;
+}
+
+.report-group-label {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.report-toolbar-period {
+  grid-area: period;
   padding: 12px 14px;
   border-bottom: 1px solid var(--border);
 }
 
-.report-period-form {
+.report-toolbar-actions {
+  grid-area: actions;
+  justify-content: flex-end;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+  border-left: 1px solid var(--border);
+}
+
+.report-toolbar-scope {
   display: grid;
   min-width: 0;
-  grid-template-columns:
-    auto
-    repeat(2, minmax(132px, 170px))
-    auto;
-  align-items: end;
-  gap: 8px;
+  grid-area: scope;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.report-period-form {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
 }
 
 .report-period-context {
@@ -1637,6 +1663,19 @@ body {
   align-items: center;
   gap: 9px;
   padding-right: 3px;
+}
+
+/* Inicio/Fim read as one segment instead of two loose fields. */
+.report-period-range {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(2, minmax(126px, 168px));
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.02);
 }
 
 .report-period-context svg {
@@ -1712,14 +1751,6 @@ body {
   font-size: 12px;
 }
 
-.report-command-meta {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 12px;
-}
-
 .report-command-actions .button,
 .report-command-actions form,
 .report-command-actions form > div {
@@ -1733,24 +1764,35 @@ body {
   white-space: nowrap;
 }
 
-.report-analysis-controls {
+/* The Meta sync window is a hint on the action, not a floating "Meta:" tag. */
+.report-sync-action {
   display: grid;
   min-width: 0;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: start;
+  justify-items: end;
+  gap: 4px;
+}
+
+.report-sync-hint {
+  color: var(--ink-muted);
+  cursor: help;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 800;
+  line-height: 1;
+  white-space: nowrap;
 }
 
 .report-analysis-switcher {
   display: flex;
   min-width: 0;
-  min-height: 56px;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
-  padding: 10px 12px;
-  border-right: 1px solid var(--border);
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
 }
 
-.report-analysis-switcher > .tag {
+.report-scope-count {
   flex: 0 0 auto;
   white-space: nowrap;
 }
@@ -1768,8 +1810,17 @@ body {
 }
 
 .report-selection-toolbar {
-  padding-left: 8px;
+  padding-left: 10px;
   border-left: 1px solid var(--border);
+}
+
+/* Keeps the destructive clear control away from "Filtrar por seleção". */
+.report-selection-divider {
+  width: 1px;
+  height: 20px;
+  flex: 0 0 auto;
+  margin-inline: 2px;
+  background: var(--border);
 }
 
 .report-selection-count {
@@ -1832,14 +1883,14 @@ body {
   line-height: 1.15;
 }
 
-.report-analysis-controls .report-view-tabs {
+.report-toolbar-scope .report-view-tabs {
   display: inline-flex;
   width: auto;
   padding: 2px;
   border-radius: 7px;
 }
 
-.report-analysis-controls .report-view-tabs a {
+.report-toolbar-scope .report-view-tabs a {
   justify-content: center;
   min-height: 32px;
   padding: 5px 10px;
@@ -1860,9 +1911,9 @@ body {
     minmax(150px, 1fr)
     auto
     auto;
-  align-items: start;
+  align-items: center;
   gap: 8px;
-  padding: 10px 12px;
+  padding: 10px 14px;
 }
 
 .report-filter-primary .filter-control,
@@ -2281,33 +2332,27 @@ body {
 }
 
 @media (max-width: 1280px) {
-  .report-command-body {
+  .report-toolbar {
     grid-template-columns: minmax(0, 1fr);
-    align-items: stretch;
+    grid-template-areas:
+      "period"
+      "scope"
+      "actions";
   }
 
-  .report-command-meta {
-    justify-content: space-between;
-  }
-
-  .report-analysis-controls {
-    grid-template-columns: minmax(0, 1fr);
+  .report-toolbar-actions {
+    justify-content: flex-start;
+    border-top: 1px solid var(--border);
+    border-bottom: 0;
+    border-left: 0;
   }
 
   .report-analysis-switcher {
-    min-height: 0;
-    justify-content: space-between;
     padding-block: 8px;
-    border-right: 0;
-    border-bottom: 1px solid var(--border);
   }
 }
 
 @media (max-width: 1080px) {
-  .report-command-meta {
-    align-items: flex-start;
-  }
-
   .report-filter-primary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -2342,41 +2387,51 @@ body {
     flex-direction: column;
   }
 
-  .report-command-body,
+  .report-toolbar-period,
+  .report-toolbar-actions,
+  .report-analysis-switcher,
   .report-filter-primary {
     padding-inline: 16px;
   }
 
-  .report-context-tags,
-  .report-command-actions {
-    justify-content: flex-start;
-  }
-
-  .report-command-meta {
+  .report-toolbar-period,
+  .report-toolbar-actions {
     align-items: stretch;
     flex-direction: column;
   }
 
+  .report-command-actions {
+    justify-content: flex-start;
+  }
+
   .report-period-form {
+    align-items: stretch;
+    flex-direction: column;
     width: 100%;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .report-period-context {
-    grid-column: 1 / -1;
     min-width: 0;
   }
 
+  .report-period-range {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .report-period-form .button {
-    grid-column: 1 / -1;
     width: 100%;
   }
 
   .report-command-actions,
   .report-command-actions form,
   .report-command-actions form > div,
-  .report-command-actions .button {
+  .report-command-actions .button,
+  .report-sync-action {
     width: 100%;
+  }
+
+  .report-sync-action {
+    justify-items: center;
   }
 
   .report-analysis-switcher {
@@ -2395,7 +2450,7 @@ body {
     border-left: 0;
   }
 
-  .report-analysis-controls .report-view-tabs {
+  .report-toolbar-scope .report-view-tabs {
     display: grid;
     width: 100%;
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -2608,19 +2663,11 @@ body {
 }
 
 @media (max-width: 460px) {
-  .report-period-form {
+  .report-period-range {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .report-period-context {
-    grid-column: auto;
-  }
-
-  .report-period-form .button {
-    grid-column: auto;
-  }
-
-  .report-analysis-controls .report-view-tabs a,
+  .report-toolbar-scope .report-view-tabs a,
   .report-metric-tabs a {
     padding-inline: 7px;
     font-size: 11px;
@@ -4137,6 +4184,67 @@ body {
 
 .whatsapp-instance-panel .metric-grid.compact {
   margin-top: 14px;
+}
+
+.inbound-counter.unmeasured strong {
+  color: var(--ink-muted);
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.inbound-counter-note {
+  margin: 0;
+  font-size: 12px;
+}
+
+.inbound-instance-activity {
+  display: grid;
+  gap: 8px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.whatsapp-instance-activity {
+  display: grid;
+  min-width: 180px;
+  justify-items: start;
+  gap: 8px;
+}
+
+.whatsapp-instance-activity p {
+  margin: 0;
+  font-size: 12px;
+}
+
+.whatsapp-instance-activity-counts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, auto));
+  gap: 4px 16px;
+  margin: 0;
+}
+
+.whatsapp-instance-activity-counts div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.whatsapp-instance-activity-counts dt {
+  color: var(--ink-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.whatsapp-instance-activity-counts dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+  font-weight: 800;
+}
+
+.whatsapp-instance-activity small {
+  color: var(--ink-muted);
 }
 
 .integration-flow-content {
@@ -5885,6 +5993,10 @@ body {
   .app-modal-body {
     padding: 16px;
   }
+
+.whatsapp-instance-activity-counts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -6216,6 +6328,19 @@ body {
   display: none;
 }
 
+/* "Substitui envio na entrada": stays inside the Evento cell and wraps. */
+.conversion-rule-cell .tag {
+  max-width: 100%;
+  min-height: 0;
+  padding: 3px 8px;
+  border-radius: 8px;
+  font-size: 10px;
+  line-height: 1.35;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 .conversion-scope-all {
   color: var(--mint);
   font-weight: 800;
@@ -6233,18 +6358,36 @@ body {
   gap: 6px;
 }
 
+/* One compact line per note (scope, duplicates, overrides), secondary text
+   with readable contrast; never a single low-contrast dashed box. */
 .conversion-rule-notes {
   display: grid;
   grid-column: 1 / -1;
   gap: 4px;
   margin: 2px 0 0;
-  padding: 8px 10px;
-  border: 1px dashed rgba(242, 193, 78, 0.35);
-  border-radius: 8px;
+  padding: 0;
   color: var(--ink-soft);
-  font-size: 12px;
+  font-size: 12.5px;
   line-height: 1.45;
   list-style: none;
+}
+
+.conversion-rule-notes li {
+  padding: 6px 10px;
+  border-left: 2px solid rgba(242, 193, 78, 0.7);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--ink-soft);
+}
+
+/* "Número removido": a callout (warn tone, readable contrast) across the row. */
+.conversion-rule-warning {
+  grid-column: 1 / -1;
+  padding: 10px 12px;
+}
+
+.conversion-rule-warning span {
+  color: var(--ink-soft);
 }
 
 /* "Todos os números": números que ainda não enviam (mesmo tom de aviso das
@@ -6762,6 +6905,12 @@ body {
   gap: 10px;
 }
 
+.single-url-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .conversion-webhook-url .conversion-field,
 .conversion-webhook-url .provider-conversion-payload-helper {
   width: 100%;
@@ -6789,6 +6938,77 @@ body {
 
 .conversion-review-block p {
   margin: 0;
+}
+
+/* Unificar (automações): each rule with its mode and value; the one that
+   prevails is highlighted. Scrolls sideways on a phone instead of the page. */
+.conversion-unify-members-scroll {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.conversion-unify-members {
+  width: 100%;
+  min-width: 520px;
+  border-collapse: collapse;
+  font-family: var(--font-body);
+  font-size: 13px;
+}
+
+.conversion-unify-members th,
+.conversion-unify-members td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--ink-soft);
+  font-family: var(--font-body);
+  text-align: left;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+/* "Regra" takes the room; the name wraps, the chip stays beside it. */
+.conversion-unify-members td:first-child {
+  width: 100%;
+  white-space: normal;
+}
+
+.conversion-unify-member-name {
+  margin-right: 8px;
+}
+
+.conversion-unify-members .status-chip {
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.conversion-unify-members th {
+  color: var(--ink-muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.conversion-unify-members tr.is-target td {
+  color: var(--ink);
+  font-weight: 700;
+}
+
+/* "Entendi quais valores vão valer": design-system checkbox row, inline. */
+.conversion-unify-ack {
+  align-items: center;
+  justify-self: start;
+  margin-top: 6px;
+}
+
+/* Disabled "Unificar" reads as disabled: neutral, not-allowed. */
+.conversion-unify-review .button.primary:disabled {
+  border-color: var(--border);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--ink-muted);
+  opacity: 1;
+  cursor: not-allowed;
+  box-shadow: none;
 }
 
 .conversion-number-chips {
@@ -6906,7 +7126,10 @@ body {
   width: 100%;
 }
 
-@media (max-width: 1100px) {
+/* The fixed sidebar eats ~280px, so 1480px of window is ~1200px of content:
+   below that the 5-column row is too tight (badge/actions overlap or clip).
+   Switch to the card layout: facts in 3 columns, actions on their own line. */
+@media (max-width: 1480px) {
   .conversion-rule-head {
     display: none;
   }
@@ -6958,6 +7181,7 @@ body {
   }
 
   /* Notes right under the facts, actions last, in one compact row. */
+  .conversion-rule-warning,
   .conversion-rule-notes {
     order: 1;
   }
@@ -7543,6 +7767,83 @@ body {
   accent-color: var(--mint);
 }
 
+/* Excluir regras em lote: caixa por linha, barra de ações e confirmação. */
+.conversion-rule-main.has-select {
+  grid-template-columns: auto auto minmax(0, 1fr);
+}
+
+.conversion-rule-select {
+  width: 18px;
+  height: 18px;
+  margin: 11px 0 0;
+  accent-color: var(--mint);
+  cursor: pointer;
+}
+
+.conversion-bulk-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+
+.conversion-bulk-toolbar:empty {
+  display: none;
+}
+
+.conversion-bulk-count {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.conversions-hide-unified {
+  align-self: end;
+}
+
+.conversion-bulk-list {
+  display: grid;
+  gap: 8px;
+  max-height: min(52vh, 440px);
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.conversion-bulk-item {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.conversion-bulk-item small {
+  color: var(--ink-muted);
+  font-size: 12px;
+}
+
+.conversion-bulk-delete {
+  justify-items: stretch;
+}
+
+.conversion-bulk-list {
+  width: 100%;
+}
+
+.conversion-bulk-item .conversion-bulk-warning {
+  margin: 4px 0 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(245, 185, 66, 0.55);
+  border-radius: 8px;
+  background: rgba(245, 185, 66, 0.12);
+  color: #f5c76a;
+  font-size: 13px;
+  font-weight: 700;
+}
+
 @media (max-width: 640px) {
   .single-url-products .conversion-field-row {
     grid-template-columns: minmax(0, 1fr);
@@ -7552,4 +7853,184 @@ body {
 .conversions-unattributed h2 {
   margin: 0 0 8px;
   font-size: 1rem;
+}
+
+/* Fase 6.5 (porte do SaaS #169): "Ver dados recebidos" das vendas. */
+.single-url-list-item > .unattributed-sale-payload {
+  flex: 1 1 100%;
+}
+
+.unattributed-sale-payload {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+}
+
+.unattributed-sale-parsed {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 6px 12px;
+  margin: 0;
+}
+
+.unattributed-sale-parsed > div {
+  min-width: 0;
+}
+
+.unattributed-sale-parsed dt {
+  font-size: 0.8rem;
+  opacity: 0.75;
+}
+
+.unattributed-sale-parsed dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+/* Backoffice "Recebimentos das URLs únicas": table on desktop, cards on phones. */
+.integration-receipts-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: flex-end;
+}
+
+.integration-receipts-filter .filter-field {
+  flex: 1 1 160px;
+  min-width: 0;
+}
+
+.integration-receipts-section {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.integration-receipts-table table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.integration-receipts-table th,
+.integration-receipts-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+  font-size: 13px;
+}
+
+.integration-receipts-table tr.open > td {
+  border-bottom: 0;
+}
+
+.integration-receipt-client,
+.integration-receipt-result,
+.integration-receipt-actions {
+  display: grid;
+  gap: 4px;
+  justify-items: start;
+  min-width: 0;
+}
+
+.integration-receipt-client small {
+  overflow-wrap: anywhere;
+}
+
+.integration-receipt-result small {
+  max-width: 260px;
+  overflow-wrap: anywhere;
+}
+
+.integration-receipt-detail > td {
+  background: var(--surface);
+}
+
+.integration-receipt-payload {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.integration-receipt-payload .unattributed-sale-payload {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
+}
+
+.integration-receipt-payload .payload-block {
+  max-height: 420px;
+  overflow: auto;
+}
+
+@media (max-width: 900px) {
+  .integration-receipt-payload .unattributed-sale-payload {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .integration-receipts-table {
+    overflow: visible;
+  }
+
+  .integration-receipts-table :is(table, tbody, tr, td) {
+    display: block;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .integration-receipts-table thead {
+    display: none;
+  }
+
+  .integration-receipts-table tr {
+    padding: 12px 12px 8px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .integration-receipts-table tr.open {
+    border-bottom: 0;
+  }
+
+  .integration-receipts-table td {
+    display: grid;
+    grid-template-columns: 112px minmax(0, 1fr);
+    gap: 2px 10px;
+    padding: 4px 0;
+    border: 0;
+  }
+
+  .integration-receipts-table td::before {
+    content: attr(data-label);
+    color: var(--ink-muted);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-transform: uppercase;
+  }
+
+  .integration-receipts-table td > * {
+    grid-column: 2;
+  }
+
+  .integration-receipts-table td[data-label="Ações"],
+  .integration-receipts-table td[data-label="Dados recebidos"] {
+    grid-template-columns: minmax(0, 1fr);
+    padding-top: 8px;
+  }
+
+  .integration-receipts-table td[data-label="Ações"]::before,
+  .integration-receipts-table td[data-label="Dados recebidos"]::before {
+    display: none;
+  }
+
+  .integration-receipts-table td[data-label="Ações"] > *,
+  .integration-receipts-table td[data-label="Dados recebidos"] > * {
+    grid-column: 1;
+  }
+
+  .integration-receipt-actions,
+  .integration-receipt-actions .button {
+    width: 100%;
+  }
+
+  .integration-receipt-detail > td {
+    padding: 10px;
+    border-radius: 10px;
+  }
 }

@@ -17,7 +17,11 @@ import type {
   InboundWebhookConnectionStatusUpdateInputDto,
   InboundWebhookCapabilitiesDto,
 } from "@wpptrack/shared";
-import { inboundWebhookProviders } from "@wpptrack/shared";
+import {
+  inboundWebhookProviders,
+  isSalesPlatformProvider,
+  salesPlatformLabels,
+} from "@wpptrack/shared";
 import { PrismaService } from "../common/prisma/prisma.service";
 import { RUNTIME_ENV, type RuntimeEnv } from "../common/runtime/runtime.module";
 import { parseInboundWebhooksConfig } from "../config/deployment-config";
@@ -33,8 +37,26 @@ import {
   requireInboundWebhookConnection,
 } from "./inbound-webhook-production-activation";
 import { UazapiConversionBridgeService } from "./uazapi-conversion-bridge.service";
+import {
+  type BridgedWhatsappProvider,
+  isBridgedWhatsappProvider,
+} from "./bridged-whatsapp-providers";
+
+/**
+ * Porte do #105 do SaaS, com a ponte WAHA: a conexão-ponte de uma conexão
+ * WhatsApp (Uazapi/WAHA) recebe pelo webhook da instância, não por esta URL.
+ * Gerar URL aqui não ajuda e confunde: bloqueado.
+ */
+const bridgeSecretRotationBlockedMessage =
+  "Conexões Uazapi e WAHA recebem pelo webhook da própria conexão WhatsApp. Não gere URL aqui: confira o webhook da conexão WhatsApp em Integrações.";
 import { effectiveInboundParserStatus } from "./inbound-webhook-parser-eligibility";
+import {
+  bornChannelState,
+  bornConnectionStatus,
+  productionDirectEligible,
+} from "./production-direct";
 import { normalizePhoneIdentity } from "../common/phone/phone-identity";
+import { reanchorSpanningAutomationRules } from "../conversion-rules/provider-rule-reanchor";
 
 const parserVersion = "v1";
 
@@ -53,7 +75,9 @@ type UnnichatConnectionBind = {
 function resolveUnnichatConnectionBind(
   input: InboundWebhookConnectionCreateInputDto,
 ): UnnichatConnectionBind | null {
-  if (input.provider !== "unnichat") return null;
+  // Fase 6.8 (porte do #183): ROI Chat is bound the same way (one connection
+  // = one client number = one URL); a URL only ever attributes to its number.
+  if (input.provider !== "unnichat" && input.provider !== "roichat") return null;
   const connectedPhone = input.connectedPhone
     ? normalizePhoneIdentity(input.connectedPhone)
     : undefined;
@@ -95,13 +119,19 @@ export class InboundWebhookConnectionsService {
       productionEnabled: config.enabled && config.productionEnabled,
       // UAZAPI/NOD is bridged automatically from the WhatsApp instance and
       // never goes through the generic manual creation flow. Payt is a sales
-      // platform with no WhatsApp number: its rules live in Conversoes.
+      // platform with no WhatsApp number: its rules live in Conversoes; so is
+      // Braip (6.5) and Yampi (6.7), reached only by the workspace integration
+      // URL (hub).
       // WAHA is a WhatsApp connection (Integrações → WhatsApp) whose own
       // receiver uses the waha parser release; it has no generic connection.
       providers: inboundWebhookProviders
         .filter(
           (provider) =>
-            provider !== "uazapi" && provider !== "payt" && provider !== "waha",
+            provider !== "uazapi" &&
+            provider !== "payt" &&
+            provider !== "braip" &&
+            provider !== "yampi" &&
+            provider !== "waha",
         )
         .map((provider) => {
           const release = releaseByProvider.get(provider);
@@ -149,6 +179,18 @@ export class InboundWebhookConnectionsService {
       workspaceId,
       connectionId,
     );
+
+    // Porte do #103 do SaaS, com a ponte WAHA: a ponte Uazapi/WAHA não usa o
+    // pipeline genérico de observação. O CTWA vira lead direto pelo webhook
+    // da instância, então ler InboundWebhookEvent mostraria a conexão vazia.
+    if (isBridgedWhatsappProvider(connection.provider)) {
+      return this.getBridgeOverview(
+        workspaceId,
+        connection,
+        connection.provider,
+      );
+    }
+
     const [eventCounts, deliveries] = await Promise.all([
       this.prisma.inboundWebhookEvent.groupBy({
         by: ["classification"],
@@ -174,11 +216,12 @@ export class InboundWebhookConnectionsService {
     const countsByClassification = new Map(
       eventCounts.map((row) => [row.classification, row._count._all]),
     );
-    // Fase 4b: the Unnichat sale automation has its own parser release.
+    // Fase 4b: the Unnichat sale automation has its own parser release (and,
+    // since 6.8, the ROI Chat purchase received on the number URL).
     const automationParserRelease =
-      connection.provider === "unnichat"
+      connection.provider === "unnichat" || connection.provider === "roichat"
         ? await this.prisma.inboundWebhookParserRelease.findFirst({
-            where: { provider: "unnichat", version: "automation-v1" },
+            where: { provider: connection.provider, version: "automation-v1" },
             select: { id: true, version: true, status: true },
           })
         : undefined;
@@ -205,6 +248,63 @@ export class InboundWebhookConnectionsService {
     };
   }
 
+  private async getBridgeOverview(
+    workspaceId: string,
+    connection: PersistedInboundWebhookConnection,
+    provider: BridgedWhatsappProvider,
+  ): Promise<InboundWebhookConnectionOverviewDto> {
+    const empty = {
+      eligibleRouted: 0,
+      eligibleUnresolved: 0,
+      ignoredNoCtwa: 0,
+      duplicate: 0,
+      invalid: 0,
+    };
+    const channel = await this.prisma.inboundWebhookChannel.findFirst({
+      where: {
+        workspaceId,
+        connectionId: connection.id,
+        whatsappInstanceId: { not: null },
+      },
+      select: { whatsappInstanceId: true },
+    });
+    const whatsappInstanceId = channel?.whatsappInstanceId;
+    if (!whatsappInstanceId) {
+      return { connection: this.toDto(connection), counters: empty };
+    }
+
+    const [eligibleRouted, latestLog] = await Promise.all([
+      this.prisma.lead.count({
+        where: {
+          workspaceId,
+          whatsappInstanceId,
+          source: provider,
+          ctwaClid: { not: null },
+        },
+      }),
+      this.prisma.webhookLog.findFirst({
+        where: { workspaceId, whatsappInstanceId, source: provider },
+        orderBy: [{ receivedAt: "desc" }, { id: "desc" }],
+        select: { receivedAt: true },
+      }),
+    ]);
+
+    return {
+      connection: this.toDto(connection, latestLog?.receivedAt ?? null),
+      counters: {
+        // A bridge lead is only created for an inbound message with ctwaClid.
+        eligibleRouted,
+        // The bridge has no persisted unresolved route state: never invented.
+        eligibleUnresolved: 0,
+        // WebhookLog keeps a redacted payload, not a queryable CTWA outcome.
+        ignoredNoCtwa: 0,
+        // Duplicate and invalid attempts return before a distinct log exists.
+        duplicate: 0,
+        invalid: 0,
+      },
+    };
+  }
+
   async getConnection(
     workspaceId: string,
     connectionId: string,
@@ -227,11 +327,11 @@ export class InboundWebhookConnectionsService {
         "Conexões UAZAPI são criadas automaticamente a partir da instância WhatsApp",
       );
     }
-    if (input.provider === "payt") {
-      // Payt has no WhatsApp number: a Payt rule is created in Conversões
-      // and bound to the connection of its WhatsApp numbers.
+    if (isSalesPlatformProvider(input.provider)) {
+      // A sales platform (Payt, Braip, Yampi) has no WhatsApp number: its rule is
+      // created in Conversões and bound to the connection of its numbers.
       throw new ConflictException(
-        "A Payt não usa conexão própria: crie a regra de venda em Conversões",
+        `A ${salesPlatformLabels[input.provider]} não usa conexão própria: crie a regra de venda em Conversões`,
       );
     }
     if (input.provider === "waha") {
@@ -243,12 +343,17 @@ export class InboundWebhookConnectionsService {
       );
     }
     const unnichatBind = resolveUnnichatConnectionBind(input);
-    if (input.provider === "unnichat" && !unnichatBind) {
+    if (
+      (input.provider === "unnichat" || input.provider === "roichat") &&
+      !unnichatBind
+    ) {
       // The shared schema already requires it; keep the service boundary
       // fail-closed for direct callers too: the connection must own the
       // client's number before any payload can be parsed.
       throw new ConflictException(
-        "Conexões Unnichat exigem o número de WhatsApp do cliente",
+        input.provider === "roichat"
+          ? "Conexões ROI Chat exigem o número de WhatsApp do cliente"
+          : "Conexões Unnichat exigem o número de WhatsApp do cliente",
       );
     }
 
@@ -269,10 +374,20 @@ export class InboundWebhookConnectionsService {
 
       if (!release) {
         throw new ConflictException(
-          "Versão de observação do provedor indisponível",
+          "Versão do leitor do provedor indisponível",
         );
       }
 
+      // Fase 6.1c (produção direta): integração validada nasce em produção;
+      // só um leitor ainda não validado começa em observação. Meta Cloud sem
+      // META_APP_SECRET também: em produção a API passa a exigir a assinatura
+      // da Meta e recusaria as entregas; a tela pede o segredo e "Ativar
+      // envio" confere de novo.
+      const bornAt = new Date();
+      const status =
+        input.provider === "meta_cloud" && !this.env.META_APP_SECRET?.trim()
+          ? "observation"
+          : bornConnectionStatus(release);
       const created = await transaction.inboundWebhookConnection.create({
         data: {
           workspaceId,
@@ -280,7 +395,8 @@ export class InboundWebhookConnectionsService {
           displayName: input.displayName,
           parserReleaseId: release.id,
           secretHash,
-          status: "observation",
+          status,
+          productionActivatedAt: status === "production" ? bornAt : null,
           createdByUserId: actorUserId,
         },
         include: {
@@ -289,16 +405,24 @@ export class InboundWebhookConnectionsService {
       });
 
       if (unnichatBind) {
+        const channelState = bornChannelState(created, release, bornAt);
         await transaction.inboundWebhookChannel.create({
           data: {
-            metaRoutingMode: "inherit_workspace",
+            // Unnichat numbers explicitly follow the workspace Meta
+            // configuration (as in the SaaS); a ROI Chat number keeps the
+            // column default, like the other non-Unnichat providers, whose
+            // routing ignores this mode (route learned from the entry's ad).
+            ...(input.provider === "unnichat"
+              ? { metaRoutingMode: "inherit_workspace" as const }
+              : {}),
             workspaceId,
             connectionId: created.id,
             organizationId: workspaceId,
             providerChannelId: unnichatBind.providerChannelId,
             connectedPhone: unnichatBind.connectedPhone,
             channelName: unnichatBind.channelName,
-            status: "discovered",
+            status: channelState.status,
+            productionActivatedAt: channelState.productionActivatedAt,
             conversionEngineMode: "canonical",
             firstSeenAt: created.createdAt,
             lastSeenAt: created.createdAt,
@@ -336,6 +460,15 @@ export class InboundWebhookConnectionsService {
     connectionId: string,
     actorUserId: string,
   ): Promise<InboundWebhookConnectionRotateSecretResultDto> {
+    const existing = await this.requireConnection(
+      this.prisma,
+      workspaceId,
+      connectionId,
+    );
+    if (isBridgedWhatsappProvider(existing.provider)) {
+      throw new ConflictException(bridgeSecretRotationBlockedMessage);
+    }
+
     const config = this.requireEnabledConfig();
     const secret = this.generateSecret();
     const secretHash = this.hashSecret(secret);
@@ -346,6 +479,9 @@ export class InboundWebhookConnectionsService {
         workspaceId,
         connectionId,
       );
+      if (isBridgedWhatsappProvider(current.provider)) {
+        throw new ConflictException(bridgeSecretRotationBlockedMessage);
+      }
       const updatedAt = this.nextMutationTime(current.updatedAt);
       const claimed = await transaction.inboundWebhookConnection.updateMany({
         where: this.activeMutationWhere(current),
@@ -421,6 +557,12 @@ export class InboundWebhookConnectionsService {
         requireValidMetaRoute: metaRouteRequiredForProvider(current.provider),
         seats: this.seatHook(),
         env: this.env,
+        // Fase 6.1c: "Retomar conexão" de uma integração validada volta a
+        // enviar sem exigir rota em cada número (conferida no envio).
+        productionDirectResume:
+          current.status === "paused" &&
+          input.status === "production" &&
+          productionDirectEligible(current.parserRelease),
       });
     });
 
@@ -451,6 +593,16 @@ export class InboundWebhookConnectionsService {
       });
 
       this.assertMutationClaimed(claimed.count);
+
+      // Fase 6.1a (porte do #159): Umbler/Unnichat rules for ALL numbers
+      // anchored here move to another live connection of the provider, so
+      // the other numbers keep sending (audited; same transaction).
+      await reanchorSpanningAutomationRules(transaction, {
+        workspaceId,
+        removedConnectionId: connectionId,
+        provider: current.provider,
+        actorUserId,
+      });
 
       // rastrackdash sanitize (rewrite_rules.external-channel-seat-gate-noop):
       // billing/ is stripped in this edition, so external-channel seats are
@@ -610,6 +762,7 @@ export class InboundWebhookConnectionsService {
 
   private toDto(
     connection: PersistedInboundWebhookConnection,
+    lastDeliveryAt: Date | null = connection.lastDeliveryAt,
   ): InboundWebhookConnectionDto {
     return {
       id: connection.id,
@@ -621,7 +774,7 @@ export class InboundWebhookConnectionsService {
       status: connection.status,
       productionActivatedAt:
         connection.productionActivatedAt?.toISOString() ?? null,
-      lastDeliveryAt: connection.lastDeliveryAt?.toISOString() ?? null,
+      lastDeliveryAt: lastDeliveryAt?.toISOString() ?? null,
       lastSuccessfulParseAt:
         connection.lastSuccessfulParseAt?.toISOString() ?? null,
       createdAt: connection.createdAt.toISOString(),

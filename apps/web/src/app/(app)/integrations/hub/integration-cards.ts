@@ -76,6 +76,27 @@ export type IntegrationHubSnapshot = {
     /** Fase 5.3: a URL única da Payt já foi gerada. */
     integrationUrl?: boolean;
   };
+  /**
+   * Fase 6.5: Braip, same shape as Payt. Absent = no rule read yet (the card
+   * is still offered: no gate).
+   */
+  braip?: {
+    loaded: boolean;
+    ruleCount: number;
+    activeRuleCount: number;
+    integrationUrl?: boolean;
+  };
+  /**
+   * Fase 6.7: Yampi, same shape as Braip. Open to every workspace in the
+   * student edition (no private-integration gate). Absent = no rule read yet
+   * (the card is still offered).
+   */
+  yampi?: {
+    loaded: boolean;
+    ruleCount: number;
+    activeRuleCount: number;
+    integrationUrl?: boolean;
+  };
   crm: {
     kommo: CrmSnapshot;
     pipedrive: CrmSnapshot;
@@ -142,7 +163,7 @@ function inboundDecision(
         production > 0
           ? { label: "Enviando conversões", tone: "ok" }
           : observation > 0
-            ? { label: "Em teste", tone: "ok" }
+            ? { label: "Envio desligado", tone: "warn" }
             : { label: "Pausada", tone: "warn" },
       detail: plural(connections.length, "conexão", "conexões"),
     };
@@ -216,8 +237,31 @@ function whatsappDecision(
 }
 
 function paytDecision(snapshot: IntegrationHubSnapshot): CardDecision {
+  return salesPlatformDecision(snapshot.payt);
+}
+
+/** Braip (6.5): always offered; state from its rules and single URL. */
+function braipDecision(snapshot: IntegrationHubSnapshot): CardDecision {
+  return salesPlatformDecision(
+    snapshot.braip ?? { loaded: true, ruleCount: 0, activeRuleCount: 0 },
+  );
+}
+
+/** Yampi (6.7): always offered (no gate); state from its rules and single URL. */
+function yampiDecision(snapshot: IntegrationHubSnapshot): CardDecision {
+  return salesPlatformDecision(
+    snapshot.yampi ?? { loaded: true, ruleCount: 0, activeRuleCount: 0 },
+  );
+}
+
+function salesPlatformDecision(platform: {
+  loaded: boolean;
+  ruleCount: number;
+  activeRuleCount: number;
+  integrationUrl?: boolean;
+}): CardDecision {
   const { loaded, ruleCount, activeRuleCount, integrationUrl = false } =
-    snapshot.payt;
+    platform;
 
   if (ruleCount === 0 && integrationUrl) {
     return {
@@ -333,6 +377,10 @@ function decide(
       return crmDecision(snapshot, gate.provider);
     case "payt_rules":
       return paytDecision(snapshot);
+    case "braip_rules":
+      return braipDecision(snapshot);
+    case "yampi_rules":
+      return yampiDecision(snapshot);
     case "always":
       return definition.id === "meta" ? metaDecision(snapshot) : available;
   }

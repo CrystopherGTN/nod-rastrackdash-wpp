@@ -97,7 +97,7 @@ Por que isso é obrigatório: telas novas (como a opção Data Crazy) só existe
 ### Exemplo: depois da atualização com Data Crazy
 
 - Em `/integrations` → aba **Atendimento e vendas**, o card **Data Crazy** aparece (em **Disponíveis** ou **Ativos**).
-- Ao gerar o webhook, a conexão nasce **em observação** — é esperado. Ela só vai para produção depois de uma entrega **CTWA real** ser processada e de você ativar a produção (conexão e cada regra). O parser **Data Crazy v1** já vem certificado pela migration `20261016090300_validated_parser_certification`.
+- Ao gerar o webhook, a conexão já nasce **em produção** (produção direta, Fase 6.1c): o número que aparecer na primeira entrega já envia e cada regra nasce enviando. Configure a rota Meta do número; sem rota, nada é enviado. O parser **Data Crazy v1** já vem certificado pela migration `20261016090300_validated_parser_certification`.
 - Não existe canal/número provisório: o canal aparece sozinho após o primeiro webhook. E só mensagens inbound com **CTWA** viram lead.
 - Passo a passo completo da conexão: [`whatsapp-providers.md`](whatsapp-providers.md#data-crazy--conexão-de-webhook-de-entrada-ctwa) e passo 10.2 do [Guia do Aluno](../GUIA-ALUNO.md#102-painel-webhooks-de-entrada--umbler-gupshup-data-crazy-e-meta-whatsapp-cloud-api).
 
@@ -326,6 +326,7 @@ Nesse caso, é possível informar o commit exato no build: `--build-arg GIT_SHA=
 - **Fail-closed:** pare no primeiro passo que falhar e diagnostique em [`troubleshooting.md`](troubleshooting.md) antes de seguir. Não avance "torcendo para dar certo".
 - **Não reinstale para corrigir.** Reinstalar = banco novo, admin novo, segredos novos → você perde clientes, conexões e históricos.
 - **Não volte para uma versão antiga por conta própria** depois que as migrations rodaram: o banco já está no formato novo. Leve o log (sem segredos — troque valores sensíveis por `***`) para o suporte/comunidade e restaure o backup só com orientação.
+- **Se for mesmo voltar** (com orientação e backup): siga a recuperação de [`docs/releases/1.3.0.json`](../releases/1.3.0.json). Voltar para a 1.2.0 ou anterior depois de usar ROI Chat, Braip ou Yampi exige rodar `scripts/rollback/antes-de-voltar-para-1.2.sql` **antes** de voltar o código (sem isso a 1.2.0 não lista Integrações nem Conversões). Para desfazer o que a produção direta ligou na atualização, há `scripts/rollback/desfazer-producao-direta-6-1c.sql`. Os dois rodam com `psql` no servidor, e nada é apagado.
 
 ## Instalação local (Docker Compose)
 

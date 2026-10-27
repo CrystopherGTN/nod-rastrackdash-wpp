@@ -1,9 +1,12 @@
+import { manualConversionSummary } from "./manual-conversion-payload";
 import {
   Inject,
   Injectable,
   NotFoundException,
+  Optional,
   UnprocessableEntityException,
 } from "@nestjs/common";
+import { RUNTIME_ENV, type RuntimeEnv } from "../common/runtime/runtime.module";
 import {
   leadLifecycleLabel,
   leadSourceLabel,
@@ -20,13 +23,17 @@ import {
   normalizePhoneIdentity,
 } from "../common/phone/phone-identity";
 import { dateRangeInTimezone } from "../external-data/external-event-policy";
+import { liveHttpUrl } from "../integrations/meta/meta-cdn-url";
+import { conversionEventRejectionText } from "../conversion-events/meta-capi-rejection";
 import {
   chunked,
+  deferredLeadNovoPeriodWhere,
   firstContactScopeWhere,
   leadFirstContactBeforeWhere,
   leadFirstContactInRangeWhere,
   loadLeadIdsByPhoneHash,
-  paidLeadSubmittedEventWhere,
+  paidLeadSubmittedWhereFor,
+  resolveRuleOverrideReportMode,
   phoneHashesWithoutLeadId,
   repeatConversationLeadIds,
   withFirstContactAttribution,
@@ -83,6 +90,8 @@ type ConversionLogRecord = {
   eventOccurredAt: Date;
   sentAt?: Date | null;
   createdAt: Date;
+  sourcePayload?: unknown;
+  providerResponseSummary?: unknown;
 };
 
 type CampaignRecord = {
@@ -100,6 +109,8 @@ type AdRecord = {
   campaignId: string;
   adSetId: string;
   name: string;
+  creativeId?: string | null;
+  thumbnailUrl?: string | null;
 };
 
 type AdHierarchyRecord = {
@@ -145,7 +156,12 @@ export type UpsertWhatsappLeadInput = {
 
 @Injectable()
 export class LeadsService {
-  constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
+  constructor(
+    @Inject(PrismaService) private readonly prisma: PrismaService,
+    @Optional()
+    @Inject(RUNTIME_ENV)
+    private readonly env: RuntimeEnv = process.env,
+  ) {}
 
   async listLeads(
     workspaceId: string,
@@ -314,7 +330,26 @@ export class LeadsService {
     workspaceId: string,
     query: Omit<LeadListQueryDto, "page" | "pageSize" | "limit">,
   ) {
+    const whatsappInstanceId = query.whatsappInstanceId
+      ? await this.requireWorkspaceInstance(
+          workspaceId,
+          query.whatsappInstanceId,
+        )
+      : undefined;
     const conversationPeriodRange = this.conversationPeriodRange(query);
+    // Porte do SaaS #155: report mode (flag on + deferred receipts around the
+    // period). nod: the flag is on by default, so the lookup only runs when
+    // it can change the result (a period or a campaign/ad set/ad drill-down);
+    // a plain list never pays the extra query.
+    const ruleOverride =
+      conversationPeriodRange || query.campaignId || query.adSetId || query.adId
+        ? await resolveRuleOverrideReportMode(
+            this.prisma,
+            workspaceId,
+            conversationPeriodRange,
+            this.env,
+          )
+        : false;
     const eventLeadIds = query.eventName
       ? await this.leadIdsForEvent(workspaceId, query.eventName)
       : null;
@@ -364,7 +399,11 @@ export class LeadsService {
           const value = query[field];
 
           return value
-            ? [firstContactScopeWhere(this.prisma, workspaceId, field, value)]
+            ? [
+                firstContactScopeWhere(this.prisma, workspaceId, field, value, {
+                  ruleOverride,
+                }),
+              ]
             : [];
         },
       ),
@@ -374,16 +413,31 @@ export class LeadsService {
     // "Voltaram no periodo" needs a period start: without it nobody is "before".
     // "Mais de uma conversa" counts conversations inside a period, new or not.
     const baseFilter = returning
-      ? await this.returningLeadFilter(workspaceId, conversationPeriodRange)
+      ? await this.returningLeadFilter(
+          workspaceId,
+          conversationPeriodRange,
+          ruleOverride,
+        )
       : repeat
         ? await this.repeatConversationLeadFilter(
             workspaceId,
             conversationPeriodRange,
+            ruleOverride,
           )
         : null;
+    // Leads novos: first contact in the period, except leads whose entry
+    // LeadSubmitted was deferred to a provider rule, which are new on the day
+    // the rule sent it (tarefa 20, same helper as the reports).
+    // Flag off (or no deferred receipt around the period): no extra query.
     const periodFilter =
       conversationPeriodRange && !returning && !repeat
-        ? leadFirstContactInRangeWhere(conversationPeriodRange)
+        ? ((ruleOverride
+            ? await deferredLeadNovoPeriodWhere(
+                this.prisma,
+                workspaceId,
+                conversationPeriodRange,
+              )
+            : null) ?? leadFirstContactInRangeWhere(conversationPeriodRange))
         : null;
 
     if (
@@ -398,6 +452,7 @@ export class LeadsService {
 
       return {
         workspaceId,
+        ...(whatsappInstanceId ? { whatsappInstanceId } : {}),
         ...(eventLeadIds ? { id: { in: eventLeadIds } } : {}),
         ...(query.status ? { status: query.status } : {}),
         ...(query.label ? { labels: { has: query.label } } : {}),
@@ -428,6 +483,7 @@ export class LeadsService {
   private async returningLeadFilter(
     workspaceId: string,
     range: LeadPeriodRange | null,
+    ruleOverride = false,
   ) {
     if (!range?.gte) {
       return null;
@@ -436,7 +492,7 @@ export class LeadsService {
     const events = (await this.prisma.conversionEventLog.findMany({
       where: {
         workspaceId,
-        ...paidLeadSubmittedEventWhere,
+        ...paidLeadSubmittedWhereFor(ruleOverride),
         eventOccurredAt: range,
       },
       select: { leadId: true, phoneHash: true },
@@ -496,6 +552,7 @@ export class LeadsService {
   private async repeatConversationLeadFilter(
     workspaceId: string,
     range: LeadPeriodRange | null,
+    ruleOverride = false,
   ) {
     if (!range) {
       return null;
@@ -504,7 +561,7 @@ export class LeadsService {
     const events = (await this.prisma.conversionEventLog.findMany({
       where: {
         workspaceId,
-        ...paidLeadSubmittedEventWhere,
+        ...paidLeadSubmittedWhereFor(ruleOverride),
         eventOccurredAt: range,
       },
       select: { leadId: true, phoneHash: true },
@@ -519,6 +576,29 @@ export class LeadsService {
     const repeatIds = repeatConversationLeadIds(events, leadIdsByPhoneHash);
 
     return repeatIds.length ? [{ id: { in: repeatIds } }] : null;
+  }
+
+  /**
+   * The WhatsApp number filter only accepts a connection of this workspace
+   * (any status: removed connections keep their historical leads).
+   */
+  private async requireWorkspaceInstance(
+    workspaceId: string,
+    whatsappInstanceId: string,
+  ): Promise<string> {
+    const instance = await this.prisma.whatsappInstance.findFirst({
+      where: {
+        id: whatsappInstanceId,
+        workspaceId,
+      },
+      select: { id: true },
+    });
+
+    if (!instance) {
+      throw new NotFoundException("Número WhatsApp não encontrado");
+    }
+
+    return instance.id;
   }
 
   /**
@@ -782,6 +862,8 @@ export class LeadsService {
             eventOccurredAt: true,
             sentAt: true,
             createdAt: true,
+            sourcePayload: true,
+            providerResponseSummary: true,
           },
         }) as Promise<ConversionLogRecord[]>,
         this.prisma.webhookLog.findMany({
@@ -836,11 +918,17 @@ export class LeadsService {
                 campaignId: true,
                 adSetId: true,
                 name: true,
+                creativeId: true,
+                thumbnailUrl: true,
               },
             }) as Promise<AdRecord[]>)
           : Promise.resolve([]),
       ]);
     const ad = ads[0];
+    const thumbnailVersion = await this.storedThumbnailVersion(
+      workspaceId,
+      ad?.creativeId ?? null,
+    );
     const resolvedLead = ad
       ? {
           ...lead,
@@ -875,8 +963,13 @@ export class LeadsService {
         adSetName: resolvedAdSets[0]?.name ?? null,
         adName: ads[0]?.name ?? null,
         creative: {
-          thumbnailUrl: this.publicHttpUrl(lead.ctwaThumbnailUrl),
+          // Persisted image (served by our API) wins; otherwise only a
+          // not-yet-expired CTWA/Meta CDN URL is returned (oe= expiry).
+          thumbnailUrl:
+            liveHttpUrl(lead.ctwaThumbnailUrl) ??
+            liveHttpUrl(ad?.thumbnailUrl ?? null),
           destinationUrl: this.publicHttpUrl(lead.ctwaSourceUrl),
+          thumbnailVersion,
         },
       },
       conversionEvents: conversionLogs.map((event) => ({
@@ -889,10 +982,22 @@ export class LeadsService {
         adSetId: event.adSetId ?? null,
         adId: event.adId ?? null,
         errorCode: event.errorCode ?? null,
-        errorMessage: event.errorMessage ?? null,
+        // Recusa da Meta: motivo legível pelo código guardado (nunca o texto
+        // livre da Meta, que pode trazer dados do lead).
+        errorMessage:
+          conversionEventRejectionText({
+            status: event.status ?? "unknown",
+            errorCode: event.errorCode ?? null,
+            sourceTrigger: event.sourceTrigger ?? null,
+            providerResponseSummary: event.providerResponseSummary,
+          }) ??
+          (event.errorCode === "MetaCapiRejected"
+            ? "A Meta recusou o evento"
+            : (event.errorMessage ?? null)),
         occurredAt: event.eventOccurredAt.toISOString(),
         sentAt: event.sentAt?.toISOString() ?? null,
         createdAt: event.createdAt.toISOString(),
+        manual: manualConversionSummary(event),
       })),
       webhookEvents: webhookLogs.map((event) => ({
         id: event.id,
@@ -1038,6 +1143,26 @@ export class LeadsService {
       createdAt: lead.createdAt.toISOString(),
       updatedAt: lead.updatedAt.toISOString(),
     };
+  }
+
+  private async storedThumbnailVersion(
+    workspaceId: string,
+    creativeId: string | null,
+  ): Promise<string | null> {
+    if (!creativeId || !this.prisma.metaCreativeThumbnail) {
+      return null;
+    }
+
+    try {
+      const row = (await this.prisma.metaCreativeThumbnail.findFirst({
+        where: { workspaceId, creativeId, status: "ready" },
+        select: { version: true },
+      })) as { version: string | null } | null;
+
+      return row?.version || null;
+    } catch {
+      return null;
+    }
   }
 
   private publicHttpUrl(value: string | null): string | null {

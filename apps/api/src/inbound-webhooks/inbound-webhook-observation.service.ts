@@ -20,6 +20,7 @@ import {
   provisionalChannelProviderChannelId,
 } from "./inbound-webhook-provisional-channel";
 import { inboundWebhookParserContext } from "./providers/inbound-webhook-parser";
+import { bornChannelState } from "./production-direct";
 import type {
   InboundWebhookDeliveryNormalizedSummary,
   InboundWebhookEventClassification,
@@ -589,7 +590,11 @@ export class InboundWebhookObservationService {
 
       return parser.parse(
         payload,
-        inboundWebhookParserContext(delivery.workspaceId, connectedPhone),
+        inboundWebhookParserContext(
+          delivery.workspaceId,
+          connectedPhone,
+          delivery.firstReceivedAt,
+        ),
       );
     } catch (error) {
       if (error instanceof InboundWebhookDeterministicFailure) {
@@ -611,7 +616,8 @@ export class InboundWebhookObservationService {
     delivery: LoadedDelivery,
     parser: InboundWebhookParser,
   ): Promise<string | null> {
-    if (parser.provider !== "unnichat") {
+    // Fase 6.8: the ROI Chat number URL is bound the same way.
+    if (parser.provider !== "unnichat" && parser.provider !== "roichat") {
       return null;
     }
 
@@ -627,7 +633,9 @@ export class InboundWebhookObservationService {
     });
     if (!channel?.connectedPhone?.trim()) {
       throw new InboundWebhookDeterministicFailure(
-        "inbound_webhook_unnichat_channel_binding_missing",
+        parser.provider === "roichat"
+          ? "inbound_webhook_roichat_channel_binding_missing"
+          : "inbound_webhook_unnichat_channel_binding_missing",
         "invalid_payload",
       );
     }
@@ -921,7 +929,14 @@ export class InboundWebhookObservationService {
         providerChannelId: event.channel.providerChannelId,
         connectedPhone: event.channel.connectedPhone,
         channelName: event.channel.name,
-        status: "discovered",
+        // Fase 6.1c (produção direta): número novo de uma integração
+        // validada já nasce com o envio ativo, valendo desde a entrega que o
+        // revelou (a primeira conversa do número também segue para a Meta).
+        ...bornChannelState(
+          delivery.connection,
+          delivery.connection?.parserRelease,
+          delivery.firstReceivedAt,
+        ),
         conversionEngineMode: "canonical",
         // Unnichat numbers explicitly follow the workspace Meta configuration
         // (as in the SaaS); other providers keep the column default.

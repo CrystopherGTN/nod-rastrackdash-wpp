@@ -1,3 +1,5 @@
+import { isSalesPlatformProvider } from "../inbound-webhooks/providers/sales-platform-sale";
+import { roichatPurchaseDedupePolicy } from "./roichat-purchase-dedupe";
 import { Injectable } from "@nestjs/common";
 import { normalizeCurrencyCode } from "@wpptrack/shared";
 import type {
@@ -119,9 +121,10 @@ export class ProviderConversionLegacyDecisionEngine {
         "automation_matched",
       );
     }
-    // A Payt sale carries its own value; the rule average is only a fallback.
+    // A sale (Payt, Braip, ROI Chat) carries its own value; the rule average is only a fallback.
     if (
-      input.occurrence.provider === "payt" &&
+      (isSalesPlatformProvider(input.occurrence.provider) ||
+        input.occurrence.provider === "roichat") &&
       input.occurrence.observedValueCents
     ) {
       return this.eligible(
@@ -227,9 +230,11 @@ export class ProviderConversionLegacyDecisionEngine {
         ? { purchaseKey: input.occurrence.purchaseKey }
         : {}),
       businessDedupePolicy:
-        input.occurrence.provider === "payt" && input.occurrence.purchaseKey
+        isSalesPlatformProvider(input.occurrence.provider) &&
+        input.occurrence.purchaseKey
           ? { mode: "lifetime", scopeKey: input.occurrence.purchaseKey }
-          : input.rule.eventName === "QualifiedLead"
+          : (roichatPurchaseDedupePolicy(input) ??
+            (input.rule.eventName === "QualifiedLead"
             ? {
                 mode: "lifetime",
                 scopeKey,
@@ -238,7 +243,7 @@ export class ProviderConversionLegacyDecisionEngine {
                 mode: "rolling_window",
                 scopeKey,
                 windowSeconds: PURCHASE_DEDUPE_WINDOW_SECONDS,
-              },
+              })),
       eventName: input.occurrence.eventName,
       occurredAt: input.occurrence.occurredAt,
       authorType: input.occurrence.authorType,

@@ -8,6 +8,7 @@ import type {
   ProviderConversionDecisionCatalogSnapshotDto,
   ProviderConversionDecisionDto,
   ProviderConversionDecisionRuleSnapshotDto,
+  ProviderConversionObservationDetailDto,
   ProviderConversionPaidLeadResolutionDto,
 } from "@wpptrack/shared";
 import {
@@ -26,10 +27,12 @@ import { parseInboundWebhooksConfig } from "../config/deployment-config";
 import type { ParsedInboundWebhookEvent } from "../inbound-webhooks/providers/inbound-webhook-parser";
 import type { ParsedUmblerAutomationV1 } from "../inbound-webhooks/providers/umbler/umbler-automation-v1.parser";
 import {
-  paytProductFilterMatches,
-  type ParsedPaytAutomationV1,
-} from "../inbound-webhooks/providers/payt/payt-automation-v1.parser";
+  isSalesPlatformProvider,
+  saleProductFilterMatches,
+  type ParsedSaleAutomationV1,
+} from "../inbound-webhooks/providers/sales-platform-sale";
 import type { ParsedUnnichatAutomationV1 } from "../inbound-webhooks/providers/unnichat/unnichat-automation-v1.parser";
+import type { ParsedRoichatAutomationV1 } from "../inbound-webhooks/providers/roichat/roichat-automation-v1.parser";
 import {
   PAYT_LEAD_OTHER_CHANNEL_REASON,
   resolvePurchaseChannels,
@@ -53,11 +56,36 @@ import {
   PROVIDER_RULE_OVERRIDDEN_REASON,
   providerRuleCandidateWhere,
   providerRuleScope,
+  providerRuleSpansProviderConnections,
   resolveApplicableProviderRules,
   resolveProviderRuleScopeChannelIds,
 } from "./provider-rule-scope";
 
-/** Fase 5.3: sale of a product outside the rule product filter. */
+/**
+ * An Umbler/Unnichat rule "todas as conexoes" covers every number of the
+ * provider, on any connection (Unnichat: one connection per number). Its
+ * callbacks are resolved FIRST on the connection that sent them (the
+ * callback origin) and only then across the scope; each occurrence is gated
+ * by its own number's connection. Every other rule keeps the historical
+ * per-connection resolution.
+ */
+function automationSpansConnections(rule: AutomationRule): boolean {
+  return providerRuleSpansProviderConnections(rule);
+}
+
+/**
+ * Where a callback came from (the strongest signal of its number):
+ *  - per-rule URL: the connection of the rule that owns that URL (for an
+ *    old URL forwarded by "Unificar", the OLD rule's connection);
+ *  - per-event URL: the number the router proved (ctwa_clid entry, payload
+ *    channel.phone, lead origin).
+ */
+export type AutomationCallbackOrigin = {
+  connectionId: string;
+  channelId: string | null;
+};
+
+/** Sale of a product outside the rule's product filter (fase 4). */
 export const PAYT_PRODUCT_NOT_IN_RULE_REASON = "payt_product_not_in_rule";
 
 const observedRuleInclude = {
@@ -115,6 +143,8 @@ type GateConnection = {
 
 type ObservedChannel = {
   id: string;
+  /** Connection of the number (automations spanning connections gate on it). */
+  connectionId?: string;
   organizationId: string;
   providerChannelId: string;
   status: string;
@@ -122,15 +152,26 @@ type ObservedChannel = {
   conversionEngineMode: ProviderConversionEngineMode;
 };
 
+const observedChannelSelect = {
+  id: true,
+  connectionId: true,
+  organizationId: true,
+  providerChannelId: true,
+  status: true,
+  productionActivatedAt: true,
+  conversionEngineMode: true,
+} as const;
+
 /** Endpoint automations of this edition (Umbler, Payt). */
 type ParsedProviderAutomation =
   | ParsedUmblerAutomationV1
-  | ParsedPaytAutomationV1
+  | ParsedSaleAutomationV1
   | (ParsedUnnichatAutomationV1 & {
       provider: "unnichat";
       automation: "crm_movement";
       eventName: ConversionEventNameDto;
-    });
+    })
+  | ParsedRoichatAutomationV1;
 
 export type ProviderConversionObservationResult = {
   executionIds: string[];
@@ -147,6 +188,8 @@ export type ProviderConversionAutomationObservationResult = {
   reviewId: string | null;
   channelId: string | null;
   leadResolved: boolean;
+  /** Why an observed decision sent nothing (only when observed). */
+  observationDetail?: ProviderConversionObservationDetailDto | null;
 };
 
 export type ProviderConversionEvaluationMode =
@@ -236,17 +279,22 @@ export class ProviderConversionObservationService {
      * against the rule scope: outside it, the rule does not own the callback.
      */
     routedChannelId?: string | null;
+    /** Callback origin (default: the rule's own connection). */
+    origin?: AutomationCallbackOrigin | null;
   }): Promise<ProviderConversionAutomationObservationResult> {
-    if (input.automation.provider === "payt") {
+    if (
+      isSalesPlatformProvider(input.automation.provider) &&
+      "orderRef" in input.automation
+    ) {
       // One sale (seller + order + event) is one occurrence, whatever endpoint
-      // or delivery carried it.
+      // or delivery carried it (Payt, Braip).
       input = {
         ...input,
         automation: {
           ...input.automation,
           externalExecutionKey: buildProviderPurchaseIdentity({
             workspaceId: input.workspaceId,
-            provider: "payt",
+            provider: input.automation.provider,
             accountRef: input.automation.accountRef,
             orderRef: input.automation.orderRef,
             eventName: input.automation.eventName,
@@ -297,10 +345,12 @@ export class ProviderConversionObservationService {
     // code). A sale of another product is not this rule's: ignored, never an
     // error, never sent by it.
     if (
-      input.automation.provider === "payt" &&
-      !paytProductFilterMatches(
+      isSalesPlatformProvider(input.automation.provider) &&
+      !saleProductFilterMatches(
         rule.productFilterCodes,
-        input.automation.productCodes ?? [],
+        ("productCodes" in input.automation
+          ? input.automation.productCodes
+          : undefined) ?? [],
       )
     ) {
       return {
@@ -320,24 +370,39 @@ export class ProviderConversionObservationService {
     if (this.isUnnichatWithoutCtwa(input.automation)) {
       return this.recordUnnichatCtwaMissing({ input, rule });
     }
+    // Fase 6.1a (porte do #159): the callback's own connection first (and
+    // its number when the router proved it): a contact that talked to two
+    // numbers is attributed to the number whose automation called, never to
+    // the latest conversation.
+    const spansConnections = automationSpansConnections(rule);
+    // Fase 6.8 (porte do #183): the ROI Chat purchase came through ONE
+    // number's own URL, so that number is always the origin (also for a rule
+    // of a single connection).
+    const roichat = rule.parserRelease.provider === "roichat";
+    const origin: AutomationCallbackOrigin =
+      (spansConnections || roichat) && input.origin
+        ? input.origin
+        : { connectionId: input.connectionId, channelId: null };
     // A Payt sale is attributed only to a tracked CTWA lead: its verified
     // entry (on any channel of the workspace) is then bound to the rule scope.
-    // An Unnichat automation resolves the lead on its own entry connection.
-    const purchaseLead = ["payt", "unnichat"].includes(
-      rule.parserRelease.provider,
-    )
-      ? await this.paidLeads.resolve({
-          workspaceId: input.workspaceId,
-          ...(rule.parserRelease.provider === "unnichat"
-            ? { connectionId: input.connectionId }
-            : { ctwaProofAnyChannel: true }),
-          phone: input.automation.phone,
+    // An Unnichat automation resolves the lead on its own entry connection
+    // (a rule "todas as conexões": then on any number of its scope).
+    const purchaseLead =
+      isSalesPlatformProvider(rule.parserRelease.provider) ||
+      rule.parserRelease.provider === "unnichat" ||
+      roichat
+      ? await this.resolveAutomationPurchaseLead({
+          input,
+          rule,
+          origin,
+          spansConnections,
           phoneCandidates,
         })
       : null;
     const channel = await this.resolveAutomationChannel({
       workspaceId: input.workspaceId,
       connectionId: input.connectionId,
+      origin,
       phone: input.automation.phone,
       phoneCandidates,
       deliveryReceivedAt: input.deliveryReceivedAt,
@@ -381,7 +446,7 @@ export class ProviderConversionObservationService {
         };
       }
     }
-    if (rule.parserRelease.provider === "payt" && !channel) {
+    if (isSalesPlatformProvider(rule.parserRelease.provider) && !channel) {
       // One Payt rule per WhatsApp number receives the same sale. When the
       // buyer is a tracked lead whose verified origin is another number, this
       // rule simply does not own the purchase: record it as such (the rule of
@@ -423,6 +488,12 @@ export class ProviderConversionObservationService {
         leadResolved: false,
       };
     }
+    // The number's own connection: the anchor for every historical rule, the
+    // resolved number's connection for an automation spanning connections.
+    const occurrenceConnectionId =
+      spansConnections && channel?.connectionId
+        ? channel.connectionId
+        : input.connectionId;
     const leadResolution =
       rule.parserRelease.provider === "unnichat" && !channel
         ? {
@@ -433,11 +504,14 @@ export class ProviderConversionObservationService {
         : (purchaseLead ??
           (await this.paidLeads.resolve({
             workspaceId: input.workspaceId,
+            ...(rule.parserRelease.provider === "unnichat" && channel
+              ? { channelId: channel.id, connectionId: occurrenceConnectionId }
+              : {}),
             phone: input.automation.phone,
             phoneCandidates,
           })));
     const persistedDecision = await this.resolveAutomationDecision({
-      input,
+      input: { ...input, connectionId: occurrenceConnectionId },
       rule,
       channel,
       leadResolution,
@@ -457,11 +531,25 @@ export class ProviderConversionObservationService {
       };
     }
 
+    // Spanning automations are gated by the resolved number's connection
+    // (production, certified parser, not removed); the anchor only stores
+    // the delivery. A number whose connection vanished fails closed.
+    const gateConnection =
+      occurrenceConnectionId === rule.connectionId
+        ? rule.connection
+        : await this.loadGateConnection({
+            workspaceId: input.workspaceId,
+            connectionId: occurrenceConnectionId,
+          });
     const disposition = this.disposition({
       config,
       decision: persistedDecision.decision,
       rule,
-      gateConnection: rule.connection,
+      gateConnection: gateConnection ?? {
+        ...rule.connection,
+        removedAt: rule.connection.removedAt ?? new Date(0),
+        status: "paused",
+      },
       channel,
       deliveryReceivedAt: input.deliveryReceivedAt,
       manualRecovery: input.manualRecovery === true,
@@ -496,6 +584,10 @@ export class ProviderConversionObservationService {
       reviewId: orchestration.reviewId,
       channelId: channel?.id ?? null,
       leadResolved: leadResolution.status === "resolved",
+      observationDetail:
+        disposition.state === "observed" && !orchestration.purchaseDuplicate
+          ? (disposition.detail ?? null)
+          : null,
     };
   }
 
@@ -510,7 +602,11 @@ export class ProviderConversionObservationService {
     workspaceId: string,
     automation: ParsedProviderAutomation,
   ): Promise<string[]> {
-    if (ruleIds.length === 0 || automation.provider !== "payt") return ruleIds;
+    if (ruleIds.length === 0 || !isSalesPlatformProvider(automation.provider))
+      return ruleIds;
+    const productCodes =
+      ("productCodes" in automation ? automation.productCodes : undefined) ??
+      [];
     const filters = await this.prisma.providerConversionRuleConfig.findMany({
       where: { workspaceId, id: { in: ruleIds } },
       select: { id: true, productFilterCodes: true },
@@ -519,10 +615,7 @@ export class ProviderConversionObservationService {
       filters.map((rule) => [rule.id, rule.productFilterCodes ?? []]),
     );
     return ruleIds.filter((id) =>
-      paytProductFilterMatches(
-        byId.get(id) ?? [],
-        automation.productCodes ?? [],
-      ),
+      saleProductFilterMatches(byId.get(id) ?? [], productCodes),
     );
   }
 
@@ -788,11 +881,12 @@ export class ProviderConversionObservationService {
         externalEventId: input.input.automation.externalExecutionKey,
         externalMessageId: null,
         occurrenceKey,
-        ...(input.input.automation.provider === "payt"
+        ...(isSalesPlatformProvider(input.input.automation.provider) &&
+        "orderRef" in input.input.automation
           ? {
               purchaseKey: buildProviderPurchaseIdentity({
                 workspaceId: input.input.workspaceId,
-                provider: "payt",
+                provider: input.input.automation.provider,
                 accountRef: input.input.automation.accountRef,
                 orderRef: input.input.automation.orderRef,
                 eventName: input.input.automation.eventName,
@@ -858,9 +952,55 @@ export class ProviderConversionObservationService {
     });
   }
 
+  /**
+   * Paid lead of an automation callback. Unnichat: the CTWA proof of the
+   * callback's own connection (and number) first; only a rule "todas as
+   * conexoes" whose contact has no proof there looks for the proof of any
+   * number of the workspace (an ambiguous contact, with proofs on several
+   * numbers, then stays unresolved: never guessed). Sales platforms: any
+   * channel, as before.
+   */
+  private async resolveAutomationPurchaseLead(input: {
+    input: {
+      workspaceId: string;
+      connectionId: string;
+      automation: ParsedProviderAutomation;
+    };
+    rule: AutomationRule;
+    origin: AutomationCallbackOrigin;
+    spansConnections: boolean;
+    phoneCandidates?: readonly string[];
+  }): Promise<ProviderConversionPaidLeadResolutionDto> {
+    const base = {
+      workspaceId: input.input.workspaceId,
+      phone: input.input.automation.phone,
+      phoneCandidates: input.phoneCandidates,
+    };
+    if (input.rule.parserRelease.provider === "roichat") {
+      // ROI Chat leads come from an ad (source_id): the lead of this phone
+      // with its own ad attribution. No CTWA page/pixel proof path.
+      return this.paidLeads.resolve(base);
+    }
+    if (input.rule.parserRelease.provider !== "unnichat") {
+      return this.paidLeads.resolve({ ...base, ctwaProofAnyChannel: true });
+    }
+    const own = await this.paidLeads.resolve({
+      ...base,
+      connectionId: input.origin.connectionId,
+      ...(input.origin.channelId ? { channelId: input.origin.channelId } : {}),
+    });
+    if (
+      !input.spansConnections ||
+      !(own.status === "not_found" && own.reasonCode === "paid_attribution_missing")
+    )
+      return own;
+    return this.paidLeads.resolve({ ...base, ctwaProofAnyChannel: true });
+  }
+
   private async resolveAutomationChannel(input: {
     workspaceId: string;
     connectionId: string;
+    origin: AutomationCallbackOrigin;
     phone: string;
     phoneCandidates?: readonly string[];
     deliveryReceivedAt: Date;
@@ -886,6 +1026,22 @@ export class ProviderConversionObservationService {
     if (contactIdentityHashes.length === 0 || channelIds.length === 0)
       return null;
 
+    // ROI Chat: one URL per number. The number is the URL's (the router
+    // proved it); it is never looked up from the lead's other conversations,
+    // so a purchase on number A can never be attributed to number B.
+    if (input.rule.parserRelease.provider === "roichat") {
+      const channelId = input.origin.channelId;
+      if (!channelId || !channelIds.includes(channelId)) return null;
+      return this.prisma.inboundWebhookChannel.findFirst({
+        where: {
+          id: channelId,
+          workspaceId: input.workspaceId,
+          connectionId: input.origin.connectionId,
+        },
+        select: observedChannelSelect,
+      });
+    }
+
     if (
       input.rule.parserRelease.provider === "unnichat" &&
       input.purchaseLead?.status === "resolved" &&
@@ -895,19 +1051,23 @@ export class ProviderConversionObservationService {
       input.purchaseLead.lead.ctwaDestination
     ) {
       const proof = input.purchaseLead.lead.ctwaDestination;
+      // A rule for all Unnichat numbers takes the proof of any number of its
+      // scope; every other rule only the proof of its own connection.
+      const spans = automationSpansConnections(input.rule);
       if (
         !channelIds.includes(proof.channelId) ||
-        proof.connectionId !== input.connectionId
+        (!spans && proof.connectionId !== input.connectionId)
       )
         return null;
       return this.prisma.inboundWebhookChannel.findFirst({
         where: {
           id: proof.channelId,
           workspaceId: input.workspaceId,
-          connectionId: input.connectionId,
+          connectionId: spans ? proof.connectionId : input.connectionId,
         },
         select: {
           id: true,
+          connectionId: true,
           organizationId: true,
           providerChannelId: true,
           status: true,
@@ -916,7 +1076,7 @@ export class ProviderConversionObservationService {
         },
       });
     }
-    if (input.rule.parserRelease.provider === "payt") {
+    if (isSalesPlatformProvider(input.rule.parserRelease.provider)) {
       // A Payt sale belongs to the scoped channel where the paid lead's CTWA
       // entry was verified; a phone match alone is never enough.
       if (input.purchaseLead?.status !== "resolved") return null;
@@ -962,12 +1122,16 @@ export class ProviderConversionObservationService {
       if (proof && candidates[0]!.id !== proof.channelId) return null;
       return candidates[0]!;
     }
-
+    const spans = automationSpansConnections(input.rule);
     // Fase 5.3: an Umbler callback routed by the URL por evento already has
     // its number (channel.phone or the contact's single number). Recomputing
     // it by the last message could pick another number (two numbers within
     // 30 days) and silently drop or duplicate the conversion.
-    if (input.rule.parserRelease.provider === "umbler" && input.routedChannelId) {
+    if (
+      !spans &&
+      input.rule.parserRelease.provider === "umbler" &&
+      input.routedChannelId
+    ) {
       if (!channelIds.includes(input.routedChannelId)) return null;
       return this.prisma.inboundWebhookChannel.findFirst({
         where: {
@@ -977,6 +1141,7 @@ export class ProviderConversionObservationService {
         },
         select: {
           id: true,
+          connectionId: true,
           organizationId: true,
           providerChannelId: true,
           status: true,
@@ -986,14 +1151,20 @@ export class ProviderConversionObservationService {
       });
     }
 
+    // The callback's own connection (and number) first.
+    const ownConnectionId = spans ? input.origin.connectionId : input.connectionId;
+    const ownChannelIds =
+      spans && input.origin.channelId
+        ? channelIds.filter((id) => id === input.origin.channelId)
+        : channelIds;
     const recentEvent = await this.prisma.inboundWebhookEvent.findFirst({
       where: {
         workspaceId: input.workspaceId,
-        connectionId: input.connectionId,
+        connectionId: ownConnectionId,
         ...(input.rule.parserRelease.provider === "unnichat"
           ? { hasCtwa: true }
           : {}),
-        channelId: { in: channelIds },
+        channelId: { in: ownChannelIds },
         contactIdentityHash:
           contactIdentityHashes.length === 1
             ? contactIdentityHashes[0]!
@@ -1007,6 +1178,7 @@ export class ProviderConversionObservationService {
         channel: {
           select: {
             id: true,
+            connectionId: true,
             organizationId: true,
             providerChannelId: true,
             status: true,
@@ -1017,6 +1189,29 @@ export class ProviderConversionObservationService {
       },
     });
     if (recentEvent?.channel) return recentEvent.channel;
+
+    if (spans) {
+      // Umbler: the number named by the payload (channel.phone) is the
+      // number even before any message of the contact reached it.
+      if (
+        input.origin.channelId &&
+        input.rule.parserRelease.provider !== "unnichat" &&
+        channelIds.includes(input.origin.channelId)
+      ) {
+        const named = await this.prisma.inboundWebhookChannel.findFirst({
+          where: { id: input.origin.channelId, workspaceId: input.workspaceId },
+          select: observedChannelSelect,
+        });
+        if (named) return named;
+      }
+      // Nothing on the callback's own number: the rest of the scope, a
+      // production number before any other, then the most recent.
+      return this.scopeWideAutomationChannel({
+        ...input,
+        channelIds,
+        contactIdentityHashes,
+      });
+    }
 
     // An Unnichat CRM movement is only attributable when the same contact was
     // previously observed through CTWA on a scoped channel. Do not fall back
@@ -1031,12 +1226,70 @@ export class ProviderConversionObservationService {
     const fallback = input.rule.channels[0]!.channel;
     return {
       id: fallback.id,
+      connectionId: input.connectionId,
       organizationId: "",
       providerChannelId: "",
       status: fallback.status,
       productionActivatedAt: fallback.productionActivatedAt,
       conversionEngineMode: fallback.conversionEngineMode,
     };
+  }
+
+  /**
+   * Fallback of a rule "todas as conexoes" when the contact has nothing on
+   * the callback's own number: the contact's numbers in the scope, a number
+   * whose connection is in production first (never an observation one over
+   * a production one), then the most recent conversation. Removed
+   * connections are never in the scope.
+   */
+  private async scopeWideAutomationChannel(input: {
+    workspaceId: string;
+    rule: AutomationRule;
+    channelIds: string[];
+    contactIdentityHashes: string[];
+    deliveryReceivedAt: Date;
+  }): Promise<ObservedChannel | null> {
+    const events = await this.prisma.inboundWebhookEvent.findMany({
+      where: {
+        workspaceId: input.workspaceId,
+        ...(input.rule.parserRelease.provider === "unnichat"
+          ? { hasCtwa: true }
+          : {}),
+        channelId: { in: input.channelIds },
+        contactIdentityHash:
+          input.contactIdentityHashes.length === 1
+            ? input.contactIdentityHashes[0]!
+            : { in: input.contactIdentityHashes },
+        occurredAt: {
+          lte: new Date(input.deliveryReceivedAt.getTime() + 5 * 60 * 1_000),
+        },
+      },
+      orderBy: { occurredAt: "desc" },
+      select: {
+        channel: {
+          select: {
+            ...observedChannelSelect,
+            connection: { select: { status: true, removedAt: true } },
+          },
+        },
+      },
+      take: 50,
+    });
+    const candidates = events
+      .map((event) => event.channel)
+      .filter(
+        (channel): channel is NonNullable<typeof channel> =>
+          Boolean(channel) && !channel!.connection?.removedAt,
+      );
+    const picked =
+      candidates.find(
+        (channel) =>
+          channel.connection?.status === "production" &&
+          channel.status === "active",
+      ) ?? candidates[0];
+    if (!picked) return null;
+    const { connection: _connection, ...channel } = picked;
+    return channel;
   }
 
   /** The lead may have been matched through an equivalent BR form (with or
@@ -1282,13 +1535,15 @@ export class ProviderConversionObservationService {
     // Payt is only sent by the canonical engine; legacy/shadow channels keep
     // its sales audit-only. Canonical production still requires every live
     // certification, activation and feature gate below.
-    if (
-      input.rule.parserRelease?.provider === "payt" &&
-      input.channel.conversionEngineMode !== "canonical"
-    ) {
+    // Sales platforms of the student edition: Payt, Braip (6.5) and Yampi (6.7).
+    const salesPlatform = isSalesPlatformProvider(
+      input.rule.parserRelease?.provider,
+    );
+    if (salesPlatform && input.channel.conversionEngineMode !== "canonical") {
       return {
         state: "observed",
         reasonCode: `${input.decision.reasonCode}_payt_observation`,
+        detail: "lead_number_legacy_engine",
       };
     }
     // Manual recovery reuses the frozen decision snapshot (including the mode
@@ -1305,6 +1560,9 @@ export class ProviderConversionObservationService {
       return {
         state: "observed",
         reasonCode: `${input.decision.reasonCode}_observation`,
+        detail: !input.config.conversionProductionEnabled
+          ? "production_sending_disabled"
+          : "rule_observation_at_receipt",
       };
     }
     // An unbound rule has no parser of its own: the occurrence connection's
@@ -1326,16 +1584,32 @@ export class ProviderConversionObservationService {
         reasonCode: "production_context_invalid",
       };
     }
+    // Sales platforms (porte do #171): a lead's number that was never
+    // activated in production on its own connection is NOT a callback
+    // "received before activation". The production worker refuses it
+    // (channel.productionActivatedAt) even with the operator approval, so a
+    // manual reprocess must not queue it to fail: it stays observed, with the
+    // reason the screen shows ("ative o envio neste número").
+    const leadNumberNotProduction =
+      !input.channel.productionActivatedAt &&
+      (!input.manualRecovery || salesPlatform);
     if (
       !input.rule.productionActivatedAt ||
+      leadNumberNotProduction ||
       (!input.manualRecovery &&
-        (!input.channel.productionActivatedAt ||
-          input.deliveryReceivedAt < input.rule.productionActivatedAt ||
-          input.deliveryReceivedAt < input.channel.productionActivatedAt))
+        (input.deliveryReceivedAt < input.rule.productionActivatedAt ||
+          input.deliveryReceivedAt < input.channel.productionActivatedAt!))
     ) {
       return {
         state: "observed",
         reasonCode: "before_production_activation",
+        detail: !input.rule.productionActivatedAt
+          ? "rule_not_activated"
+          : leadNumberNotProduction
+            ? "lead_number_not_production"
+            : input.deliveryReceivedAt < input.rule.productionActivatedAt
+              ? "received_before_rule_activation"
+              : "received_before_number_activation",
       };
     }
 

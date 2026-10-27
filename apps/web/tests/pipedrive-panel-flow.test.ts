@@ -1,7 +1,6 @@
 // @vitest-environment jsdom
 import {
   conversionEventCarriesValue,
-  conversionEventDisplayLabels,
   conversionEventNameSchema,
   conversionEventValuePolicy,
 } from "@wpptrack/shared";
@@ -23,6 +22,7 @@ import {
   sentForm,
 } from "./support/pipedrive-panel-harness";
 import { WorkspaceCurrencyProvider } from "../src/components/workspace-currency";
+import { accentedEventDisplayLabel } from "../src/app/(app)/conversions/event-copy";
 
 const { routerRefresh } = vi.hoisted(() => ({ routerRefresh: vi.fn() }));
 vi.mock("next/navigation", () => ({
@@ -60,10 +60,10 @@ function submitRule() {
 }
 
 describe("Pipedrive connect flow", () => {
-  it("states that observation is the default and production needs an explicit confirmation", () => {
+  it("Fase 6.1c: states that a rule is born sending, with no observation step", () => {
     renderPanel({ connections: [], loadState: "empty" });
-    expect(screen.getAllByText(/observação/i).length).toBeGreaterThan(0);
-    expect(screen.getAllByText(/com confirmação/i).length).toBeGreaterThan(0);
+    expect(screen.queryAllByText(/observação/i)).toHaveLength(0);
+    expect(screen.getAllByText(/A regra já começa enviando/i).length).toBeGreaterThan(0);
     expect(screen.queryByText(/Produção ativa/)).toBeNull();
     expect(screen.getByText(/Nenhuma conexão Pipedrive/)).toBeTruthy();
   });
@@ -376,7 +376,7 @@ describe("Pipedrive rule CRUD", () => {
     const optionLabels = Array.from(select.options).map((option) => option.textContent);
 
     expect(allEvents).toHaveLength(14);
-    expect(optionLabels).toEqual(allEvents.map((name) => conversionEventDisplayLabels[name]));
+    expect(optionLabels).toEqual(allEvents.map((name) => accentedEventDisplayLabel(name)));
   });
 
   it("groups stages by pipeline and sends pipelineId and stageId (not names)", async () => {
@@ -405,8 +405,9 @@ describe("Pipedrive rule CRUD", () => {
       pipelineId: "pipeline_2",
       stageId: "stage_9",
       eventName: "LeadSubmitted",
-      mode: "observation",
     });
+    // Fase 6.1c (produção direta): a tela não escolhe modo; a API decide.
+    expect(payload).not.toHaveProperty("mode");
     expect(await screen.findByText("Pos-venda / Renovacao")).toBeTruthy();
   });
 
@@ -444,8 +445,8 @@ describe("Pipedrive rule CRUD", () => {
       stageId: null,
       eventName: "Purchase",
       valueMode: "deal",
-      mode: "observation",
     });
+    expect(payload).not.toHaveProperty("mode");
     expect(payload).not.toHaveProperty("currency");
     expect(await screen.findByText("Vendas / Negócio ganho")).toBeTruthy();
   });
@@ -544,7 +545,7 @@ describe("Pipedrive rule CRUD", () => {
       await waitFor(() => expect(createRuleAction).toHaveBeenCalledTimes(1));
       const payload = JSON.parse(formValues(createRuleAction.mock.calls[0]![0]).payload);
       expect(payload.eventName).toBe(eventName);
-      expect(payload.mode).toBe("observation");
+      expect(payload.mode).toBeUndefined();
       expect(payload.valueMode).toBe("deal");
       if (policy === "required") expect(payload.currency).toBe("BRL");
       if (!carries) {

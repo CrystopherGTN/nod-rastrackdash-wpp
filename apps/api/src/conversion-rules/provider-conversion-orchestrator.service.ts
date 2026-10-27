@@ -1,5 +1,7 @@
+import { isSalesPlatformProvider } from "../inbound-webhooks/providers/sales-platform-sale";
 import { Inject, Injectable, Logger } from "@nestjs/common";
 import { Prisma } from "@prisma/client";
+import type { ProviderConversionObservationDetailDto } from "@wpptrack/shared";
 import { PrismaService } from "../common/prisma/prisma.service";
 import {
   providerConversionDecisionOutcome,
@@ -23,6 +25,8 @@ export type ProviderConversionTechnicalDisposition =
   | {
       state: "observed";
       reasonCode: string;
+      /** Why nothing was sent (recorded with the execution for the UI). */
+      detail?: ProviderConversionObservationDetailDto;
     }
   | {
       state: "eligible";
@@ -119,7 +123,7 @@ export class ProviderConversionOrchestrator {
 
     const purchaseKey = persistedDecision.decision.occurrence.purchaseKey;
     if (
-      persistedDecision.decision.occurrence.provider === "payt" &&
+      isSalesPlatformProvider(persistedDecision.decision.occurrence.provider) &&
       purchaseKey &&
       input.disposition.state === "observed"
     ) {
@@ -344,12 +348,18 @@ export class ProviderConversionOrchestrator {
     }
 
     const catalogVariantId = this.singleCatalogVariantId(decision);
-    const normalizedResult: Prisma.InputJsonValue = manualReplayApproval
-      ? {
-          ...(this.normalizedResult(persisted) as Prisma.InputJsonObject),
-          manualReplayApproval,
-        }
-      : this.normalizedResult(persisted);
+    const observationDetail =
+      input.disposition.state === "observed"
+        ? (input.disposition.detail ?? null)
+        : null;
+    const normalizedResult: Prisma.InputJsonValue =
+      manualReplayApproval || observationDetail
+        ? {
+            ...(this.normalizedResult(persisted) as Prisma.InputJsonObject),
+            ...(manualReplayApproval ? { manualReplayApproval } : {}),
+            ...(observationDetail ? { observationDetail } : {}),
+          }
+        : this.normalizedResult(persisted);
 
     return client.providerConversionRuleExecution.upsert({
       where: {

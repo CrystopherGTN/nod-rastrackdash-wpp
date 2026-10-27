@@ -15,17 +15,19 @@ import type {
   ReportPaginationDto,
   ReportSortDto,
   ReportSortKeyDto,
+  WhatsappConnectionDto,
 } from "@wpptrack/shared";
 import { BarChart3, CalendarRange, Download, RefreshCcw } from "lucide-react";
 import Link from "next/link";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import type { BackofficeActionState } from "../../../components/backoffice-action-form";
 import {
   CurrencyKpiGroups,
   ExchangeRateMissingNote,
 } from "../../../components/currency-kpi-groups";
+import { MetaSyncCoverageNotice } from "../../../components/meta-sync-coverage-notice";
 import { PresentationMask } from "../../../components/presentation-mask";
 import { SubmitButton } from "../../../components/submit-button";
 import {
@@ -50,9 +52,16 @@ import {
   unconvertedRevenueLabel,
 } from "../../../lib/report-currency";
 import { isApiRequestError, serverApiFetch } from "../../../lib/server-api";
+import {
+  toWhatsappNumberOptions,
+  type WhatsappNumberOption,
+} from "../../../lib/whatsapp-number-options";
 import { getCurrentWorkspace } from "../../../lib/current-workspace";
 import { MetaEntityControls } from "./meta-entity-controls";
 import { MetaReportFilters } from "./meta-report-filters";
+import { ReportFiltersProvider } from "./report-filter-state";
+import { ReportPeriodFilter } from "./report-period-filter";
+import { logMetaReportingSyncEnqueueFailure } from "./reports-error-logging";
 import { ReportAdPreview } from "./report-ad-preview";
 import {
   REPORT_INSIGHT_FETCH_SIZE,
@@ -200,6 +209,7 @@ type ReportFilters = {
   status?: string;
   until?: string;
   whatsappClassification?: string;
+  whatsappInstanceId?: string;
 };
 type ReportSortColumn = {
   cost: ReportSortAction;
@@ -307,7 +317,28 @@ async function getCampaignReports(
       report,
       state: report.campaigns.length > 0 ? "real" : "empty",
     };
-  } catch {
+  } catch (error) {
+    // Fase 6.3b: the API now answers 404 for a drill-down campaign outside
+    // the current BM/accounts (or of an inactive account). That is an empty
+    // cut, as before the campaign check, never "API indisponível".
+    if (
+      filters.campaignId &&
+      isApiRequestError(error) &&
+      error.status === 404
+    ) {
+      return {
+        report: {
+          workspaceId: "unavailable",
+          rangeLabel:
+            filters.since && filters.until
+              ? periodLabel(filters.since, filters.until)
+              : "Período selecionado",
+          campaigns: [],
+        },
+        state: "empty",
+      };
+    }
+
     return {
       report: {
         workspaceId: "unavailable",
@@ -513,6 +544,24 @@ async function getMetaAssets(): Promise<MetaAssetsDto | null> {
   }
 }
 
+/**
+ * Números WhatsApp ativos do workspace (as conexões do nod). Uma conexão
+ * removida sai da lista, mas a URL com o id dela continua valendo.
+ */
+async function getWhatsappInstances(): Promise<WhatsappNumberOption[]> {
+  try {
+    const connections = await serverApiFetch<WhatsappConnectionDto[]>(
+      "/integrations/whatsapp-connections",
+    );
+
+    return toWhatsappNumberOptions(connections).filter(
+      (number) => number.active,
+    );
+  } catch {
+    return [];
+  }
+}
+
 function reportQuery(
   filters: ReportFilters,
   includeComparison = false,
@@ -541,6 +590,10 @@ function reportQuery(
   }
 
   setAdAccountParams(params, splitAdAccountIds(filters.adAccountId));
+
+  if (filters.whatsappInstanceId) {
+    params.set("whatsappInstanceId", filters.whatsappInstanceId);
+  }
 
   if (filters.campaignId) {
     params.set("campaignId", filters.campaignId);
@@ -613,6 +666,7 @@ async function syncMetaReports(formData: FormData) {
     "delivery",
     "selectedIds",
     "whatsappClassification",
+    "whatsappInstanceId",
     "view",
     "metrics",
     "mode",
@@ -657,7 +711,9 @@ async function syncMetaReports(formData: FormData) {
     );
     revalidatePath("/reports");
     redirectParams.set("notice", "meta-sync-queued");
-  } catch {
+  } catch (error) {
+    // Keep operational context without serializing the error or form values.
+    logMetaReportingSyncEnqueueFailure(error);
     redirectParams.set("notice", "meta-sync-error");
   }
 
@@ -923,6 +979,7 @@ function leadsHref(filters: {
   since?: string;
   until?: string;
   whatsappClassification?: string;
+  whatsappInstanceId?: string;
 }): string {
   const params = new URLSearchParams();
 
@@ -962,6 +1019,10 @@ function leadsHref(filters: {
 
   if (filters.whatsappClassification) {
     params.set("whatsappClassification", filters.whatsappClassification);
+  }
+
+  if (filters.whatsappInstanceId) {
+    params.set("whatsappInstanceId", filters.whatsappInstanceId);
   }
 
   const query = params.toString();
@@ -1373,10 +1434,25 @@ function aggregateFunnelSteps(
   spendCents: number,
 ): ReportFunnelStepDto[] {
   const steps = new Map<string, ReportFunnelStepDto>();
+  const order: string[] = [];
 
   for (const row of rows) {
+    // Merge estavel: a API ja manda as etapas na ordem do funil, mas linhas sem
+    // compra omitem first_purchase/repurchase. Anexar no fim jogaria uma etapa
+    // do meio do funil para o final; inserimos logo apos a etapa anterior desta
+    // mesma linha.
+    let insertAt = 0;
+
     for (const step of row.funnelSteps) {
       const current = steps.get(step.key);
+      const known = order.indexOf(step.key);
+
+      if (known >= 0) {
+        insertAt = known + 1;
+      } else {
+        order.splice(insertAt, 0, step.key);
+        insertAt += 1;
+      }
 
       steps.set(step.key, {
         key: step.key,
@@ -1387,10 +1463,14 @@ function aggregateFunnelSteps(
     }
   }
 
-  return Array.from(steps.values()).map((step) => ({
-    ...step,
-    costCents: step.value > 0 ? Math.floor(spendCents / step.value) : null,
-  }));
+  return order.map((key) => {
+    const step = steps.get(key)!;
+
+    return {
+      ...step,
+      costCents: step.value > 0 ? Math.floor(spendCents / step.value) : null,
+    };
+  });
 }
 
 function reportTotals(rows: PerformanceRow[]): ReportTotals {
@@ -1493,7 +1573,9 @@ function metaSyncPeriodState(
 
   const ranges = accounts
     .map((account) =>
-      account.syncStatus === "synced" &&
+      // Only a completed or currently running import can use its persisted
+      // range. Unknown, pending, and error statuses remain fail-closed.
+      (account.syncStatus === "synced" || account.syncStatus === "syncing") &&
       account.lastSyncSince &&
       account.lastSyncUntil
         ? `${account.lastSyncSince}|${account.lastSyncUntil}`
@@ -1535,7 +1617,7 @@ function metaSyncCoversPeriod(
     accounts.length > 0 &&
     accounts.every(
       (account) =>
-        account.syncStatus === "synced" &&
+        (account.syncStatus === "synced" || account.syncStatus === "syncing") &&
         Boolean(account.lastSyncSince) &&
         Boolean(account.lastSyncUntil) &&
         account.lastSyncSince! <= since &&
@@ -1939,10 +2021,17 @@ function PerformanceSummaryFooter({
 
   return (
     <tfoot className="report-summary">
-      {lines.map((line) => (
+      {lines.map((line, index) => (
         <tr
           data-currency={perCurrency ? line.currency : undefined}
           key={line.currency}
+          style={
+            perCurrency
+              ? ({
+                  "--summary-after": lines.length - 1 - index,
+                } as CSSProperties)
+              : undefined
+          }
         >
           <td
             className="performance-name-cell summary-name"
@@ -2376,6 +2465,9 @@ export default async function ReportsPage({
         resolvedSearchParams.adAccountIds,
       ),
     ) || undefined;
+  const whatsappInstanceId = asStringParam(
+    resolvedSearchParams.whatsappInstanceId,
+  );
   const campaignId = asStringParam(resolvedSearchParams.campaignId);
   const adSetId = asStringParam(resolvedSearchParams.adSetId);
   const adId = asStringParam(resolvedSearchParams.adId);
@@ -2433,6 +2525,7 @@ export default async function ReportsPage({
     compareUntil,
     businessId,
     adAccountId,
+    whatsappInstanceId,
     campaignId,
     adSetId,
     adId,
@@ -2470,6 +2563,7 @@ export default async function ReportsPage({
     currentWorkspaceResult,
     comparisonReports,
     metaAssets,
+    whatsappInstances,
     metaStructure,
     adAccountCurrencies,
   ] = await Promise.all([
@@ -2497,6 +2591,7 @@ export default async function ReportsPage({
         })
       : Promise.resolve(null),
     getMetaAssets(),
+    getWhatsappInstances(),
     shouldLoadMetaStructure ? getMetaStructureReport() : Promise.resolve(null),
     getAdAccountCurrencies(),
   ]);
@@ -2517,6 +2612,34 @@ export default async function ReportsPage({
     since,
     until,
   };
+  const hasWhatsappInstanceFilter = Boolean(whatsappInstanceId);
+  const appliedFilterValues = {
+    since: since ?? "",
+    until: until ?? "",
+    compareSince: compareSince ?? "",
+    compareUntil: compareUntil ?? "",
+    businessId: businessId ?? "",
+    adAccountId: adAccountId ?? "",
+    whatsappInstanceId: whatsappInstanceId ?? "",
+    campaignId: campaignId ?? "",
+    adSetId: adSetId ?? "",
+    adId: adId ?? "",
+    nameContains: nameContains ?? "",
+    nameScope: nameScope ?? "",
+    status: status ?? "",
+    delivery,
+    selectedIds: selectedIds ?? "",
+    whatsappClassification: whatsappClassification ?? "",
+    pageSize: String(pageSize),
+    metrics: activeMetricGroup,
+    view: activeView,
+    mode: activeMode === "insights" ? activeMode : "",
+    objective: activeMode === "insights" ? insightObjective : "",
+    sort: sort?.key ?? "",
+    dir: sort?.direction ?? "",
+  };
+  const metaMetricsAreCampaignExclusive =
+    campaignReports?.report.metaMetricsScope === "campaign";
   const rows = campaignReports?.report.campaigns ?? [];
   const adSetRows = adSetReports?.report.adSets ?? [];
   const adRows = adReports?.report.ads ?? [];
@@ -2599,6 +2722,12 @@ export default async function ReportsPage({
     metaSyncPeriod.since === since &&
     metaSyncPeriod.until === until;
   const metaPeriodCoversReport = metaSyncCoversPeriod(metaAssets, since, until);
+  // Reporting-only breaker (API): sync paused until the Meta account is
+  // reconnected/validated. Conversions are not affected.
+  const metaReconnectAccounts = (metaAssets?.reportingAccounts ?? []).filter(
+    (account) =>
+      account.active && account.syncError?.startsWith("Reconecte a conta Meta"),
+  );
   const metaPeriodProvidesReport =
     activeView === "campaigns"
       ? metaPeriodCoversReport
@@ -2776,241 +2905,223 @@ export default async function ReportsPage({
         className="surface-panel report-control-center"
         aria-label="Controles do relatório"
       >
-        <div className="report-command-body">
-          <form className="report-period-form" action="/reports">
-            <input type="hidden" name="view" value={activeView} />
-            <input type="hidden" name="metrics" value={activeMetricGroup} />
-            <input type="hidden" name="pageSize" value={pageSize} />
-            <input type="hidden" name="businessId" value={businessId ?? ""} />
-            <AdAccountHiddenInput value={adAccountId} />
-            <input type="hidden" name="campaignId" value={campaignId ?? ""} />
-            <input type="hidden" name="adSetId" value={adSetId ?? ""} />
-            <input type="hidden" name="adId" value={adId ?? ""} />
-            <input type="hidden" name="nameScope" value={nameScope ?? ""} />
-            <input
-              type="hidden"
-              name="nameContains"
-              value={nameContains ?? ""}
-            />
-            <input type="hidden" name="status" value={status ?? ""} />
-            <input type="hidden" name="delivery" value={delivery} />
-            <input type="hidden" name="selectedIds" value={selectedIds ?? ""} />
-            <input
-              type="hidden"
-              name="whatsappClassification"
-              value={whatsappClassification ?? ""}
-            />
-            <input
-              type="hidden"
-              name="compareSince"
-              value={compareSince ?? ""}
-            />
-            <input
-              type="hidden"
-              name="compareUntil"
-              value={compareUntil ?? ""}
-            />
-            <ReportSortHiddenInputs sort={sort} />
-            <ReportModeHiddenInputs
-              mode={activeMode}
-              objective={insightObjective}
-            />
-            <div className="report-period-context">
-              <CalendarRange aria-hidden="true" size={17} />
-              <span>
-                <strong>Período de análise</strong>
-                <small>{requestedPeriodLabel}</small>
-              </span>
+        <ReportFiltersProvider applied={appliedFilterValues}>
+          <div className="report-toolbar">
+            <div
+              className="report-toolbar-group report-toolbar-period"
+              role="group"
+              aria-label="Período"
+            >
+              <span className="micro-label report-group-label">Período</span>
+              <ReportPeriodFilter periodLabel={requestedPeriodLabel} />
             </div>
-            <label className="filter-field">
-              <span>Início</span>
-              <input type="date" name="since" defaultValue={since} />
-            </label>
-            <label className="filter-field">
-              <span>Fim</span>
-              <input type="date" name="until" defaultValue={until} />
-            </label>
-            <button className="button" type="submit">
-              Aplicar período
-            </button>
-          </form>
 
-          <div className="report-command-meta">
-            <div className="report-context-tags">
-              {metaSyncPeriod.kind === "single" ? (
-                <span className="tag">
-                  Meta:{" "}
-                  {periodLabel(metaSyncPeriod.since, metaSyncPeriod.until)}
-                </span>
-              ) : null}
-              {reportState === "error" ? (
-                <span className="tag">API indisponível</span>
-              ) : null}
-            </div>
-            <div className="report-command-actions">
-              {/* Plain <a>: the target is a route handler (a CSV download),
-                  so a Next <Link> would prefetch it as a page and 404. */}
-              <a
-                className="button ghost"
-                href={reportExportHref(reportFilters, activeView)}
-              >
-                <Download aria-hidden="true" size={16} />
-                Exportar CSV
-              </a>
-              {canSyncMetaReports ? (
-                <form action={syncMetaReports}>
-                  <input type="hidden" name="view" value={activeView} />
-                  <input
-                    type="hidden"
-                    name="metrics"
-                    value={activeMetricGroup}
-                  />
-                  <input type="hidden" name="pageSize" value={pageSize} />
-                  <input type="hidden" name="since" value={since ?? ""} />
-                  <input type="hidden" name="until" value={until ?? ""} />
-                  <input
-                    type="hidden"
-                    name="compareSince"
-                    value={compareSince ?? ""}
-                  />
-                  <input
-                    type="hidden"
-                    name="compareUntil"
-                    value={compareUntil ?? ""}
-                  />
-                  <input
-                    type="hidden"
-                    name="businessId"
-                    value={businessId ?? ""}
-                  />
-                  <AdAccountHiddenInput value={adAccountId} />
-                  <input
-                    type="hidden"
-                    name="campaignId"
-                    value={campaignId ?? ""}
-                  />
-                  <input type="hidden" name="adSetId" value={adSetId ?? ""} />
-                  <input type="hidden" name="adId" value={adId ?? ""} />
-                  <input
-                    type="hidden"
-                    name="nameScope"
-                    value={nameScope ?? ""}
-                  />
-                  <input
-                    type="hidden"
-                    name="nameContains"
-                    value={nameContains ?? ""}
-                  />
-                  <input type="hidden" name="status" value={status ?? ""} />
-                  <input type="hidden" name="delivery" value={delivery} />
-                  <input
-                    type="hidden"
-                    name="selectedIds"
-                    value={selectedIds ?? ""}
-                  />
-                  <input
-                    type="hidden"
-                    name="whatsappClassification"
-                    value={whatsappClassification ?? ""}
-                  />
-                  <ReportSortHiddenInputs sort={sort} />
-                  <ReportModeHiddenInputs
-                    mode={activeMode}
-                    objective={insightObjective}
-                  />
-                  <SubmitButton
-                    className="button ghost"
-                    pendingLabel="Sincronizando..."
-                    statusText="Enfileirando leitura dos dados Meta."
-                  >
-                    <RefreshCcw aria-hidden="true" size={16} />
-                    Sincronizar Meta
-                  </SubmitButton>
-                </form>
-              ) : (
-                <span className="tag">
-                  {workspacePermissionsUnavailable
-                    ? "Permissões indisponíveis"
-                    : "Sem permissão para sincronizar Meta"}
-                </span>
-              )}
-            </div>
-          </div>
-        </div>
-
-        <div className="report-analysis-controls">
-          <div className="report-analysis-switcher">
-            <nav className="report-view-tabs" aria-label="Nível do relatório">
-              {(
-                [
-                  ["campaigns", "Campanhas"],
-                  ["adsets", "Conjuntos"],
-                  ["ads", "Anúncios"],
-                ] as const
-              ).map(([view, label]) => (
-                <Link
-                  aria-current={activeView === view ? "page" : undefined}
-                  className={activeView === view ? "active" : ""}
-                  href={reportViewHref(view, {
-                    ...reportFilters,
-                    selectedIds:
-                      view === activeView
-                        ? reportFilters.selectedIds
-                        : undefined,
-                  })}
-                  key={view}
+            <div
+              className="report-toolbar-group report-toolbar-scope"
+              role="group"
+              aria-label="Escopo"
+            >
+              <div className="report-analysis-switcher">
+                <span className="micro-label report-group-label">Escopo</span>
+                <nav
+                  className="report-view-tabs"
+                  aria-label="Nível do relatório"
                 >
-                  {label}
-                </Link>
-              ))}
-            </nav>
-            <div className="report-analysis-meta">
-              <span className="tag">
-                {pagination?.totalItems ?? activeRows.length}{" "}
-                {activeCopy.plural}
-              </span>
-              <ReportSelectionToolbar
-                activeSelectedIds={activeSelectedIds}
-                filterActive={Boolean(selectedIds)}
-                level={activeSelectionLevel}
-                workspaceId={currentWorkspaceId}
+                  {(
+                    [
+                      ["campaigns", "Campanhas"],
+                      ["adsets", "Conjuntos"],
+                      ["ads", "Anúncios"],
+                    ] as const
+                  ).map(([view, label]) => (
+                    <Link
+                      aria-current={activeView === view ? "page" : undefined}
+                      className={activeView === view ? "active" : ""}
+                      href={reportViewHref(view, {
+                        ...reportFilters,
+                        selectedIds:
+                          view === activeView
+                            ? reportFilters.selectedIds
+                            : undefined,
+                      })}
+                      key={view}
+                    >
+                      {label}
+                    </Link>
+                  ))}
+                </nav>
+                <span className="tag report-scope-count">
+                  {pagination?.totalItems ?? activeRows.length}{" "}
+                  {activeCopy.plural}
+                </span>
+                <div className="report-analysis-meta">
+                  <ReportSelectionToolbar
+                    activeSelectedIds={activeSelectedIds}
+                    filterActive={Boolean(selectedIds)}
+                    level={activeSelectionLevel}
+                    workspaceId={currentWorkspaceId}
+                  />
+                </div>
+              </div>
+
+              <MetaReportFilters
+                accountCurrencies={accountCurrencies}
+                assets={metaAssets}
+                whatsappInstances={whatsappInstances}
               />
             </div>
-          </div>
 
-          <MetaReportFilters
-            accountCurrencies={accountCurrencies}
-            assets={metaAssets}
-            businessId={businessId}
-            adAccountId={adAccountId}
-            campaignId={campaignId}
-            adSetId={adSetId}
-            adId={adId}
-            metrics={activeMetricGroup}
-            nameScope={nameScope}
-            nameContains={nameContains}
-            delivery={delivery}
-            selectedIds={selectedIds}
-            status={status}
-            whatsappClassification={whatsappClassification}
-            since={since}
-            until={until}
-            compareSince={compareSince}
-            compareUntil={compareUntil}
-            view={activeView}
-            pageSize={pageSize}
-            sort={sort}
-            insightObjective={
-              activeMode === "insights" ? insightObjective : undefined
-            }
-          />
-        </div>
+            <div
+              className="report-toolbar-group report-toolbar-actions"
+              role="group"
+              aria-label="Ações"
+            >
+              <span className="micro-label report-group-label">Ações</span>
+              <div className="report-command-actions">
+                {reportState === "error" ? (
+                  <span className="tag">API indisponível</span>
+                ) : null}
+                {/* Plain <a>: the target is a route handler (a CSV download),
+                    so a Next <Link> would prefetch it as a page and 404. */}
+                <a
+                  className="button ghost"
+                  href={reportExportHref(reportFilters, activeView)}
+                >
+                  <Download aria-hidden="true" size={16} />
+                  Exportar CSV
+                </a>
+                <div className="report-sync-action">
+                  {canSyncMetaReports ? (
+                    <form action={syncMetaReports}>
+                      <input type="hidden" name="view" value={activeView} />
+                      <input
+                        type="hidden"
+                        name="metrics"
+                        value={activeMetricGroup}
+                      />
+                      <input type="hidden" name="pageSize" value={pageSize} />
+                      <input type="hidden" name="since" value={since ?? ""} />
+                      <input type="hidden" name="until" value={until ?? ""} />
+                      <input
+                        type="hidden"
+                        name="compareSince"
+                        value={compareSince ?? ""}
+                      />
+                      <input
+                        type="hidden"
+                        name="compareUntil"
+                        value={compareUntil ?? ""}
+                      />
+                      <input
+                        type="hidden"
+                        name="businessId"
+                        value={businessId ?? ""}
+                      />
+                      <AdAccountHiddenInput value={adAccountId} />
+                      <input
+                        type="hidden"
+                        name="whatsappInstanceId"
+                        value={whatsappInstanceId ?? ""}
+                      />
+                      <input
+                        type="hidden"
+                        name="campaignId"
+                        value={campaignId ?? ""}
+                      />
+                      <input
+                        type="hidden"
+                        name="adSetId"
+                        value={adSetId ?? ""}
+                      />
+                      <input type="hidden" name="adId" value={adId ?? ""} />
+                      <input
+                        type="hidden"
+                        name="nameScope"
+                        value={nameScope ?? ""}
+                      />
+                      <input
+                        type="hidden"
+                        name="nameContains"
+                        value={nameContains ?? ""}
+                      />
+                      <input type="hidden" name="status" value={status ?? ""} />
+                      <input type="hidden" name="delivery" value={delivery} />
+                      <input
+                        type="hidden"
+                        name="selectedIds"
+                        value={selectedIds ?? ""}
+                      />
+                      <input
+                        type="hidden"
+                        name="whatsappClassification"
+                        value={whatsappClassification ?? ""}
+                      />
+                      <ReportSortHiddenInputs sort={sort} />
+                      <ReportModeHiddenInputs
+                        mode={activeMode}
+                        objective={insightObjective}
+                      />
+                      <SubmitButton
+                        className="button ghost"
+                        pendingLabel="Sincronizando..."
+                        statusText="Enfileirando leitura dos dados Meta."
+                      >
+                        <RefreshCcw aria-hidden="true" size={16} />
+                        Sincronizar Meta
+                      </SubmitButton>
+                    </form>
+                  ) : (
+                    <span className="tag">
+                      {workspacePermissionsUnavailable
+                        ? "Permissões indisponíveis"
+                        : "Sem permissão para sincronizar Meta"}
+                    </span>
+                  )}
+                  {metaSyncPeriod.kind === "single" ? (
+                    <small
+                      className="report-sync-hint"
+                      title={`Janela já sincronizada da Meta: ${periodLabel(metaSyncPeriod.since, metaSyncPeriod.until)}`}
+                    >
+                      Meta:{" "}
+                      {periodLabel(metaSyncPeriod.since, metaSyncPeriod.until)}
+                    </small>
+                  ) : null}
+                </div>
+              </div>
+            </div>
+          </div>
+        </ReportFiltersProvider>
       </section>
 
       {pageNotice ? (
         <div className={`feedback-banner ${pageNotice.tone}`} role="status">
           <strong>{pageNotice.title}</strong>
           <span>{pageNotice.message}</span>
+        </div>
+      ) : null}
+
+      {metaReconnectAccounts.length > 0 ? (
+        <div className="feedback-banner warn" role="status">
+          <strong>Reconecte a conta Meta</strong>
+          <span>
+            A sincronização de relatórios está pausada para{" "}
+            {metaReconnectAccounts.length === 1
+              ? metaReconnectAccounts[0].adAccountName
+              : `${metaReconnectAccounts.length} contas de anúncios`}
+            . Reconecte ou valide a conexão em Integrações; o envio de
+            conversões continua normalmente.
+          </span>
+        </div>
+      ) : null}
+
+      {hasWhatsappInstanceFilter ? (
+        <div className="feedback-banner warn" role="status">
+          <strong>Escopo do número WhatsApp</strong>
+          <span>
+            {metaMetricsAreCampaignExclusive
+              ? "Leads, conversas e métricas Meta correspondem ao número selecionado: a API confirmou campanha exclusiva."
+              : "Leads e conversas reais estão filtrados por este número. Investimento, impressões e demais métricas Meta continuam no escopo da campanha ou conta, não por número."}
+          </span>
         </div>
       ) : null}
 
@@ -3022,6 +3133,13 @@ export default async function ReportsPage({
           <strong>{metaPeriodWarning.title}</strong>
           <span>{metaPeriodWarning.message}</span>
         </div>
+      ) : null}
+
+      {reportState !== "error" ? (
+        <MetaSyncCoverageNotice
+          action={canSyncMetaReports ? "Use Sincronizar Meta acima." : undefined}
+          coverage={loadedReport?.metaSyncCoverage}
+        />
       ) : null}
 
       {hierarchySelection.length > 0 ? (
@@ -3522,9 +3640,11 @@ export default async function ReportsPage({
                           workspaceId={currentWorkspaceId}
                         />
                         <ReportAdPreview
+                          adId={row.id}
                           adName={row.name}
                           previewUrl={row.previewUrl}
                           thumbnailUrl={row.thumbnailUrl}
+                          thumbnailVersion={row.thumbnailVersion}
                         />
                         <div className="report-entity-copy">
                           <strong>

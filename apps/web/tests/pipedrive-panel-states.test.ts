@@ -150,7 +150,7 @@ describe("Pipedrive received events (bounded, read-only diagnostics)", () => {
       });
     });
 
-    expect(await screen.findByText(/Ganho do negócio \/ .*Observado/)).toBeTruthy();
+    expect(await screen.findByText(/Ganho do negócio \/ .*Registrado sem envio/)).toBeTruthy();
     expect(screen.getByText(/199,90/)).toBeTruthy();
     expect(screen.getByText(/Regra removida/)).toBeTruthy();
     expect(screen.getByText(/Moeda do negócio diferente/)).toBeTruthy();
@@ -167,7 +167,7 @@ describe("Pipedrive received events (bounded, read-only diagnostics)", () => {
     expect(screen.queryByText(/Nenhum evento recebido ainda/)).toBeNull();
 
     fireEvent.click(screen.getAllByRole("button", { name: "Tentar novamente" })[0]!);
-    await screen.findByText("Observado", { selector: ".event-chip" });
+    await screen.findByText("Registrado sem envio", { selector: ".event-chip" });
   });
 
   it("flags a malformed events response without rendering it", async () => {
@@ -263,5 +263,20 @@ describe("Pipedrive received events (bounded, read-only diagnostics)", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Ver todos (40)" }));
     expect(screen.getByRole("list", { name: "Eventos recebidos" }).children).toHaveLength(40);
+  });
+});
+
+// Fase 6.1b — porte do #165 do SaaS (478f0f9a).
+describe("Pipedrive: números que não puderam ser carregados", () => {
+  it("never shows a failed numbers read as “no number” nor lets saving drop channels", () => {
+    const { actions } = renderPanel({ allChannels: [], channelsUnavailable: true });
+    expect(
+      screen.getAllByText(/Não foi possível carregar os números de WhatsApp agora/).length,
+    ).toBeGreaterThan(0);
+    expect(screen.queryByText(/Nenhum número de WhatsApp foi encontrado/)).toBeNull();
+    const save = screen.getByRole("button", { name: "Salvar canais" }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    fireEvent.click(save);
+    expect(actions.setChannelBindingsAction).not.toHaveBeenCalled();
   });
 });

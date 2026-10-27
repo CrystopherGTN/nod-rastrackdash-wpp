@@ -5,6 +5,7 @@ import type {
   ConversionAuditEventDetailDto,
   ConversionAuditPayloadSnapshotDto,
 } from "@wpptrack/shared";
+import { formatMoney } from "@wpptrack/shared";
 import {
   Braces,
   Check,
@@ -52,6 +53,40 @@ function stateChipClass(state: ConversionAuditDeliveryStateDto): string {
   return "event-chip";
 }
 
+/** Reasons the screen names itself (older APIs answer a generic text). */
+const auditReasonLabels: Record<string, string> = {
+  // Porte do SaaS #155: entry receipt; the provider rule sends the LeadSubmitted.
+  lead_submitted_deferred_to_rule:
+    "Lead recebido adiado: será enviado pela regra",
+};
+
+export function auditReasonLabel(
+  reasonCode: string | null | undefined,
+  reason: string,
+): string {
+  return (reasonCode && auditReasonLabels[reasonCode]) || reason;
+}
+
+/**
+ * Aba "Resposta Meta": o motivo legível da recusa (montado pela API só com
+ * código, subcódigo e identificador da Meta) acima do JSON guardado.
+ */
+export function MetaRejectionReason({
+  reasonCode,
+  reason,
+}: {
+  reasonCode: string | null | undefined;
+  reason: string | null | undefined;
+}) {
+  if (reasonCode !== "MetaCapiRejected" || !reason) return null;
+  return (
+    <div className="event-audit-reason">
+      <span className="micro-label">Motivo da recusa da Meta</span>
+      <strong>{reason}</strong>
+    </div>
+  );
+}
+
 function missingFieldLabel(field: string): string {
   const labels: Record<string, string> = {
     phone_hash: "Telefone identificável",
@@ -63,6 +98,34 @@ function missingFieldLabel(field: string): string {
   };
 
   return labels[field] ?? field;
+}
+
+/**
+ * Tarefa 21: author and note of a manual conversion, shown on top of the
+ * "Entrada" tab (the note stays in the panel; it is never sent to Meta).
+ */
+export function ManualConversionNote({ payload }: { payload: unknown }) {
+  if (
+    !payload ||
+    typeof payload !== "object" ||
+    Array.isArray(payload) ||
+    (payload as Record<string, unknown>).processingMode !== "manual_conversion"
+  )
+    return null;
+  const record = payload as Record<string, unknown>;
+  const author =
+    typeof record.createdByName === "string" ? record.createdByName : null;
+  const note = typeof record.note === "string" ? record.note : null;
+  const orderRef = typeof record.orderRef === "string" ? record.orderRef : null;
+  return (
+    <section className="event-audit-manual-note">
+      <span className="micro-label">
+        Registro manual{author ? ` por ${author}` : ""}
+      </span>
+      {orderRef ? <p>Pedido/venda: {orderRef}</p> : null}
+      <p>{note ?? "Sem observação."}</p>
+    </section>
+  );
 }
 
 function JsonSnapshot({
@@ -339,12 +402,35 @@ export function EventAuditDetails({
                           </PresentationMask>
                         </dd>
                       </div>
+                      {detail.valueCorrection ? (
+                        <div>
+                          <dt>Valor</dt>
+                          <dd>
+                            <PresentationMask placeholder="Valor oculto">
+                              {formatMoney(
+                                detail.valueCorrection.valueCents,
+                                detail.valueCorrection.currency,
+                              )}{" "}
+                              <small>
+                                valor corrigido (antes{" "}
+                                {formatMoney(
+                                  detail.valueCorrection.previousValueCents,
+                                  detail.valueCorrection.currency,
+                                )}
+                                )
+                              </small>
+                            </PresentationMask>
+                          </dd>
+                        </div>
+                      ) : null}
                     </dl>
 
                     {detail.reason ? (
                       <div className="event-audit-reason">
                         <span className="micro-label">Motivo técnico</span>
-                        <strong>{detail.reason}</strong>
+                        <strong>
+                          {auditReasonLabel(detail.reasonCode, detail.reason)}
+                        </strong>
                         {detail.reasonCode ? (
                           <code>{detail.reasonCode}</code>
                         ) : null}
@@ -398,13 +484,24 @@ export function EventAuditDetails({
                   </section>
                 ) : null}
                 {activeTab === "source" ? (
-                  <JsonSnapshot snapshot={detail.sourceSnapshot} />
+                  <>
+                    <ManualConversionNote
+                      payload={detail.sourceSnapshot.payload}
+                    />
+                    <JsonSnapshot snapshot={detail.sourceSnapshot} />
+                  </>
                 ) : null}
                 {activeTab === "request" ? (
                   <JsonSnapshot snapshot={detail.metaRequest} />
                 ) : null}
                 {activeTab === "response" ? (
-                  <JsonSnapshot snapshot={detail.metaResponse} />
+                  <>
+                    <MetaRejectionReason
+                      reasonCode={detail.reasonCode}
+                      reason={detail.reason}
+                    />
+                    <JsonSnapshot snapshot={detail.metaResponse} />
+                  </>
                 ) : null}
               </div>
             </>

@@ -1,11 +1,14 @@
 import { z } from "zod";
 import { conversionEventNameSchema } from "./conversion-events";
-import { paytSaleEventNames } from "./conversion-rules";
+import {
+  isSalesPlatformProvider,
+  salesPlatformEventNames,
+} from "./conversion-rules";
 
 /**
  * Fase 5.3 — URL única por plataforma e URLs por evento.
  *
- * - Plataforma de venda (Payt): UMA URL por workspace; o evento vem de cada
+ * - Plataforma de venda (Payt, Braip, Yampi): UMA URL por workspace; o evento vem de cada
  *   postback (compra aprovada, Pix/boleto gerado, carrinho abandonado).
  * - Automação (Unnichat, Umbler): UMA URL por evento, válida para todos os
  *   números do workspace.
@@ -16,6 +19,8 @@ import { paytSaleEventNames } from "./conversion-rules";
  */
 export const integrationEndpointProviders = [
   "payt",
+  "braip",
+  "yampi",
   "unnichat",
   "umbler",
 ] as const;
@@ -46,15 +51,17 @@ export const integrationEndpointAutomationEvents = {
 export function integrationEndpointKindFor(
   provider: z.infer<typeof integrationEndpointProviderSchema>,
 ): z.infer<typeof integrationEndpointKindSchema> {
-  return provider === "payt" ? "sales_platform" : "automation_event";
+  return isSalesPlatformProvider(provider)
+    ? "sales_platform"
+    : "automation_event";
 }
 
-/** Eventos suportados por uma URL (Payt: os que o postback pode virar). */
+/** Eventos suportados por uma URL (Payt/Braip/Yampi: os que o postback pode virar). */
 export function integrationEndpointSupportedEvents(
   provider: z.infer<typeof integrationEndpointProviderSchema>,
 ): readonly string[] {
-  return provider === "payt"
-    ? paytSaleEventNames
+  return isSalesPlatformProvider(provider)
+    ? salesPlatformEventNames
     : integrationEndpointAutomationEvents[provider];
 }
 
@@ -66,11 +73,12 @@ export const integrationEndpointCreateInputSchema = z
   })
   .strict()
   .superRefine((input, context) => {
-    if (input.provider === "payt") {
+    if (isSalesPlatformProvider(input.provider)) {
       if (input.eventName) {
         context.addIssue({
           code: z.ZodIssueCode.custom,
-          message: "A Payt usa uma única URL; o evento vem de cada venda",
+          message:
+            "A plataforma de venda usa uma única URL; o evento vem de cada venda",
           path: ["eventName"],
         });
       }
@@ -177,6 +185,8 @@ export const integrationUnattributedReasons = {
   rule_unavailable: "A regra escolhida não está mais ativa",
   rule_declined:
     "A regra do número não converteu (filtro, outro número, lead ou bloqueio; veja os eventos recebidos da regra)",
+  multiple_rules_for_event:
+    "Duas regras para o mesmo evento neste número — unifique as regras",
 } as const;
 export type IntegrationUnattributedReasonDto =
   keyof typeof integrationUnattributedReasons;
@@ -197,6 +207,13 @@ export const integrationEndpointEventStatuses = [
   "unattributed",
   "ignored",
   "invalid",
+  /**
+   * Fase 6.5 (SaaS #170): recusado com erro HTTP (a plataforma recebeu 4xx):
+   * token ausente/errado, URL removida, licença sem acesso, corpo ilegível.
+   * Sem token válido só os metadados ficam (nunca o payload). Só aparece em
+   * Backoffice > Recebimentos das URLs únicas.
+   */
+  "rejected",
 ] as const;
 export const integrationEndpointEventStatusSchema = z.enum(
   integrationEndpointEventStatuses,
@@ -225,6 +242,48 @@ export const integrationUnattributedEventSchema = z.object({
 export const integrationUnattributedEventListSchema = z.object({
   total: z.number().int().nonnegative(),
   items: z.array(integrationUnattributedEventSchema),
+});
+
+/** O que o leitor leu de uma venda guardada (para comparar com o payload). */
+export const integrationEventParsedSaleSchema = z.object({
+  eventName: z.string(),
+  valueCents: z.number().int().nullable(),
+  currency: z.string().nullable(),
+  /** Valor enviado à Meta (true em toda plataforma de venda do nod). */
+  valueSent: z.boolean(),
+  productCode: z.string().nullable(),
+  productName: z.string().nullable(),
+  offerCode: z.string().nullable(),
+  offerName: z.string().nullable(),
+  /** Pedido/transação da plataforma (trans_key da Braip, id do pedido da Yampi). */
+  orderRef: z.string().nullable(),
+  occurredAt: z.string().datetime().nullable(),
+  /** Só os últimos 4 dígitos. */
+  phoneMasked: z.string().nullable(),
+  providerStatus: z.string().nullable(),
+  /** Venda de teste da plataforma. */
+  test: z.boolean(),
+});
+
+/**
+ * "Ver dados recebidos" de uma venda (porte do SaaS #169, auditado). Só
+ * leitura: mostra o payload guardado com chaves de conta e segredos ocultos
+ * ao lado do que o leitor leu. Não muda nada no envio.
+ */
+export const integrationEventPayloadSchema = z.object({
+  eventId: z.string().min(1),
+  provider: integrationEndpointProviderSchema,
+  status: integrationEndpointEventStatusSchema,
+  reasonLabel: z.string(),
+  receivedAt: z.string().datetime(),
+  payloadExpiresAt: z.string().datetime(),
+  payloadAvailable: z.boolean(),
+  /** Por que o payload não aparece (apagado pela retenção, ilegível). */
+  payloadMessage: z.string().nullable(),
+  /** Payload guardado, com chaves de conta/segredos ocultos. */
+  payload: z.unknown().nullable(),
+  parsed: integrationEventParsedSaleSchema.nullable(),
+  parseError: z.string().nullable(),
 });
 
 /** Resposta de "Tentar de novo". */
@@ -269,6 +328,12 @@ export type IntegrationUnattributedEventDto = z.infer<
 >;
 export type IntegrationUnattributedEventListDto = z.infer<
   typeof integrationUnattributedEventListSchema
+>;
+export type IntegrationEventParsedSaleDto = z.infer<
+  typeof integrationEventParsedSaleSchema
+>;
+export type IntegrationEventPayloadDto = z.infer<
+  typeof integrationEventPayloadSchema
 >;
 export type IntegrationEndpointRoutingResultDto = z.infer<
   typeof integrationEndpointRoutingResultSchema

@@ -11,8 +11,15 @@ import { Check, Eye, EyeOff, RefreshCw, RotateCcw } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { PresentationMask } from "../../../components/presentation-mask";
 import { ruleEventLabelForOrigin } from "./event-copy";
+import {
+  isDeferredToRuleReason,
+  leadSubmittedOverrideCopy,
+} from "./lead-submitted-override";
 import type { ProviderConversionRuleActionResult } from "./actions";
-import { executionReasonLabel } from "../settings/provider-conversion-labels";
+import {
+  executionReasonLabel,
+  observationDetailLabel,
+} from "../settings/provider-conversion-labels";
 
 type RuleAction = (formData: FormData) => Promise<ProviderConversionRuleActionResult>;
 
@@ -24,7 +31,7 @@ type AuditStatus = ProviderConversionAutomationAuditItemDto["status"];
 export const reprocessBatchLimit = 50;
 
 const statusLabels: Record<AuditStatus, { label: string; tone: "" | "warn" | "bad" | "neutral" }> = {
-  observed: { label: "Reconhecido em observação", tone: "neutral" },
+  observed: { label: "Reconhecido sem envio", tone: "neutral" },
   eligible: { label: "Na fila de envio", tone: "neutral" },
   materialized: { label: "Virou conversão", tone: "" },
   duplicate: { label: "Repetido", tone: "warn" },
@@ -70,7 +77,7 @@ export function reprocessSummary(
   }
   if (result.observed) {
     parts.push(
-      `${result.observed} reavaliado${result.observed === 1 ? "" : "s"} em observação`,
+      `${result.observed} reavaliado${result.observed === 1 ? "" : "s"} sem envio`,
     );
   }
   if (result.blocked) {
@@ -88,7 +95,7 @@ export function reprocessConfirmText(
 ): string {
   const subject = `${count} evento${count === 1 ? "" : "s"} recebido${count === 1 ? "" : "s"}`;
   return mode === "observation"
-    ? `Reavaliar ${subject}? A regra está em observação: nada é enviado à Meta.`
+    ? `Reavaliar ${subject}? A regra está com o envio desligado: nada é enviado à Meta.`
     : `Reavaliar ${subject}? Só os que forem de um lead vindo de anúncio viram conversão e são enviados à Meta.`;
 }
 
@@ -273,7 +280,7 @@ export function ReceivedEvents({
           <dd>{audit.summary.materialized}</dd>
         </div>
         <div>
-          <dt>Em observação</dt>
+          <dt>Sem envio</dt>
           <dd>{audit.summary.observed}</dd>
         </div>
         <div>
@@ -378,9 +385,15 @@ export function ReceivedEvents({
       ) : (
         <ul className="conversion-executions-list conversion-received-list" role="list">
           {visible.map((item) => {
-            const status = statusLabels[item.status];
+            const status = isDeferredToRuleReason(item.reasonCode)
+              ? { label: leadSubmittedOverrideCopy.deferredChip, tone: "neutral" as const }
+              : statusLabels[item.status];
             const payload = payloads[item.deliveryId];
             const when = formatDateTime(item.receivedAt);
+            const observation =
+              item.status === "observed"
+                ? observationDetailLabel(item.observationDetail)
+                : null;
             return (
               <li key={item.deliveryId}>
                 <div className="conversion-executions-head">
@@ -411,6 +424,12 @@ export function ReceivedEvents({
                   {" · "}
                   {executionReasonLabel(item.reasonCode)}
                 </p>
+                {observation ? (
+                  <p className="muted conversion-received-observation">
+                    Por que não foi enviado: {observation.label}.
+                    {mode === "production" ? ` ${observation.reprocess}` : ""}
+                  </p>
+                ) : null}
                 {item.status === "ignored" ? null : (
                   <p className="muted">
                     {item.channel ? (

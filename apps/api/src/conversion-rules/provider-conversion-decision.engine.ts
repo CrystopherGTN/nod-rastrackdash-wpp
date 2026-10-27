@@ -1,3 +1,5 @@
+import { isSalesPlatformProvider } from "../inbound-webhooks/providers/sales-platform-sale";
+import { roichatPurchaseDedupePolicy } from "./roichat-purchase-dedupe";
 import type {
   ProviderConversionDecisionConversionDto,
   ProviderConversionDecisionDto,
@@ -419,12 +421,29 @@ export class ProviderConversionDecisionEngine {
 
     // A sale with a merchant order identity (Payt) is deduplicated forever by
     // that identity (seller + order + event), never by the lead window.
-    if (input.occurrence.provider === "payt" && input.occurrence.purchaseKey) {
+    if (
+      isSalesPlatformProvider(input.occurrence.provider) &&
+      input.occurrence.purchaseKey
+    ) {
       return { mode: "lifetime", scopeKey: input.occurrence.purchaseKey };
     }
+    // ROI Chat: repurchase allowed; only the same purchase (lead, number,
+    // value and currency) within 12h is a duplicate (roichat-purchase-dedupe).
+    const roichat = roichatPurchaseDedupePolicy(input);
+    if (roichat) return roichat;
     const scopeKey = [
       input.rule.eventName,
       input.occurrence.workspaceId,
+      input.occurrence.connectionId,
+      // This frozen key stays per number (#84, ported in the nod's Fase 6.0;
+      // it is persisted on every decision audit and is the historical
+      // per-number check). For once-per-lead events (QualifiedLead,
+      // LeadSubmitted) the rule "once per lead and Meta destination, whichever
+      // number or CTWA entry saw it" is enforced at materialization under a
+      // workspace-wide lead identity lock:
+      // conversion-events/lead-lifetime-conversion-guard.ts. Purchases and
+      // +-24h events stay per number by owner decision.
+      input.occurrence.channelId ?? "unresolved-channel",
       input.leadResolution.lead.id,
     ].join(":");
 

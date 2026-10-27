@@ -108,11 +108,14 @@ export const integrationProviderIds = [
   "waha",
   "zapi",
   "meta_cloud",
+  "roichat",
   "umbler",
   "gupshup",
   "data_crazy",
   "unnichat",
   "payt",
+  "braip",
+  "yampi",
   "kommo",
   "pipedrive",
   "meta",
@@ -126,7 +129,12 @@ export type WhatsappIntegrationProvider =
 
 /** Inbound webhook providers (`InboundWebhookPanel`, scoped to one). */
 export type InboundIntegrationProvider =
-  "meta_cloud" | "umbler" | "gupshup" | "data_crazy" | "unnichat";
+  | "meta_cloud"
+  | "umbler"
+  | "gupshup"
+  | "data_crazy"
+  | "unnichat"
+  | "roichat";
 
 export type CrmIntegrationProvider = "kommo" | "pipedrive";
 
@@ -146,6 +154,17 @@ export type IntegrationGate =
    * state comes from the Payt rules the workspace already has.
    */
   | { kind: "payt_rules" }
+  /**
+   * Fase 6.5: Braip, same base as Payt (a rule origin in Conversões that
+   * receives through the workspace single URL). Always offered, no gate; the
+   * state comes from the Braip rules and URL of the workspace.
+   */
+  | { kind: "braip_rules" }
+  /**
+   * Fase 6.7: Yampi, same base as Braip (single URL of the workspace). Open
+   * to every workspace in the student edition: no private-integration gate.
+   */
+  | { kind: "yampi_rules" }
   | { kind: "always" };
 
 export type IntegrationProviderDefinition = {
@@ -181,11 +200,17 @@ const logoAssets: Record<IntegrationProviderId, LogoAsset> = {
   waha: { file: "waha.png", surface: "light" },
   zapi: { file: "zapi.svg", surface: "dark" },
   meta_cloud: { file: "meta.svg", surface: "dark" },
+  // Neutral wordmark. PENDENTE: official ROI Chat logo.
+  roichat: { file: "roichat.svg", surface: "dark" },
   umbler: { file: "umbler.svg", surface: "light" },
   gupshup: { file: "gupshup.svg", surface: "light" },
   data_crazy: { file: "datacrazy.svg", surface: "dark" },
   unnichat: { file: "unnichat.png", surface: "light" },
   payt: { file: "payt.svg", surface: "dark" },
+  braip: { file: "braip.png", surface: "dark" },
+  // Neutral wordmark placeholder (same file as the SaaS). PENDENTE: official
+  // Yampi artwork with usage permission (see public/integrations/SOURCES.md).
+  yampi: { file: "yampi.svg", surface: "dark" },
   kommo: { file: "kommo.png", surface: "light" },
   pipedrive: { file: "pipedrive.svg", surface: "dark" },
   meta: { file: "meta.svg", surface: "dark" },
@@ -232,6 +257,20 @@ export const integrationProviders: readonly IntegrationProviderDefinition[] = [
     description:
       "Use a sua própria WAHA (motor GoWS): você hospeda o servidor e lê o QR no painel dela, e o RastrackDash recebe as conversas dos anúncios por webhook.",
     gate: { kind: "whatsapp_provider", provider: "waha" },
+  },
+  {
+    // Fase 6.8 (porte do #183): ROI Chat (WhatsApp API Oficial). Sem gate de
+    // integração privada no nod: o card aparece sempre, ao lado de WAHA e
+    // Meta Cloud. Uma conexão = um número = uma URL.
+    id: "roichat",
+    name: "ROI Chat",
+    category: "whatsapp_official",
+    logo: integrationLogoPath("roichat"),
+    initials: "RC",
+    logoSurface: logoSurface("roichat"),
+    description:
+      "Receba as conversas de anúncio e as compras que chegam no ROI Chat (API oficial do WhatsApp), com uma URL por número.",
+    gate: { kind: "inbound_provider", provider: "roichat" },
   },
   {
     id: "zapi",
@@ -315,6 +354,30 @@ export const integrationProviders: readonly IntegrationProviderDefinition[] = [
     description:
       "Envie compra aprovada, Pix/boleto gerado e carrinho abandonado como conversão do lead que veio do anúncio. Funciona por regra em Conversões.",
     gate: { kind: "payt_rules" },
+  },
+  {
+    id: "braip",
+    name: "Braip",
+    category: "attendance",
+    logo: integrationLogoPath("braip"),
+    initials: "Br",
+    logoSurface: logoSurface("braip"),
+    description:
+      "Envie compra aprovada, boleto/Pix gerado e checkout abandonado da Braip como conversão do lead que veio do anúncio. Uma URL única para a conta toda.",
+    gate: { kind: "braip_rules" },
+  },
+  {
+    // Fase 6.7 (porte do SaaS #186): no nod a Yampi é liberada para todos os
+    // workspaces (sem integração privada).
+    id: "yampi",
+    name: "Yampi",
+    category: "attendance",
+    logo: integrationLogoPath("yampi"),
+    initials: "Ya",
+    logoSurface: logoSurface("yampi"),
+    description:
+      "Envie pedido pago, pedido aguardando pagamento (boleto/Pix) e carrinho abandonado da Yampi como conversão do lead que veio do anúncio, com os itens do pedido. Uma URL única para a conta toda.",
+    gate: { kind: "yampi_rules" },
   },
   {
     id: "meta",

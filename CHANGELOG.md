@@ -7,6 +7,707 @@ Version 1.0.0 was the initial public release of the `nod-rastrackdash-wpp` stude
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-27
+
+Upgrade notes for students: [`docs/releases/1.3.0.json`](docs/releases/1.3.0.json). **Breaking: behavior changes on its own after the deploy (data-only promotion of observation to production, including Kommo and Pipedrive but not LeadSubmitted rules; rules following INBOUND_CONVERSION_RULES_ENABLED when INBOUND_CONVERSION_PRODUCTION_ENABLED is unset; Lead recebido moved to an active rule); read the guide before updating. Direct update from 1.0.0, 1.1.x and 1.2.0. Rollback needs the scripts in `scripts/rollback/` (see the notes), and includes the review fixes listed under Fixed.** **Two migrations (Fase 6.1a, additive; Fase 6.1c, data-only promotion): back up PostgreSQL before the redeploy.** One new optional API variable (Fase 6.1b): `META_CAPI_SEND_FIRST_NAME`, off by default. New default (Fase 6.1c): `INBOUND_CONVERSION_PRODUCTION_ENABLED` unset follows `INBOUND_CONVERSION_RULES_ENABLED`. New API variable (Fase 6.2a, no migration): `LEAD_SUBMITTED_RULE_OVERRIDE_ENABLED`, **on by default** (unset = on; explicit `false`/`0`/`off`/`no` restores the entry send); students only act if they want it off. Fase 6.3a (reports, read-only): no migration, no new variable, nothing to do. Fase 6.2b (CRM Kanban): no migration and no new variable; the build installs new dependencies (`@dnd-kit/core`, `@dnd-kit/utilities`; `@electric-sql/pglite` only in API tests) pinned in `pnpm-lock.yaml`, so redeploy API, shared and web from the same commit. Fase 6.3b (filters of Visão Geral, Relatórios, Leads, Eventos Meta and Revisão de compras that apply by themselves; WhatsApp number and several-campaign filters; activity of each Uazapi/WAHA connection): no migration and no new variable (the existing optional WEB variable `WPPTRACK_WEB_PROVIDER_STATUS_TIMEOUT_MS`, default 2000 ms, now also limits each activity read); nothing to do beyond the redeploy of API, shared and web from the same commit. Fase 6.4 (Meta Graph robustness): **two more additive migrations, `20261027130000_meta_creative_thumbnail` then `20261027130100_meta_reporting_sync_block` (they run by themselves at API boot): back up PostgreSQL before the redeploy**; only optional API variables, all with safe defaults (`WPPTRACK_META_USAGE_PAUSE_PERCENT`, `WPPTRACK_META_SYNC_DEDUPE_WINDOW_MINUTES`, `WPPTRACK_META_SYNC_MAX_DEFERRALS`, `WPPTRACK_META_AUTO_SYNC_INCREMENTAL_DAYS` — on by default with 3 days, `0` turns it off —, `META_INSIGHTS_LEVEL_MODE` default `legacy`, `META_INSIGHTS_PAGE_LIMIT` default 500, `META_INSIGHTS_ASYNC_*` and `META_CAPI_BATCH_*` off by default, `WPPTRACK_CONVERSION_WORKER_CONCURRENCY` default 1); `META_VIDEO_THUMBNAILS_ENABLED` is unchanged; redeploy API, shared and web from the same commit. Fase 6.5 (Braip on the single URL): **two more migrations, `20261027140000_braip_provider` (enum values only) then `20261027140100_braip_parser_release` (inserts the Braip reader already certified: production direct); they run by themselves at API boot: back up PostgreSQL before the redeploy**; no new variable; redeploy API, shared and web from the same commit; nothing to release or certify (guide: [`docs/setup/braip.md`](docs/setup/braip.md)). Fase 6.9 (Meta instant forms / Lead Ads and the Dashboard Leads import; nod PRs #91 and #92 without #90): **one more additive migration, `20261027145000_meta_lead_forms` (two new tables; it runs by itself at API boot): back up PostgreSQL before the redeploy**; no new variable in `.env` (the forms use the existing `META_APP_SECRET`, `META_WEBHOOK_VERIFY_TOKEN`, `META_TOKEN_ENCRYPTION_KEY` and `API_PUBLIC_URL`; the optional import command reads `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` only on its own command line, never in `.env`); nothing changes by itself after the deploy; redeploy API, shared and web from the same commit (guides: [`docs/setup/meta-lead-forms.md`](docs/setup/meta-lead-forms.md), [`docs/setup/dashboard-leads-import.md`](docs/setup/dashboard-leads-import.md)). Fase 6.9b (a Meta form connection with submissions is deactivated instead of removed): no migration, no new variable; redeploy API and web from the same commit. Fase 6.8 (ROI Chat, WhatsApp API Oficial, one URL per number for the ad entry and the purchase): **two more migrations, `20261027170000_roichat_provider` (enum values only) then `20261027170100_roichat_parser_releases` (inserts the two ROI Chat readers already certified: production direct); they run by themselves at API boot: back up PostgreSQL before the redeploy**; no new variable; redeploy API, shared and web from the same commit; nothing to release or certify (guide: [`docs/setup/roichat.md`](docs/setup/roichat.md)). Fase 6.7 (Yampi on the single URL, open to every workspace): **two more migrations, `20261027160000_yampi_provider` (enum values only) then `20261027160100_yampi_parser_release` (inserts the Yampi reader already certified: validated in the SaaS with real Yampi payloads; production direct); they run by themselves at API boot: back up PostgreSQL before the redeploy**; no new variable; redeploy API, shared and web from the same commit; nothing to release or certify; register the single URL in a Yampi store webhook (guide: [`docs/setup/yampi.md`](docs/setup/yampi.md)). Review of PR #121 (fixes before publishing): no new migration and no new variable; the unpublished `20261027125000` was corrected (a paused number is never re-enabled through a sibling identity; a "Lead recebido" rule in observation is **not** promoted, the student turns it on with "Ligar esta regra"; Kommo and Pipedrive promotions write `production_direct_6_1c:kommo|pipedrive:<id>` audits and Pipedrive only with the creation checks); `INBOUND_CONVERSION_PRODUCTION_ENABLED=false` now also stops Kommo and Pipedrive and the Conversions screen says the sending is off; the optional `OPS_ALERT_UAZAPI_BASE_URL`, `OPS_ALERT_UAZAPI_TOKEN` (secret) and `OPS_ALERT_SCAN_INTERVAL_MS` (Fase 6.1c) are documented; going back to 1.2.0 needs `scripts/rollback/antes-de-voltar-para-1.2.sql` **before** reverting the code if ROI Chat, Braip or Yampi were used, and `scripts/rollback/desfazer-producao-direta-6-1c.sql` undoes the promotion by its audits (see the rollback of `docs/releases/unreleased.json`). Direct upgrade from 1.0.0, 1.1.x and 1.2.0.
+
+### Added
+
+- **Fase 6.7 — Yampi on the single URL, with the real order lines in the
+  Meta Purchase (API, shared and web; two migrations; no new variable)**.
+  Ported from the SaaS (`1889af48` #186, `087df11b` #187, `bce48c6c` #188).
+  Reader `yampi/automation-v1`: `order.paid` and `order.status.updated`
+  (paid) are the SAME Purchase (order id + event), `order.created` waiting
+  for payment (boleto/Pix) is InitiateCheckout, `cart.reminder` is
+  CartAbandoned (keyed by the cart); cancel, refund, refused and other
+  statuses are received and ignored. Value = `value_products` only (no
+  shipping, no installment interest; cart: subtotal), always BRL; phone from
+  `area_code` + `number` or `full_number` with or without 55; dates in
+  Brasília time capped at the arrival; main product = highest price x
+  quantity (#187). The Purchase and InitiateCheckout carry the real order
+  lines to Meta (`contents` with the order bump, `num_items`,
+  `content_name`, `order_id` = Yampi order id; event_id and dedupe
+  unchanged; a coupon mismatch keeps value and lines and logs
+  `sale_capi_items_value_mismatch` without personal data) (#188).
+  "Ver dados recebidos" also hides `x-yampi-hmac-sha256`, the whole
+  `login_url` and the login tokens inside the order links. The reader enters
+  **certified** by migration (validated in the SaaS with real Yampi
+  payloads received and read correctly), so the Yampi URL and rules are born
+  in production. Adapted to the student edition: **open to every workspace**
+  (no `private-sales-platform-gate`, no `yampi-feature-gate`, no
+  `yampiEnabled` flag, no Backoffice private-integration key), no billing
+  hunk, the per-rule URL of a Yampi rule is always born disabled (single URL
+  only, also in the API), a blocked license answers 423 at the global guard.
+  Yampi card always in the hub (Atendimento e vendas, neutral wordmark
+  logo), "Venda na Yampi" rules in Conversões, Yampi unattributed sales,
+  Yampi in the manual purchase dedupe (order = Yampi order id), Yampi
+  filter in Backoffice receipts and readers.
+- **Fase 6.8 — ROI Chat (WhatsApp API Oficial): CTWA entry and purchase by
+  rule (API, shared and web; two migrations; no new variable)**. Ported from
+  the SaaS (`f4f74673` #183, `37bee70d` #185; no later ROI Chat fix up to
+  `origin/main`). One connection = one client number = one URL; the same URL
+  receives the lead entry (no `event_name`: reader `roichat/v1`, generic
+  CTWA production with the Meta route learned from the ad, lead created,
+  once-per-lead-and-pixel guard of #153, also against a WAHA number of the
+  same lead) and the purchase (`event_name: "Purchase"`: routed to the rule
+  "Compra no ROI Chat" that owns the URL's number, reader
+  `roichat/automation-v1`, value and currency from `valor_venda`/`moeda`,
+  rule value only a fallback). Repurchase allowed; the same purchase (lead,
+  number, value and currency) within 12h is a duplicate (ingestion guard +
+  12h rolling production policy). The reader reads the ad fields inside the
+  nested `anuncio` object (real format, #185) with the top level as
+  fallback. Both readers enter **certified** by migration (decision of
+  27/10/2026: validated with real payloads received in the SaaS), so the
+  connection, the number and the rule are born sending. Adapted: no
+  `roichat-feature-gate`/private integrations, no billing or seat hunks, no
+  `WhatsappSeatProvider` value; the card is always in the hub next to WAHA
+  and Meta Cloud; a blocked license answers 423 on every ROI Chat write.
+  Real sanitized fixture of #185 included.
+- **Fase 6.9 — Meta instant forms (Lead Ads) with the CRM stage, and the
+  Dashboard Leads import (API, shared and web; one migration; no new
+  variable)**. Absorbs the nod PRs #91 (`a2782948`) and #92 (`98fb1664`,
+  `d2f9db63`) without #90 (closed; replaced by #158 and #176). A Page
+  connection (Graph token and optional dataset token, encrypted) in
+  Integrations → Meta → "Formulários Meta", "Assinar Página" and the
+  `leadgen` field of `POST /webhooks/meta` (after the signature check) turn
+  each instant-form submission into a lead (one person per phone, 9th-digit
+  variants, WhatsApp attribution kept) and a `MetaLeadSubmission`. A
+  QualifiedLead registered by the manual conversion (#158) or the CRM
+  Kanban (#176) also records the CRM stage (`meta_lead_form_crm`, Conversions
+  API for CRM, `event_id` `{lead_id}:{event}`) on the connection dataset,
+  outside the once-per-lead-per-pixel guard of #153 (another dataset), once
+  per submission; configuration blocks and Meta login failures (190/102)
+  enter "Reenviar bloqueados" (#181). `dashboard-leads:import` (dry-run by
+  default, idempotent, refuses `--apply` with a blocked license) imports
+  what Dashboard Leads already sent with the nod keys (#158/#153
+  `manual_conversion` once-per-lead `event_id`, or the 6.9 CRM key), so
+  neither an automation nor a new manual registration resends it; the #153
+  guard and the CRM Kanban count an imported manual conversion. Connections
+  are born active (production direct); writes answer 423 with a blocked
+  license; `delete-workspace.js` removes the new tables before `Lead`.
+  Migration renamed from `20261017100000_meta_lead_forms` to
+  `20261027145000_meta_lead_forms` (additive, idempotent).
+
+- **Fase 6.9b — a Meta form connection that already received submissions
+  is deactivated, never removed (API and web; no migration; no new
+  variable)**. Decision of 2026-10-27: `DELETE /integrations/meta-lead-forms/:id`
+  answers 409 ("Esta Página já recebeu formulários. Desative a conexão...")
+  when the connection has any `MetaLeadSubmission` (check and delete in one
+  statement, so the submissions are never cascaded away); a connection
+  without submissions is still removed. New `POST /:id/deactivate` and
+  `POST /:id/reactivate` (writes: 423 with a blocked license; the existing
+  `active` column, the `PATCH` `active` field keeps working). The `leadgen` of
+  a deactivated Page is answered 2xx and ignored (not read, saved or logged),
+  so Meta does not redeliver. In the panel, "Pausar/Retomar" became
+  "Desativar/Reativar" and "Remover" only shows without submissions, with
+  the short reason otherwise. One Page in one workspace is unchanged (a
+  deactivated Page stays reserved); `delete-workspace.js` still deletes the
+  submissions when the whole workspace is deleted.
+
+- **Fase 6.5 — Sales platforms on the single URL: Braip, received data and
+  receipts audit (API, shared and web; two migrations; no new variable)**.
+  Ported from the SaaS (`09d7303a`, `f83522af`, `072bb61a`, `25a7cd76`,
+  `b3124d65`, `8af225f4` #168, `ec996549` #164, `92edd263` #169 read part,
+  `60588489` #170, `4ba8961d` #184, `be599f49` #158 purchase hunk for Braip,
+  `7570fe14` Kommo part; `b4d71afc` and `1af5411c` #166 only as a read-only
+  diagnostic). A shared sales-platform base (`sales-platform-sale.ts`:
+  Payt + Braip, same purchase identity, product filter, routing, resend
+  reconciliation, production gates and claims); the Braip reader
+  (`braip/automation-v1`: JSON or form body normalized to canonical JSON,
+  the account key dropped at any depth, order bump routed by the main item,
+  dates read in Brasília time by the fase 6.0 reader and capped at the
+  arrival) enters **certified** by migration, validated in the SaaS with a
+  real sale (confirmed by Samuel on 2026-10-27; the reader was also checked
+  against the official Braip postback in #168), so the Braip URL and rules are born in
+  production and the student never releases anything. Braip card always in
+  the hub (Atendimento e vendas), "Venda na Braip" rules in Conversões
+  (event from each status, optional product filter, single URL only),
+  Braip unattributed sales, Braip in the manual purchase dedupe (order =
+  `trans_key`). "Ver dados recebidos" of a stored sale (masked: account
+  keys, credentials and tokens inside URLs; audited) for integration
+  managers. Backoffice → Webhooks WhatsApp → **Recebimentos das URLs únicas**
+  (every receipt of every workspace, filters, cursor, masked payload; refused
+  calls of a known URL kept as `rejected`, metadata only without a valid
+  token and for any refused Braip body, same 60-day retention) and **Leitores de webhook** (read only).
+  The URL box counters stay real after "Mostrar URL"/"Gerar URL"/"Gerar
+  nova" (#164); a failed `/channels` read never hides the sales platforms in
+  "Nova regra" (#164); "Tentar de novo" only for unattributed/pending
+  receipts. Kommo actions also refresh `/integrations`. The SaaS
+  certification actions ("Liberar plataforma", certify-parser routes) and
+  the private-integration/billing gates are not part of the student edition.
+- **Fase 6.4 — Robustness of the Meta Graph calls (API, shared and web;
+  two additive migrations; optional variables only)**. Ported from the
+  SaaS (`918a0837`, `0403cbce`, `f1ec6a9e`, `6a3f2c79`, `c0cec66c`,
+  `c685ef66`, `0f16c25c`, `213047d3`, `70625e41`, `bc72b208`; release notes
+  `33adb781`). Typed Graph errors and a **reporting-only circuit breaker**
+  (`MetaReportingAccount.reportingSyncBlockedAt`): a dead token (190/102)
+  or a lost ad account permission (10/200) pauses only the report sync of
+  the failing account (every account of the token once a cached `GET /me`
+  confirms 190/102), never CAPI/CTWA routing; reconnect, revalidate, rotate or "Testar" lifts it.
+  Relatórios shows "Reconecte a conta Meta" and the Meta coverage warning
+  of Visão Geral/Relatórios now lists blocked accounts (the "bloqueada"
+  reason waiting since Fase 6.3a). Usage-aware yield (`X-App-Usage`,
+  `X-Business-Use-Case-Usage`, `X-FB-Ads-Insights-Throttle`,
+  `X-Ad-Account-Usage`) moves report jobs to delayed instead of retrying;
+  sync jobs are deduplicated per account/period/window; the auto-sync
+  takes a Redis marker per interval and pages through every workspace.
+  **Persisted creative thumbnails** (`MetaCreativeThumbnail`, 320 px, at
+  most 100 KB, fetched once per creative with bounded refresh and a
+  15-minute pause after a Meta rate limit) served by
+  `GET /reports/creative-thumbnails/ads/:adId` (workspace-scoped, read
+  only) and used by the lead page, the ad rows of Relatórios and the CRM
+  Kanban cards (the stored thumbnail waiting since Fase 6.2b); expired
+  signed Meta CDN URLs are no longer rendered. Optional ad-level Insights
+  with local aggregation (`META_INSIGHTS_LEVEL_MODE`), 500-row pages,
+  optional async reports, an incremental auto-sync window verified
+  against Meta's totals (spend and conversations) and optional CAPI
+  micro-batching (`META_CAPI_BATCH_ENABLED`, plain dispatches only; a
+  batch-wide 190/102 or throttle is not resent one by one). nod adaptations: the URGENT
+  mitigation stays (saved previews reused, `/{video}/thumbnails` only with
+  `META_VIDEO_THUMBNAILS_ENABLED=true`, first auto-sync after a random
+  10-30 min instead of the SaaS boot jitter); app-level usage is tracked
+  per Meta app (PalmUP social login vs the student's own app), so one hot
+  app does not pause the other; CAPI batches keep the strict nod
+  acknowledgement and never store the provider body;
+  `apps/api/scripts/delete-workspace.js` deletes the new table before
+  `Workspace` (`delete-workspace-order` test).
+
+- **Fase 6.3b — Filters of Visão Geral and Relatórios, applied automatically
+  (API, shared and web; no migration, no new variable)**. Ported from the
+  SaaS (`d2a5f76e` #62, `fae01607` #106, `9fccf687` #110, `588cec7c` #114,
+  `54cc7739` #115, `aa04fed9` #116, `c1204447` #117, `bcc9adda` #118,
+  `d389892f` #119, `98bf9fc5` #121, `4f42dd03` #122, `8b99506f` #123,
+  `9db08583` #124, `75125d69` #125 and `256ff325` #126 adapted, `bb76b30e`,
+  `e5ef9006`, `d8cefd91` #175), plus the later SaaS pieces of the same files
+  (`2f79c3c7` searchable ad account filter with the currency badge,
+  `996e7c12` several ad accounts on the campaign options, `be599f49` "Manual"
+  source on Eventos Meta, `82448211` WhatsApp number on the Leads export
+  route, the number filter on the deferred-lead lookup of `4d74d303`).
+  - Relatórios toolbar grouped in Período / Escopo / Ações (#62); every filter
+    of Relatórios, Leads, Eventos Meta and Revisão de compras applies by
+    itself, without the "Aplicar" button (#121–#124; dates and texts wait for
+    the typing to stop; Enter and no-JS GET keep working).
+  - Visão Geral: WhatsApp number filter (#106/#110; removed connections leave
+    the list but an old link still works), searchable campaign filter with
+    up to 10 campaigns (#114–#118; `GET /reports/campaign-options`,
+    `campaignIds`), honest Meta metrics for the cut (account, shared or
+    exclusive campaign, not synced) and the scope notes. Relatórios: the same
+    number filter (#119).
+  - #175: with the number filter, conversations include the entries deferred
+    to the Lead-recebido rule (`metricEventLeadIds`); nod: the variable unset
+    is the override mode, so the "normal mode" tests use an explicit "false".
+  - #125/#126 adapted: `GET /integrations/whatsapp-connections/:id/activity`
+    in the nod connections module (Uazapi BYO and WAHA, one number per
+    connection; no `schemas/billing`: `whatsappInstanceActivitySchema` lives in
+    the integrations schema), shown on each connection card and on the
+    Uazapi/WAHA bridges of the phrase rules (their entry counters show "Não
+    medido"); Leads filter by number (`whatsappInstanceId`, list and export).
+  - One platform look for every `<select>` in the app (bb76b30e,
+    `docs/design/dropdowns.md`); stacked per-currency totals and an uncut ad
+    account popover in Relatórios, currency in the rule example message
+    (e5ef9006). The CRM board campaign filter (6.2b) uses the same searchable
+    FilterCombobox.
+  - nod adaptations: the number options come from
+    `/integrations/whatsapp-connections` (`lib/whatsapp-number-options.ts`);
+    the ad account filter is the SaaS FilterCombobox version; UI texts in
+    Portuguese with accents. Skipped: #143 (API sort by any funnel step; the
+    web never sends that key, in the SaaS either).
+  - nod fixes found in the review (not in the SaaS yet): with several
+    campaigns the Overview summary is scoped to them (`summaryMetricScope`
+    reads `campaignIds`, so leads/sales follow the same campaigns as the
+    spend); the Relatórios CSV follows the WhatsApp number
+    (`campaigns/export.csv` and the web export route take
+    `whatsappInstanceId`); a drill-down campaign outside the current BM/accounts
+    (404 from the campaign check) renders an empty table instead of "API
+    indisponível". Ported with the number filter: the returning-lead lookup
+    and the Overview → Leads shortcuts carry the number and the campaign.
+  - Reads only (plus the existing writes): with a locked license the filters,
+    the activity and the export keep working; writes still answer 423.
+
+- **Fase 6.3a — Reports: correct numbers (API, shared and web; no
+  migration, no new variable)**. Ported from the SaaS (`c95961f0` #61,
+  `45f18c2b` #69, `58d5e51b` #83 partial, `e4139c4c`, `d4420843` #157,
+  `ea8203a7` #167, `f4aa9878` #174).
+  - Canonical funnel order (#61): QualifiedLead (40) before InitiateCheckout
+    (45) in the catalog (`conversionEventCatalogOrder`); a stage not yet
+    saved enters right after the last saved stage that precedes it in the
+    catalog instead of the end of the funnel; Overview/Reports merge funnel
+    steps keeping that order. Eventos Meta lists every event configured in
+    the workspace in its filter (`availableEvents`).
+  - Overview KPI cards by funnel (#69): one card per visible Jornada stage,
+    with its label and cost ("Custo por …" follows a renamed stage);
+    "Compras" and "Receita tráfego" only with a Purchase stage.
+  - Meta coverage notice (#174): `metaSyncCoverage` on campaign, ad set and
+    ad reports (`reporting/meta-sync-coverage.ts`); "Atenção aos dados da
+    Meta" on Visão Geral and Relatórios when the period starts before the
+    first synced day or an active account is stale (> 24 h), in error or
+    never synced. nod: the "blocked" reason needs the
+    `reportingSyncBlockedAt` column of Fase 6.4; until then no account is
+    reported as blocked. The fail-safe warning logs only the error name.
+  - Daily reconciliation "Meta x conversas reais" (#167): every paid
+    conversation started per day (`adConversationsStarted`, same rule as
+    "Conversas por anúncio"; deferred entries included) next to Meta; a
+    third "Leads (evento Lead enviado)" series only in the Lead-recebido
+    rule override mode of the period (`dailyComparisonLeadEventDeferred`).
+    nod: `LEAD_SUBMITTED_RULE_OVERRIDE_ENABLED` unset = on, so the Lead
+    series appears whenever the period is in the rule override mode (an active,
+    sending Lead recebido rule).
+  - "valor corrigido (antes R$ X)" in the Eventos Meta detail
+    (`e4139c4c`), only for platform support access (backoffice).
+  - Not ported here: #175 (number-filter conversations with deferred
+    entries) only applies to the WhatsApp number filter of the reports,
+    which the nod gets in Fase 6.3b (#106); it moves there.
+
+- **Fase 6.2b — CRM Kanban of the Jornada (API, shared and web; no
+  migration)**. Ported from the SaaS (`f5c2b47b` #176). No later CRM fix in
+  the SaaS up to `origin/main` (#189) needed porting (the later edits of
+  `manual-conversion.service.ts` are Hotmart/Yampi/ROI Chat, Fases 6.6–6.8).
+  - New "CRM" item in the menu (Operação, right after Leads; every member
+    sees it): columns are the visible stages of the Jornada ("Leads novos"
+    first; "Conversas iniciadas" first, read-only, when "Lead recebido pela
+    regra" is in use), real totals per column, 20 cards per column with
+    "Carregar mais", the stage of each lead computed in one aggregated SQL
+    query (`apps/api/src/crm/crm-board-query.ts`, existing indexes, no
+    migration) and a 15 s server cache; `GET /crm/board` and
+    `GET /crm/board/columns/:stageKey`.
+  - Dragging a card forward (owners/admins; pointer and keyboard; "Mover
+    para…" on phones) opens the same manual conversion confirmation with the
+    column event locked and the Jornada default value; it is a manual
+    conversion with `source: "kanban"` ("Manual (Kanban) por <nome>" in the
+    audit). The API refuses moving back or to the same stage (409
+    `crm_backward_move`/`crm_same_stage`).
+  - Lead detail extracted to `lead-detail-view.tsx` and reused in the board
+    modal; filters in the URL (arrival period, default 30 days, up to 180;
+    number; campaign); light refresh every 60 s.
+  - nod adaptations: with the license locked the board stays readable (GET)
+    but moving a card is a write (423), so cards are not draggable and a
+    notice says why; numbers come from the active WhatsApp connections (no
+    paid seat); campaigns from the synced Meta structure (native select; the
+    searchable, period-scoped campaign filter arrives with Fase 6.3b); card
+    thumbnails use the CTWA/ad URL (stored creative thumbnails are Fase 6.4).
+  - nod fixes on top of the SaaS port: `/crm` is in the session middleware
+    (redirects to the login like the other app routes); the board height
+    leaves room for the residual footer on phones ("RastrackDash · powered by
+    PalmUP" stays in view); dropping a card with Enter in the keyboard drag no
+    longer also opens the lead modal; a retried kanban move with the same
+    idempotency key replays the registered conversion instead of answering
+    409 "O lead já está nesta etapa"; an empty campaign/ad name never breaks
+    the board.
+  - New dependencies: `@dnd-kit/core` 6.3.1 and `@dnd-kit/utilities` 3.2.2
+    (web), `@electric-sql/pglite` 0.2.17 (API dev/tests only: runs the board
+    SQL in-process in the tests).
+
+- **Fase 6.2a — "Lead recebido" sent by the rule and manual conversion on the
+  lead (API, shared and web; no migration)**. Ported from the SaaS (`4d74d303`
+  #155, `2e328e97` #156, `be599f49` #158 and the #159 hunk of
+  `lead-submitted-rule-override.ts` from `42ccbc7c`).
+  - "Lead recebido pela regra" (#155): an active, sending provider rule with
+    the LeadSubmitted event (phrase, catalog or automation) that covers the
+    entry number makes the CTWA entry write a non-sending receipt
+    (`not_eligible`, `lead_submitted_deferred_to_rule`, proof of origin and
+    conversation in the reports) and the rule sends the LeadSubmitted when it
+    fires, once per lead and pixel (lifetime guard, now also covering the
+    Uazapi BYO/WAHA `auto_lead` entry). Fail-closed towards the entry send.
+    nod: `LEAD_SUBMITTED_RULE_OVERRIDE_ENABLED` is **on by default**
+    (production direct; validated in SaaS production) with one parser
+    (`config/lead-submitted-rule-override-flag.ts`) shared by every mirror
+    (rules, lead cohort, reporting, lifetime guard, capabilities); the SaaS
+    seat gate becomes the usable license plus, for bridged numbers, the
+    WhatsApp connection `active`; the deferral is also asked on the WAHA
+    bridge entry, on the Meta Cloud (and other non-Unnichat) production path
+    and on the student replay. Reports count the entry receipt as the
+    conversation and make a deferred lead "novo" on the day the rule sends.
+    Screens: "Substitui envio na entrada" badge, notice on the rule form,
+    "Adiado para a regra" on the deferred entry in Eventos Meta (the
+    Executions/Received events chip is kept for parity with the SaaS), "N
+    leads aguardando a regra" (a manual Lead recebido also stops the wait)
+    and the Overview texts, shown when the API reports the flag on
+    (`GET /conversion-rules/providers/capabilities`). Rules with LeadSubmitted
+    exist only on Uazapi BYO, WAHA, Umbler and Unnichat numbers; Meta Cloud,
+    Gupshup and Data Crazy entries keep sending (the hook on their production
+    path is fail-safe). The leads list only runs the report-mode lookup with a
+    period or a campaign/ad set/ad filter.
+  - Rules list without overlap on medium windows (#156, CSS).
+  - Manual conversion on the lead (#158): owners/admins register any catalog
+    event from the lead detail (`POST /leads/:leadId/manual-conversions`,
+    `/preview`, `/:logId/cancel`); destination resolved like the automations
+    (lead's ad route for Uazapi, WAHA, Meta Cloud and webhook leads; CTWA
+    page/pixel proof for Unnichat); once-per-lead events reuse the rule
+    `event_id` (a QualifiedLead phrase rule plus a manual QualifiedLead is one
+    Meta event); Purchase with order number deduped against Payt (extension
+    point `leads/manual-conversion-sales-platforms.ts` for Braip, Hotmart and
+    Yampi in 6.5–6.7); ±24h confirmation; cancel before sending; stuck
+    dispatch recovery; rate limit 30/hour per user. nod: the SaaS "sem vaga" /
+    "número desconhecido" reasons become `connection_inactive` (bridged
+    number whose WhatsApp connection is not active); the license is enforced
+    by the global guard (423) on every manual-conversion write and the button
+    is disabled while the license is blocked. Replaces nod PR #90 (manual
+    QualifiedLead with another `event_id`), which is not published.
+
+- **Docs for the student AI**: `docs/AI_AGENTS.md` (and `AGENTS.md`) now tell the student Claude/Codex how to handle "update" or "change a variable/flow" requests (follow `docs/setup/update.md`, read the upgrade notes, explain every new or changed variable from `environment.md`). Maintainers must document every change that needs student action in the same commit.
+
+- **Fase 6.1c — Production direct (nod product rule; API, shared and web)**:
+  what was validated in the SaaS reaches the student in production; the
+  student never re-tests, certifies or releases anything.
+  - New `inbound-webhooks/production-direct.ts`: with a production-eligible
+    parser release (`inboundParserProductionEligible`), an inbound connection
+    is born `production` (with `productionActivatedAt`) and each number is
+    born `active`: Umbler, Gupshup, Data Crazy, Unnichat (its bound number),
+    Meta Cloud (only with `META_APP_SECRET`: in production the API requires the
+    Meta signature and would reject the deliveries), the Uazapi BYO/WAHA bridge
+    (server URL + token, one number per connection), a manually provisioned
+    number and a number discovered by its first delivery (active since that
+    delivery's `firstReceivedAt`, so its first CTWA is sent). A paused
+    connection stays paused (its new number is active, stamped on resume).
+    An unvalidated or retired release keeps the observation step.
+  - Conversion rules (phrase, catalog, label, Umbler/Unnichat automation,
+    Payt, adapted legacy rules) are born `production` when the create omits
+    `mode` (shared `providerConversionRuleCreateInputSchema.mode` is now
+    optional; the web no longer sends it): no "Ativar envio" click. An
+    explicitly requested mode still applies; with the server switch off or
+    an unvalidated reader the rule is born `observation`. A defaulted
+    production create does not run the strict number cascade (numbers are
+    already born live; operator pauses are never undone implicitly).
+    "Retomar" a paused rule resumes it sending; resuming a paused connection
+    or number (`productionDirectResume`) no longer demands a Meta route on
+    every number (numbers are born active; the route is enforced at send
+    time), while the validated reader, `META_APP_SECRET` and replay-in-flight
+    checks still apply. Kommo rules default to
+    `production` (shared schema); Pipedrive rules default to `production`
+    when the connection has what sending needs, otherwise `observation`
+    (no creation failure).
+  - `INBOUND_CONVERSION_PRODUCTION_ENABLED` unset now follows
+    `INBOUND_CONVERSION_RULES_ENABLED`; an explicit `false` remains the server
+    switch, and the screens say exactly which variable to set.
+  - Data-only migration `20261027125000_production_direct_validated_integrations`
+    (slot reserved for 6.1c): certifies the Meta Cloud v1 row (already
+    eligible in code), promotes observation connections with a certified
+    reader of their own provider (Meta Cloud excluded: its promotion depends
+    on `META_APP_SECRET`), activates never-activated numbers of production
+    connections (Uazapi/WAHA only with an active WhatsApp connection; no
+    rediscovered duplicate of an active number; between two discovered
+    identities of a number only the last seen), stamps active numbers
+    without activation date, and promotes active observation rules (provider
+    rules with a certified or no own release whose bound connection is
+    production or paused; Kommo only when its connection has no event still
+    queued, since Kommo has no activation fence; Pipedrive with its
+    activation fence). Kept as is: paused, unified or removed rules; rules
+    that had been in production and were taken off (audit
+    `resultStatus = production`); connections an operator put back in
+    observation (and rules bound to them); connections with a replay in
+    flight. Activation dates are
+    the migration's (nothing is sent retroactively). Idempotent, with
+    deterministic system audit ids (`production_direct_6_1c:*`).
+  - Screens: no observation, test, release or certification steps for the
+    student. Rule status "Observação" became "Envio desligado"; no "Voltar
+    para observação"/"Observar" (Pausar is the off switch); Kommo/Pipedrive
+    forms no longer offer "Observar primeiro"; Integrations connection labels,
+    notes and messages, received-events reasons ("Por que não foi enviado"),
+    and student docs (guide, Payt, Unnichat, Pipedrive, Data Crazy, Meta
+    Cloud, troubleshooting, environment) were updated.
+- **Fase 6.1c — WhatsApp disconnect alert per connection (API, shared and
+  web)**, ported from the SaaS (`6be4bdcd`/`86aaac21`, #63), adapted: the
+  check never ran in this edition (it only recorded "unavailable"). Each scan
+  reads every active Uazapi BYO and WAHA connection through the provider's
+  status API (`WhatsappConnectionsService.readConnectionStatusForAlert`,
+  read-only). It alerts only after 2 consecutive definitive "disconnected"
+  readings (Uazapi `disconnected/closed/logged_out`; WAHA `STOPPED` or a
+  session waiting to be paired again); ambiguous states neither count nor
+  reset; a connected reading resets; a read error never alerts (Uazapi now
+  exposes `providerStatusText`, as in the SaaS). The streak lives in
+  `WorkspaceOpsAlertDelivery` rows. The confirmed alert shows in
+  Integrations (`disconnectAlert` on the WhatsApp connections list, optional
+  in the shared schema); the WhatsApp message goes out only with the
+  workspace alerts on, a phone and a usable license.
+- **Fase 6.1c — "Reenviar os que falharam" in the student recovery (API,
+  shared and web)**, ported from the SaaS (`f7c61c07`, #91), adapted to the
+  owner-scoped Meta Cloud recovery: `POST …/recovery/batches/:batchId/retry`
+  re-queues the failed items of a batch while the original payload is still
+  retained, re-checking each one like a new authorization (active channel,
+  one active valid route, identity, 7-day window) and never re-sending a
+  CTWA that already has a conversion event. The batch authorization is
+  renewed with the current context (latest authorize audit wins). 423 with
+  a locked license (global guard and service). `retryableFailedCount` and the
+  new `retryableFailed` of the result count failed items with a retained
+  payload, whatever their error code (as in #91).
+
+- **Fase 6.1b — Why an event stayed in observation (API, shared and web)**,
+  ported from the SaaS (`d4c6a419`, #171), adapted to the student edition:
+  - The observed disposition records its reason with the execution
+    (`normalizedResult.observationDetail`): rule in observation at receipt,
+    production sending disabled, lead number on the legacy engine, rule
+    without activation, received before the rule's or the number's
+    activation, lead number not in production on its own connection.
+    "Eventos recebidos" shows it with what "Reprocessar" will do; reason-code
+    labels no longer all read "Reconhecido em observação". Older rows fall
+    back to the reason codes that say it unambiguously.
+  - Payt "Todos os números": with the anchor connection live, the lead
+    number's own connection (Uazapi/WAHA bridge, Meta Cloud, Umbler...) is the
+    remaining gate. The pending-numbers list shows it and "Ativar envio neste
+    número" promotes that connection. Student-edition adaptation: the
+    Uazapi/WAHA bridge (one connection per number) follows the save cascade
+    and the automatic activation like phrase rules; connections that may carry
+    several numbers wait for the explicit click.
+  - Adaptations: the only sales platform is Payt (no Braip/Brink Park yet);
+    no `ctwa_requires_canonical_engine` branch; messages never send the
+    student to "support".
+- **Fase 6.1b — First name (`fn`) in the Conversions API, off by default
+  (API)**, ported from the SaaS (`a7ccdab3`, #179, CAPI part; `c44dc9fb`,
+  #180): `user_data.fn` = SHA-256 of the normalized first name (lowercase,
+  no punctuation, UTF-8 accents kept); never empty, generic, emoji-only,
+  phone-like or single-initial names. New optional API variable
+  `META_CAPI_SEND_FIRST_NAME` (only `true`/`1`/`on`/`yes` enable it;
+  documented in `.env.example` and `docs/setup/environment.md`). With it
+  off the lead is not even read. `event_id` and dedupe are unchanged.
+- **Fase 6.1b — "Bloqueado" always comes with a reason (API, shared and
+  web)**, ported from the SaaS (`a7ccdab3`, #179, readiness part): new
+  readiness reasons `ctwa_send_failed` (a real block),
+  `ctwa_in_progress` and `ctwa_not_eligible` (informative: they leave the
+  number partial and never downgrade a ready one), with counts in the DTO.
+  `adUnavailableCtwa` now comes for every provider.
+- **Fase 6.1b — Tests for the Unnichat routing-mode selector (web)**, ported
+  from the SaaS (`d4d70274`); the behavior was already in the nod.
+
+- **Fase 6.1a — One rule per event for every Unnichat/Umbler number, across
+  connections (API, shared and web)**, ported from the SaaS (`42ccbc7c`,
+  #159), adapted to the student edition:
+  - New additive migration `20261027120000_provider_rule_cross_connection_scope`
+    (in the SaaS: `20261021120000`): `ADD COLUMN IF NOT EXISTS
+    "crossConnectionScope" BOOLEAN` on `ProviderConversionRuleConfig`,
+    nullable. Existing rules do not change: an old "Todos os números"
+    automation keeps covering its own connection until the operator uses
+    "Ampliar para todas as conexões".
+  - "Todos os números do Unnichat / da Umbler (todas as conexões)": the rule
+    covers every number of the provider on any connection (Unnichat creates
+    one connection per number); its connection is only the anchor of its
+    deliveries and URL, and each occurrence is gated by the connection of its
+    own number. New rules are created this way, without choosing a connection.
+  - The callback origin (the URL that was called, or the per-event URL's
+    proven number) is stored with the delivery (`callbackOrigin`) and reused by
+    replays; it lives alongside the nod's Fase 5.3 `routedChannelId`.
+  - Per-event URL: when a rule "todas as conexões" competes with another rule
+    of the same tier on a number, the callback is held as
+    `multiple_rules_for_event` ("Duas regras para o mesmo evento — unifique");
+    older duplicates keep the oldest rule, as before. A rule whose connection
+    was removed never wins the routing.
+  - "Unificar" accepts Umbler/Unnichat automations (per provider + event): it
+    reuses the rule "todas as conexões" or promotes the oldest live one; the
+    others are paused and linked, and their old URL keeps delivering to the
+    target. Different values or modes require `acknowledgeDifferences` (409
+    `provider_rule_unify_differences`).
+  - "Número removido" (`numberRemoved` in the DTO; in the nod also when the
+    Uazapi/WAHA number was deleted in Integrations, i.e. its WhatsApp
+    connection is suspended) with a highlighted warning and "Pausar"; removing
+    the anchor connection moves a rule "todas as conexões" to another live
+    connection of the provider (`provider_conversion_rule.reanchored`, audited,
+    same transaction).
+- **Fase 6.1a — Bulk delete of rules (API, shared and web)**, ported from the
+  SaaS (`0f6e010d`, #161): `POST /conversion-rules/providers/bulk-delete`
+  (integration managers; a write, so `423` with a locked license) removes each
+  rule in its own transaction and reports every rule (`removed`,
+  `not_found`, `needs_target_confirmation`, `failed`). The rule other unified
+  rules point to only goes when confirmed, after them. Conversions list:
+  selection, "Selecionar unificadas e de número removido", "Excluir
+  selecionadas", the last event through each old URL (warning when it still
+  received in the last 7 days) and "Ocultar regras unificadas". Deleting a
+  rule whose number was removed no longer answers 404.
+
+### Fixed
+
+- **Review of PR #121 (API, shared and web; no new migration, no new
+  variable)**.
+  - `20261027125000_production_direct_validated_integrations` (unpublished,
+    edited in place): step 3 also treats a `paused` sibling identity of the
+    same phone as blocking, so a paused number never sends again through a
+    `discovered` sibling; step 5 leaves `LeadSubmitted` rules in observation
+    (decision D1); step 6 writes deterministic audits for Kommo
+    (`production_direct_6_1c:kommo:<id>`) and step 7 promotes Pipedrive only
+    with the `requireProduction` checks (active connection, healthy
+    credential, webhook issued, every authorized number/route ready) and
+    writes `production_direct_6_1c:pipedrive:<id>` (decision D2). Only
+    connections whose authorized numbers are all explicit valid routes are
+    promoted; a number authorized by its channel (inherited workspace
+    page/pixel) needs the Meta routing check of "Ativar envio". Ran with
+    synthetic data on a disposable PostgreSQL 16 and in PGlite, twice
+    (idempotent).
+  - `scripts/rollback/`: `antes-de-voltar-para-1.2.sql` (marks ROI Chat
+    connections, Braip/Yampi/ROI Chat single URLs and their rules as removed,
+    with `rollback_1_2:*` audits, so the 1.2.0 client no longer fails with
+    `Value 'roichat' not found in enum`), `reativar-depois-de-atualizar.sql`
+    and `desfazer-producao-direta-6-1c.sql` (undoes the promotion through
+    its audits, only rows still carrying the migration's activation date;
+    step 4 and the `meta_cloud/v1` certification have no audit). The cleanup
+    also moves `WebhookLog`/`DiagnosticEvent`/`IntegrationLog`/`JobAttempt`
+    rows with source roichat/braip/yampi to `internal`, keeping the original
+    in `rollback_1_2_diagnostic_source` for the reactivation script.
+  - Kommo and Pipedrive obey `INBOUND_CONVERSION_PRODUCTION_ENABLED=false`
+    (`conversion_production_disabled`); the capabilities expose
+    `conversionSendingOff` and Conversions shows "Envio desligado no
+    servidor" in plain language. The created-rule message no longer shows the
+    variable name.
+  - Conversions: a `LeadSubmitted` rule with sending off offers "Ligar esta
+    regra", explaining that the entry LeadSubmitted then goes through the
+    rule.
+  - Meta Lead Ads: only a transient Graph failure (network, 5xx, usage limits
+    4/17/32/613/80001-80014, 1/2/341) answers 503; a permanent one (190/102,
+    10/200-299, other 4xx, unreadable stored token) is saved as
+    `fetch_failed` with its kind, answered 200, and the connection shows
+    "Reconecte a Página" or "Falta permissão" (`fetchProblem`). A single
+    connection that lists its forms no longer receives the Page's other forms.
+  - CAPI batch (off by default): the batch POST has a 30 s timeout and a
+    usage-limit refusal becomes retryable instead of a final
+    `MetaCapiRejected`.
+  - "Ver dados recebidos": CPF, CNPJ and documents keep only the last 2
+    characters; e-mail and address are partially masked (LGPD).
+  - Single URL: a refusal without a valid token is written at most once per
+    minute per endpoint, IP and reason.
+  - The reporting breaker clears itself on reconnect (OAuth, token rotation,
+    new business connection, "Testar"); now covered by a test.
+  - Accents in two messages; test fixtures use fictitious phones
+    (5511999990xxx).
+
+- **Fase 6 — Readable reason when Meta refuses a Conversions API event (API
+  and web; no migration, no new variable)**. A `MetaCapiRejected` refusal now
+  stores only `code`, `error_subcode`, `type` (must match `^[A-Za-z]{1,64}$`)
+  and `fbtrace_id` (≤ 256 safe characters) of the Graph error, in the single
+  and the batch send; `message`, `error_user_title`, `error_user_msg` and any
+  other provider text are never kept (they may carry lead data). A map by
+  code/subcode, limited to codes documented by Meta (Graph API error handling
+  and rate limiting, Marketing API error reference), turns it into a
+  Portuguese reason plus what to do (expired login/token, missing dataset
+  permission, call limit, temporary error, policy block, invalid parameter);
+  unknown codes show "A Meta recusou o evento (código X, subcódigo Y)" with
+  the Meta support identifier. Shown in the Eventos list, the audit Resumo
+  and "Resposta Meta" tab, and the lead's Pixel/CAPI events.
+  `MissingMetaDestination` also shows the known resolver reason (e.g. "Conta
+  Meta inativa"). `errorCode`, retries, dedupe and "Reenviar bloqueados"
+  (190/102, same text as before) are unchanged.
+- **Fase 6.3a — Meta spend and conversations follow the chosen period (API)**,
+  ported from the SaaS (`d4420843`, #157): with a period, campaign, ad set and
+  ad Meta numbers come only from the stored daily rows of that period (zero
+  without rows), never from the entity columns (totals of the last sync
+  window); WhatsApp ad sets/ads keep scoping mixed campaigns with their own
+  period rows. Without a period the snapshot stays the source.
+- **Fase 6.3a — Persisted Meta sync periods and safe logs (API and web)**,
+  ported from the SaaS (`58d5e51b`, #83, reports part only): Relatórios also
+  compares the saved period of accounts that are syncing (no false "Contas
+  Meta com períodos diferentes"); the automatic sync and the "Sincronizar Meta"
+  failure logs carry fixed codes, never the error text.
+- **Fase 6.1b — Number listing without loading the whole CTWA history (API
+  and web)**, ported from the SaaS (`478f0f9a`, #165): channel readiness of
+  `GET /integrations/inbound-webhooks/:id/channels` comes from one aggregate
+  SQL query per listing (COUNT FILTER / MIN per channel, on the existing
+  `InboundWebhookEvent(channelId, occurredAt)` index), same meaning, no time
+  window, no migration. On SQL failure: PII-free log
+  `inbound_webhook.channels_readiness_sql_failed` and a bounded fallback
+  (90 days, 5,000 events). Logs `channels_listed` / `channels_list_failed`
+  carry ids and timings only. Integrations, Conversões and Kommo/Pipedrive
+  say the numbers could not be loaded instead of "no number" / "number
+  removed", and "Salvar canais" is blocked meanwhile. Covers Meta Cloud.
+- **Fase 6.1b — Real stats of the Uazapi/WAHA bridge (API and web)**, ported
+  from the SaaS (`4787a8f3`, #103) with the WAHA bridge: overview and
+  readiness count the instance's CTWA leads (`source` uazapi or waha) and the
+  last WebhookLog, instead of 0 and "Aguardando CTWA"; route reasons do not
+  apply to the bridge.
+- **Fase 6.1b — No "Gerar nova URL" on the Uazapi/WAHA bridge (API and
+  web)**, ported from the SaaS (`e69a5e91`, #105) with the WAHA bridge:
+  `rotateSecret` answers 409 without changing the secret (checked again in
+  the transaction) and the panel shows a note instead of the button.
+- **Fase 6.1b — A Payt reprocess no longer queues a sale whose number was
+  never live on its own connection** (part of `d4c6a419`, #171): it stays
+  observed with the reason, also when the observation claim returns its own
+  execution as `purchase_duplicate`.
+- **Fase 6.1b — Meta's 7-day window also for ad-attributed automation events
+  (API)**, ported from the SaaS (`75f6f4b3`, window part only; the operator
+  approval was already in the nod): Payt, Unnichat and Umbler automation
+  conversions older than 7 days become `not_eligible` /
+  `MetaEventTimeExpired` (technical delivery `blocked_configuration`)
+  instead of failing at Meta. Only the age is checked.
+- Not ported in 6.1b: `b65753b7` — its Unnichat occurrence proof is already
+  in the nod and its production requeue lives in a backoffice recovery
+  service the student edition does not have.
+
+- **Fase 6.0 — One conversion per lead per pixel across numbers (API, shared
+  and web)**, ported from the SaaS (`972f6179`, #153), adapted to the
+  student edition:
+  - A once-per-lead catalog event (QualifiedLead, LeadSubmitted) goes to Meta
+    once per lead and Meta destination (pixel), whichever number or path saw
+    it: provider rules (phrase, catalog, automation) and the CTWA entry.
+    New `lead-lifetime-conversion-guard.ts`: lead identity by the canonical
+    phone line (55 / 9th digit, `phone-identity.ts`), a transaction advisory
+    lock per identity + event (always taken last) and a scan of the covered
+    `ConversionEventLog` rows (`inbound_webhook:*`). Purchases and the
+    other +-24h events are not covered.
+  - Covered in the nod: team phrase rules on the WAHA bridge
+    (`inbound_webhook:waha:*`) and on Uazapi, the Unnichat entry (live,
+    replay and no-ad page/pixel) and, through the generic production and
+    replay writers, the **Meta Cloud CTWA entry**
+    (`inbound_webhook:meta_cloud`). A repeated entry keeps its own
+    `not_eligible` receipt (proof of origin, reports) and is never queued.
+  - New once-per-lead conversions get a deterministic `event_id`
+    (`lead_<event>_<hash>` per workspace + phone line + event); ids already
+    sent never change.
+  - "Reprocessar bloqueadas" leaves out (and counts in the new optional
+    `alreadyConverted`) what would only be a duplicate. The nod's
+    conservative exclusions run first and are unchanged.
+  - Executions show "Lead já convertido por outro número" / "pela entrada do
+    anúncio".
+  - Also ported from the SaaS: the per-number business dedupe of provider
+    rules (`7d683975`, #84, only its dedupe part). The frozen decision key
+    and the execution check now include the connection and the number, so
+    the same lead on another number to a second pixel gets its own event, and
+    purchases / +-24h events on different numbers are independent (the
+    once-per-lead guard covers lead events across numbers). nod upgrade
+    bridge: decisions frozen before this version keep blocking a repeat on
+    the same number. The `auto_lead` entry (Uazapi/WAHA connections) keeps
+    its own per-lead dedupe; it joins this rule with #155 (6.2a).
+- **Fase 6.0 — "Reenviar bloqueados" also resends Meta login failures
+  (190/102) (API, shared and web)**, ported from the SaaS (`4d2fbf83`, #181,
+  plus the stalled `ready_to_send` part of `7ac17df7`):
+  - Events refused by the CAPI for a dead token or login checkpoint
+    (`error.code` 190, any subcode, or 102) inside Meta's 7-day window join
+    the bulk resend; older ones are skipped and counted as `expired`;
+    Kommo/Pipedrive (single-dispatch ledger) stay out. Conditional claim,
+    `event_id`, workspace and the 500 cap are unchanged.
+  - Button "Reenviar bloqueados e falhas de login da Meta" with tooltip;
+    `summary.metaAuthRetryable` (optional) counts them; the row explains
+    the login failure. A `ready_to_send` without error stuck for more than
+    10 minutes can be retried from the audit.
+  - nod difference: the nod CAPI adapter never stored the body of a
+    rejection (PII). It now stores only the numeric Graph `error.code`
+    next to `httpStatus`; rejections recorded before this version have no
+    code and stay out of the resend.
+  - Locked license: both resends and "Reprocessar bloqueadas" are writes and
+    answer `423` (global guard; explicit test).
+- **Fase 6.0 — Payt times in Brasília time; `event_time` never in the
+  future (API)**, ported from the SaaS (`a1b600c2`, #173): naive Payt dates
+  ("2026-10-23 21:39:30.000000") are read as America/Sao_Paulo by the new
+  `sao-paulo-timestamp.ts` (an explicit zone is kept), and a time after the
+  arrival + 5 min is capped at the arrival (`firstReceivedAt` on
+  re-evaluations, now on live ingestion). The dedupe identity does not use
+  the time; no backfill. The Brink Park part does not apply.
+- **Turning "Envio ativo" on no longer gets stuck on an orphan or duplicate
+  number (API)**, ported from the SaaS (`3f59e2f7` of #66 / `37572ad9`,
+  `ff28d8a1` #85, `71e69a95` #86): numbers no longer on the rule's live
+  connection are dropped from the rule (audited
+  `provider_conversion_rule.channel_scope_pruned`) instead of a 404 "Recurso de
+  webhook não encontrado"; an already active channel is not re-activated (no
+  second Meta route check); a rediscovered `discovered` number is remapped to
+  its active sibling on the same connection (`channel_scope_remapped`). nod
+  adaptations: rules over numbers of several connections also skip removed
+  connections, and a Uazapi/WAHA number deleted in Integrations (suspended
+  WhatsApp connection) is never activated but stays on the rule; without any
+  valid number the answer is a clear 409. The SaaS `retireBridge` does not
+  exist in the nod.
+- **Old URL section without rotation; accented event labels (web)**, ported
+  from the SaaS (`5141e217`, #160): with the single/per-event URL active, the
+  rule's own address only shows inside "URL antiga (desta conexão)", with its
+  last receipt, guided copy and no "Gerar novo endereço". Kommo and Pipedrive
+  now show the accented event labels.
+- "Pausar" works on a rule whose number was removed, and "Ampliar para todas as
+  conexões" on a rule already sending activates the covered numbers (review of
+  the port).
+
 ## [1.2.0] - 2026-10-24
 
 Upgrade notes for students: [`docs/releases/1.2.0.json`](docs/releases/1.2.0.json). No migration, no new environment variable.

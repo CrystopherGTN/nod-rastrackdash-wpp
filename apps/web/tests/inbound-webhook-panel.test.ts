@@ -16,6 +16,7 @@ import {
   type InboundWebhookConnectionView,
 } from "../src/app/(app)/integrations/inbound-webhook-panel";
 import { inboundWebhookReportingAccountOptions } from "../src/app/(app)/integrations/inbound-webhook-route-editor";
+import type { WhatsappInstanceActivities } from "../src/app/(app)/integrations/whatsapp-instance-activity";
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({
@@ -271,11 +272,11 @@ describe("inbound webhook panel", () => {
       connections: [connectionViewWithoutChannels({ provider: "data_crazy" })],
     });
 
-    expect(html).toContain("Data Crazy - Observando");
+    expect(html).toContain("Data Crazy - Envio desligado");
     expect(html).not.toContain("Cadastrar canal/número");
     expect(html).not.toContain("Nenhum canal cadastrado ainda");
     expect(html).toContain(
-      "O canal aparece sozinho quando o primeiro webhook do Data Crazy chegar.",
+      "O canal aparece sozinho quando o primeiro webhook do Data Crazy chegar; a partir daí ele já envia e pode receber regras.",
     );
   });
 
@@ -483,7 +484,7 @@ describe("inbound webhook panel", () => {
 
     for (const command of [
       "Adicionar conexão",
-      "Ativar envios automáticos",
+      "Ativar envio",
       "Pausar conexão",
       "Gerar nova URL",
       "Remover",
@@ -562,10 +563,12 @@ function renderPanel({
   canManage = true,
   connections = [connectionView],
   capabilities: panelCapabilities = capabilities,
+  instanceActivities,
 }: {
   canManage?: boolean;
   connections?: InboundWebhookConnectionView[];
   capabilities?: InboundWebhookCapabilitiesDto;
+  instanceActivities?: WhatsappInstanceActivities;
 } = {}) {
   const action = vi.fn(async (_formData: FormData) => ({
     ok: true as const,
@@ -588,9 +591,61 @@ function renderPanel({
       createChannelAction: action,
       setChannelStatusAction: action,
       saveRoutesAction: action,
+      instanceActivities,
     }),
   );
 }
+
+// Fase 6.3b (porte do SaaS #126): a ponte Uazapi/WAHA só leva as regras de
+// frase; o lead de anúncio entra pela conexão WhatsApp.
+describe("bridged WhatsApp connections (6.3b)", () => {
+  const bridged = (provider: "uazapi" | "waha") => ({
+    ...connectionView,
+    overview: {
+      ...connectionView.overview,
+      connection: { ...connectionView.overview.connection, provider },
+    },
+    channels: connectionView.channels.map((channel) => ({
+      ...channel,
+      whatsappInstanceId: "wpp_1",
+    })),
+  });
+
+  it.each(["uazapi", "waha"] as const)(
+    "%s: marks the entry counters as not measured and shows the number activity",
+    (provider) => {
+      const html = renderPanel({
+        connections: [bridged(provider)],
+        instanceActivities: {
+          wpp_1: {
+            state: "real",
+            checkedAt: "2026-07-17T20:00:00.000Z",
+            activity: {
+              leads24h: 1,
+              leads7d: 4,
+              leadsTotal: 9,
+              lastLeadAt: "2026-07-17T19:00:00.000Z",
+              lastWebhookAt: "2026-07-17T19:30:00.000Z",
+            },
+          },
+        },
+      });
+
+      expect(html).toContain("<strong>Não medido</strong>");
+      expect(html).toContain("não são medidos nesta");
+      expect(html).toContain('aria-label="Atividade do número WhatsApp"');
+      expect(html).toContain("<dt>CTWA total</dt><dd>9</dd>");
+      expect(html).toContain('href="/leads?whatsappInstanceId=wpp_1"');
+    },
+  );
+
+  it("keeps the measured counters for other providers", () => {
+    const html = renderPanel();
+
+    expect(html).not.toContain("Não medido");
+    expect(html).not.toContain("Atividade do número");
+  });
+});
 
 it("offers student historical CTWA recovery on the Meta connection", () => {
   const html = renderPanel({ connections: [{
@@ -739,3 +794,110 @@ function metaReportingAccount({
     syncError: null,
   };
 }
+
+// Fase 6.1b — porte do #165 (478f0f9a) e do #179 (a7ccdab3) do SaaS.
+describe("inbound webhook panel: leitura dos números e “Bloqueado” com motivo", () => {
+  it("never shows a failed channel listing as a connection without numbers", () => {
+    const failed = renderPanel({
+      connections: [
+        {
+          ...connectionView,
+          channels: [],
+          channelsState: "error",
+          detailState: "error",
+        },
+      ],
+    });
+    expect(failed).toContain("Não foi possível carregar os números desta conexão");
+    expect(failed).not.toContain("Nenhum canal cadastrado ainda.");
+
+    const empty = renderPanel({
+      connections: [{ ...connectionView, channels: [], channelsState: "real" }],
+    });
+    expect(empty).toContain("Nenhum canal cadastrado ainda.");
+    expect(empty).not.toContain("Não foi possível carregar os números desta conexão");
+  });
+
+  it("never shows a blocked channel without its reason", () => {
+    const channel = connectionView.channels[0]!;
+    const html = renderPanel({
+      connections: [
+        {
+          ...connectionView,
+          channels: [
+            {
+              ...channel,
+              readiness: {
+                ...channel.readiness,
+                state: "blocked",
+                blockers: ["ctwa_send_failed"],
+                unresolvedCtwa: 0,
+                retainedRoutedCtwa: 0,
+                sendFailedCtwa: 3,
+                nextPayloadExpiresAt: null,
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(html).toContain("Bloqueado");
+    expect(html).toContain(
+      "3 CTWA falharam ou foram ignorados no envio e não entram em um novo envio automático.",
+    );
+  });
+
+  it("explains a channel with CTWA still processing as partial, not blocked", () => {
+    const channel = connectionView.channels[0]!;
+    const html = renderPanel({
+      connections: [
+        {
+          ...connectionView,
+          channels: [
+            {
+              ...channel,
+              readiness: {
+                ...channel.readiness,
+                state: "partial",
+                blockers: ["ctwa_in_progress"],
+                unresolvedCtwa: 0,
+                retainedRoutedCtwa: 0,
+                inProgressCtwa: 2,
+                nextPayloadExpiresAt: null,
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(html).toContain("Prontidão parcial");
+    expect(html).not.toContain("Bloqueado");
+    expect(html).toContain("2 CTWA estão sendo processados agora.");
+  });
+});
+
+// Fase 6.1b — porte do #105 do SaaS (e69a5e91), com a ponte WAHA.
+describe("inbound webhook panel: “Gerar nova URL” na ponte Uazapi/WAHA", () => {
+  function withProvider(provider: string) {
+    return {
+      ...connectionView,
+      overview: {
+        ...connectionView.overview,
+        connection: { ...connectionView.overview.connection, provider },
+      },
+    } as InboundWebhookConnectionView;
+  }
+
+  it.each(["uazapi", "waha"])("%s: não oferece gerar URL e explica por quê", (provider) => {
+    const html = renderPanel({ connections: [withProvider(provider)] });
+    expect(html).not.toContain("Gerar nova URL");
+    expect(html).toContain("recebe pelo webhook da conexão");
+  });
+
+  it("Umbler segue com o botão", () => {
+    const html = renderPanel({ connections: [withProvider("umbler")] });
+    expect(html).toContain("Gerar nova URL");
+  });
+});

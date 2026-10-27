@@ -28,8 +28,15 @@ export function inboundParserProductionEligible(
         "uazapi",
         // Fase 4a: Payt sale parsers (certified by migration).
         "payt",
+        // Fase 6.5: Braip sale parser (certified by migration: production direct).
+        "braip",
+        // Fase 6.7: Yampi sale parser (certified by migration: production direct).
+        "yampi",
         // Fase 4b: Unnichat entry and automation parsers (certified by migration).
         "unnichat",
+        // Fase 6.8: ROI Chat entry and purchase parsers (certified by
+        // migration: validated with real payloads received in the SaaS).
+        "roichat",
       ].includes(release.provider) && release.status === "certified"
     );
   try {
